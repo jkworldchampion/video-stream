@@ -5,3 +5,10 @@ __pycache__
 */__pycache__
 *.pyc
 gradio*
+./datasets
+.env
+./wandb
+*.pth
+wandb/
+outputs_streaming/
+logs/
