@@ -106,7 +106,7 @@ class VideoDepthAnything(nn.Module):
             cur_input = torch.cat(cur_list, dim=1).to(device)
             
             with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
+                with torch.autocast(device_type='cuda', enabled=(not fp32)):
                     cur_feature = self.forward_features(cur_input)
                     x_shape = cur_input.shape
                     depth, cached_hidden_state_list = self.forward_depth(cur_feature, x_shape)
@@ -144,7 +144,7 @@ class VideoDepthAnything(nn.Module):
             # Try with cached states first, but be prepared to reset if dimensions don't match
             try:
                 with torch.no_grad():
-                    with torch.autocast(device_type=device, enabled=(not fp32)):
+                    with torch.autocast(device_type='cuda', enabled=(not fp32)):
                         cur_feature = self.forward_features(cur_input)
                         x_shape = cur_input.shape
 
@@ -178,7 +178,7 @@ class VideoDepthAnything(nn.Module):
                 # Try to infer depth with cached states directly
                 try:
                     with torch.no_grad():
-                        with torch.autocast(device_type=device, enabled=(not fp32)):
+                        with torch.autocast(device_type='cuda', enabled=(not fp32)):
                             depth, new_cache = self.forward_depth(cur_feature, x_shape, cached_hidden_state_list=cur_cache)
 
                     depth = depth.to(cur_input.dtype)
@@ -202,7 +202,7 @@ class VideoDepthAnything(nn.Module):
                 
                 # Process current frame as if it's the first frame, but keep transform
                 with torch.no_grad():
-                    with torch.autocast(device_type=device, enabled=(not fp32)):
+                    with torch.autocast(device_type='cuda', enabled=(not fp32)):
                         depth, cached_hidden_state_list = self.forward_depth(cur_feature, x_shape)
 
                 depth = depth.to(cur_input.dtype)

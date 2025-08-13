@@ -113,92 +113,50 @@ def metric_val(infs, gts, data, poses=None, Ks=None):
         return absrel,delta1
 
 def eval_tae(pred_depth, gt_depth, poses, Ks, masks):
-    if len(pred_depth) < 2:
-        return torch.tensor(0.0, device=pred_depth[0].device)
-    
-    # Check if all poses are identity matrices
-    all_identity = True
-    for pose in poses:
-        is_identity = torch.allclose(pose, torch.eye(4, device=pose.device), atol=1e-6)
-        if not is_identity:
-            all_identity = False
-            break
-    
-    if all_identity:
-        return torch.tensor(0.0, device=pred_depth[0].device)
     
     error_sum = 0.
-    valid_pairs = 0
-    
     for i in range(len(pred_depth) - 1):
         depth1 = pred_depth[i]
         depth2 = pred_depth[i+1]
+        
         mask1 = masks[i]
         mask2 = masks[i+1]
 
         T_1 = poses[i]
         T_2 = poses[i+1]
 
-        # Check if poses are actually different
-        if torch.allclose(T_1, T_2, atol=1e-6):
-            continue
-
         try:
             T_2_inv = torch.linalg.inv(T_2)
         except torch._C._LinAlgError:
+            # LU pivot 에러가 나면 pseudo-inverse 로 대체
             T_2_inv = torch.linalg.pinv(T_2)
         T_2_1 = T_2_inv @ T_1
    
         R_2_1 = T_2_1[:3,:3]
         t_2_1 = T_2_1[:3, 3]
-        
-        # Check transformation magnitude
-        translation_norm = torch.norm(t_2_1)
-        rotation_diff = torch.norm(R_2_1 - torch.eye(3, device=R_2_1.device))
-        
-        if translation_norm < 1e-4 and rotation_diff < 1e-4:
-            continue
-        
         K = Ks[i]
+
         if K.dim() == 1 and K.numel() == 9:
             K = K.view(3, 3)
 
-        # Convert to disparity for TAE calculation
-        d1_disp = torch.zeros_like(depth1)
-        d2_disp = torch.zeros_like(depth2)
-        
-        valid1 = (depth1 > 1e-6) & mask1
-        valid2 = (depth2 > 1e-6) & mask2
-        
-        if valid1.sum() == 0 or valid2.sum() == 0:
-            continue
-            
-        d1_disp[valid1] = 1.0 / depth1[valid1]
-        d2_disp[valid2] = 1.0 / depth2[valid2]
-
-        error1 = tae_torch(d1_disp, d2_disp, R_2_1, t_2_1, K, mask2)
-        
+        error1 = tae_torch(depth1, depth2, R_2_1, t_2_1, K, mask2)
         try:
             T_1_2 = torch.linalg.inv(T_2_1)
         except torch._C._LinAlgError:
+            # LU pivot 에러가 나면 pseudo-inverse 로 대체
             T_1_2 = torch.linalg.pinv(T_2_1)
             
+        T_2_1 = T_2_inv @ T_1
         R_1_2 = T_1_2[:3,:3]
         t_1_2 = T_1_2[:3, 3]
 
-        error2 = tae_torch(d2_disp, d1_disp, R_1_2, t_1_2, K, mask1)
+        error2 = tae_torch(depth2, depth1, R_1_2, t_1_2, K, mask1)
         
-        # Check if errors are valid
-        if isinstance(error1, torch.Tensor) and isinstance(error2, torch.Tensor):
-            if error1.item() > 0 or error2.item() > 0:
-                error_sum += error1
-                error_sum += error2
-                valid_pairs += 1
+        error_sum += error1
+        error_sum += error2
     
-    if valid_pairs == 0:
-        return torch.tensor(0.0, device=pred_depth[0].device)
-    else:
-        return error_sum / (2 * valid_pairs)
+    result = error_sum / (2 * (len(pred_depth) -1))
+    return result
 
 def get_mask(depth_m, min_depth, max_depth):
     valid_mask = (depth_m > min_depth) & (depth_m < max_depth)
@@ -306,7 +264,7 @@ def train(args):
     ### 2. Load data
 
     kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
-    # google_path="/workspace/Video-Depth-Anything/datasets/google_landmarks"
+    google_path="/workspace/Video-Depth-Anything/datasets/google_landmarks"
 
     rgb_clips, depth_clips = get_data_list(
         root_dir=kitti_path,
@@ -342,17 +300,17 @@ def train(args):
     kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=6)
     kitti_val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=6)
     
-    # google_img_paths, google_depth_paths = get_data_list(
-    #     root_dir=google_path,
-    #     data_name="google",
-    #     split="train"
-    # )
+    google_img_paths, google_depth_paths = get_data_list(
+        root_dir=google_path,
+        data_name="google",
+        split="train"
+    )
 
-    # google_train = GoogleDepthDataset(
-    #     img_paths=google_img_paths,
-    #     depth_paths=google_depth_paths,
-    #     resize_size=518
-    # )
+    google_train = GoogleDepthDataset(
+        img_paths=google_img_paths,
+        depth_paths=google_depth_paths,
+        resize_size=518
+    )
 
     gta_path = "/workspace/Video-Depth-Anything/datasets/GTAV_720/GTAV_720"
     
@@ -374,49 +332,49 @@ def train(args):
     
     gta_val = GTADataset(val_gta_rgb_clips, val_gta_depth_clips, val_poses, split="val")
 
-    # tartanair_root = "/workspace/Video-Depth-Anything/datasets/Tartan_air"
-    # tartanair_envs = ["UrbanConstruction"]
+    tartanair_root = "/workspace/Video-Depth-Anything/datasets/Tartan_air"
+    tartanair_envs = ["UrbanConstruction"]
 
-    # ta_train_imgs, ta_train_deps = get_data_list(
-    #     root_dir=tartanair_root,
-    #     data_name="tartanair",
-    #     split=tartanair_envs,
-    #     clip_len=16,
-    #     difficulties=["hard"]
-    # )
-    # ta_train_dataset = TartanAirVideoDataset(
-    #     img_lists=ta_train_imgs,
-    #     dep_lists=ta_train_deps,
-    #     clip_len=16,
-    #     resize_size=518,
-    #     split="train"
-    # )
-    # ta_train_loader = DataLoader(ta_train_dataset, batch_size=batch_size, shuffle=True, num_workers=6)
+    ta_train_imgs, ta_train_deps = get_data_list(
+        root_dir=tartanair_root,
+        data_name="tartanair",
+        split=tartanair_envs,
+        clip_len=16,
+        difficulties=["hard"]
+    )
+    ta_train_dataset = TartanAirVideoDataset(
+        img_lists=ta_train_imgs,
+        dep_lists=ta_train_deps,
+        clip_len=16,
+        resize_size=518,
+        split="train"
+    )
+    ta_train_loader = DataLoader(ta_train_dataset, batch_size=batch_size, shuffle=True, num_workers=6)
 
-    # ta_val_imgs, ta_val_deps, ta_val_poses = get_data_list(
-    #     root_dir=tartanair_root,
-    #     data_name="tartanair",
-    #     split=tartanair_envs,
-    #     clip_len=16,
-    #     difficulties=["easy"]
-    # )
-    # ta_val_dataset = TartanAirVideoDataset(
-    #     img_lists=ta_val_imgs,
-    #     dep_lists=ta_val_deps,
-    #     posefile_lists=ta_val_poses,
-    #     clip_len=16,
-    #     resize_size=518,
-    #     split="val"
-    # )
+    ta_val_imgs, ta_val_deps, ta_val_poses = get_data_list(
+        root_dir=tartanair_root,
+        data_name="tartanair",
+        split=tartanair_envs,
+        clip_len=16,
+        difficulties=["easy"]
+    )
+    ta_val_dataset = TartanAirVideoDataset(
+        img_lists=ta_val_imgs,
+        dep_lists=ta_val_deps,
+        posefile_lists=ta_val_poses,
+        clip_len=16,
+        resize_size=518,
+        split="val"
+    )
     
-    # ta_val_loader = DataLoader(ta_val_dataset, batch_size=batch_size, shuffle=False, num_workers=6)
+    ta_val_loader = DataLoader(ta_val_dataset, batch_size=batch_size, shuffle=False, num_workers=6)
 
     gta_train_loader =  DataLoader(gta_train, batch_size=batch_size, shuffle=True, num_workers=6)
     gta_val_loader =  DataLoader(gta_val, batch_size=batch_size, shuffle=False, num_workers=6)
 
-    # x_nyu, y_nyu = get_list("", "nyu")
-    # nyu_data = ValDataset(x_nyu, y_nyu, "nyu")
-    # nyu_val_loader = DataLoader(nyu_data, batch_size=batch_size, shuffle=False, num_workers=6)
+    x_nyu, y_nyu = get_list("", "nyu")
+    nyu_data = ValDataset(x_nyu, y_nyu, "nyu")
+    nyu_val_loader = DataLoader(nyu_data, batch_size=batch_size, shuffle=False, num_workers=6)
     
     x_kitti, y_kitti = get_list("", "kitti")
     eval_kitti_data  = ValDataset(x_kitti,  y_kitti,  "kitti")    
@@ -554,39 +512,39 @@ def train(args):
         epoch_loss = 0.0
         total_val_loss = 0.0
 
-        # model.train()
+        model.train()
         
-        # # Train on VKITTI dataset      
-        # for batch_idx, (x, y) in tqdm(enumerate(kitti_train_loader)):
+        # Train on VKITTI dataset      
+        for batch_idx, (x, y) in tqdm(enumerate(kitti_train_loader)):
             
-        #     # Generate masks
-        #     video_masks = get_mask(y, min_depth=0.001, max_depth=80.0)
-        #     x, y = x.to(device), y.to(device)
-        #     video_masks = video_masks.to(device)
+            # Generate masks
+            video_masks = get_mask(y, min_depth=0.001, max_depth=80.0)
+            x, y = x.to(device), y.to(device)
+            video_masks = video_masks.to(device)
 
-        #     optimizer.zero_grad()
-        #     with autocast():
-        #         pred = model(x)
-        #         logger.info(f"Train pred mean: {pred.mean().item():.6f}")
+            optimizer.zero_grad()
+            with autocast():
+                pred = model(x)
+                logger.info(f"Train pred mean: {pred.mean().item():.6f}")
   
-        #         # Clip-level SSI normalization
-        #         disp_normed = norm_ssi(y, video_masks)
-        #         video_masks_squeezed = video_masks.squeeze(2)
-        #         loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)
-        #         loss_tgm_value = loss_tgm(pred, y, video_masks_squeezed)
+                # Clip-level SSI normalization
+                disp_normed = norm_ssi(y, video_masks)
+                video_masks_squeezed = video_masks.squeeze(2)
+                loss_ssi_value = loss_ssi(pred, disp_normed, video_masks_squeezed)
+                loss_tgm_value = loss_tgm(pred, y, video_masks_squeezed)
 
-        #         loss = ratio_tgm * loss_tgm_value + ratio_ssi * loss_ssi_value
+                loss = ratio_tgm * loss_tgm_value + ratio_ssi * loss_ssi_value
             
-        #     scaler.scale(loss).backward()
-        #     scaler.step(optimizer)
-        #     scaler.update()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
-        #     epoch_loss += loss.item()
+            epoch_loss += loss.item()
 
-        #     if batch_idx % 5 == 0:
-        #         logger.info(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
+            if batch_idx % 5 == 0:
+                logger.info(f"Epoch [{epoch}], Batch [{batch_idx}], Loss: {loss.item():.4f}")
             
-        # avg_kitti_train_loss = epoch_loss / len(kitti_train_loader)
+        avg_kitti_train_loss = epoch_loss / len(kitti_train_loader)
         
         # === validation loop ===
         model.eval()
@@ -710,6 +668,7 @@ def train(args):
         logger.info(f"TAE    : {avg_tae:.4f}")
         #
         wandb.log({
+            "vkitti_train_loss": avg_kitti_train_loss,
             "vkitti_val_loss": avg_val_loss,
             "vkitti_absrel": avg_absrel,
             "vkitti_delta1": avg_delta1,

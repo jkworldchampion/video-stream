@@ -4,7 +4,7 @@ hyper_parameter:
   ratio_ssi: 1
   ratio_tgm: 10
   ratio_ssi_image : 0.5
-  epochs: 100
+  epochs: 200
   patient: 5
   batch_size: 16
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)

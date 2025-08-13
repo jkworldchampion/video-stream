@@ -44,84 +44,26 @@ def depth2disp(depth):
 
 def tae_torch(d1, d2, R, T, K, mask):
     H,W = d1.shape
-    
     # d1.dtype might be float64 or float32; ensure R and T match it
     R = R.to(device=d1.device, dtype=d1.dtype)
     T = torch.tensor(T, dtype=d1.dtype, device=d1.device)
     
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-    
     xx,yy = torch.meshgrid(torch.arange(W), torch.arange(H))
     xx,yy = xx.t().to(d1), yy.t().to(d1)
     X = (xx-cx)*d1/fx; Y=(yy-cy)*d1/fy; Z=d1
     pts = torch.stack([X.flatten(), Y.flatten(), Z.flatten()],1)
     T = torch.tensor(T, dtype=d1.dtype, device=d1.device)
-    
     pts_t = pts@R.T + T
-    X_cam, Y_cam, Z_cam = pts_t[:,0], pts_t[:,1], pts_t[:,2]
-    
-    # 카메라 투영: 3D -> 2D 이미지 좌표
-    # Z_cam가 양수인 점들만 유효 (카메라 앞쪽)
-    valid_depth = Z_cam > 1e-6
-    
-    if valid_depth.sum() == 0:
-        return torch.tensor(0.0, device=d1.device)
-    
-    # 이미지 평면에 투영
-    u_proj = fx * X_cam / Z_cam + cx  # x 좌표
-    v_proj = fy * Y_cam / Z_cam + cy  # y 좌표
-    
-    # 이미지 경계 내의 유효한 점들만 선택 (bilinear interpolation을 위해 1픽셀 여유)
-    u_int = torch.round(u_proj).long()
-    v_int = torch.round(v_proj).long()
-    valid_proj = valid_depth & (u_int >= 1) & (u_int < W-1) & (v_int >= 1) & (v_int < H-1)
-    
-    if valid_proj.sum() == 0:
-        return torch.tensor(0.0, device=d1.device)
-    
-    # 유효한 점들 선택
-    u_valid = u_proj[valid_proj]
-    v_valid = v_proj[valid_proj]
-    z_valid = Z_cam[valid_proj]
-    
-    # bilinear interpolation을 위한 좌표 계산
-    u_floor = torch.floor(u_valid).long()
-    v_floor = torch.floor(v_valid).long()
-    u_ceil = u_floor + 1
-    v_ceil = v_floor + 1
-    
-    # 보간 가중치
-    wu = u_valid - u_floor.float()
-    wv = v_valid - v_floor.float()
-    
-    # 4개 코너에서 d2 및 mask 값 샘플링
-    d2_tl = d2[v_floor, u_floor]
-    d2_tr = d2[v_floor, u_ceil]
-    d2_bl = d2[v_ceil, u_floor]
-    d2_br = d2[v_ceil, u_ceil]
-    
-    mask_tl = mask[v_floor, u_floor]
-    mask_tr = mask[v_floor, u_ceil]
-    mask_bl = mask[v_ceil, u_floor]
-    mask_br = mask[v_ceil, u_ceil]
-    
-    # bilinear interpolation
-    d2_top = d2_tl * (1 - wu) + d2_tr * wu
-    d2_bot = d2_bl * (1 - wu) + d2_br * wu
-    d2_interp = d2_top * (1 - wv) + d2_bot * wv
-    
-    # 마스크 interpolation (모든 코너가 유효한 경우만)
-    mask_interp = mask_tl & mask_tr & mask_bl & mask_br
-    
-    # 최종 유효한 점들
-    final_valid = mask_interp & (d2_interp > 1e-6) & (z_valid > 1e-6)
-    
-    if final_valid.sum() == 0:
-        return torch.tensor(0.0, device=d1.device)
-    
-    # 깊이 오차 계산 (절대 차이의 평균)
-    error = torch.abs(z_valid[final_valid] - d2_interp[final_valid]).mean()
-    return error
+    Xp, Yp, Zp = pts_t[:,0], pts_t[:,1], pts_t[:,2]
+    Xr = torch.round(Xp).long(); Yr = torch.round(Yp).long()
+    valid = (Xr>=0)&(Xr<W)&(Yr>=0)&(Yr<H)
+    if valid.sum()==0: return 0.0
+    proj = torch.zeros_like(d1)
+    proj[Yr[valid], Xr[valid]] = Zp[valid]
+    valid2 = (proj>0)&(d2>0)&mask
+    if valid2.sum()==0: return 0.0
+    return compute_errors_torch(d2[valid2], proj[valid2])
 
 def eval_TAE(infer_paths, gt_paths, factors, masks, Ks, poses, args):
     gts, infs = [], []

@@ -18,12 +18,13 @@ import torch
 import time
 import cv2
 
-from video_depth_anything.video_depth_stream import VideoDepthAnything
+# from video_depth_anything.video_depth_stream import VideoDepthAnything
+from video_depth_anything.video_stream_original import VideoDepthAnything
 from utils.dc_utils import save_video
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Video Depth Anything')
-    parser.add_argument('--input_video', type=str, default='./assets/example_videos/davis_rollercoaster.mp4')
+    parser.add_argument('--input_video', type=str, default='./assets/example_videos/Tokyo-Walk_rgb.mp4')
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--max_res', type=int, default=1280)
@@ -43,7 +44,8 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
 
-    video_depth_anything = VideoDepthAnything(use_causal_mask=args.use_causal_mask, **model_configs[args.encoder])
+    # video_depth_anything = VideoDepthAnything(use_causal_mask=args.use_causal_mask, **model_configs[args.encoder])
+    video_depth_anything = VideoDepthAnything(**model_configs[args.encoder])
     video_depth_anything.load_state_dict(torch.load(f'./checkpoints/video_depth_anything_{args.encoder}.pth', map_location='cpu'), strict=True)
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
 

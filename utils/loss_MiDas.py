@@ -132,7 +132,7 @@ class Loss_ssi_basic(nn.Module):
         )
 
         total = loss_ssi + 0.5 * loss_grad
-        print("SSI Loss per batch:", loss_ssi.item())
+        # print("SSI Loss per batch:", loss_ssi.item())
 
         return total
 
@@ -210,7 +210,7 @@ class Loss_ssi(nn.Module):
         loss_per_frame = sum_rho / valid_counts  # shape = (B, N)
 
         loss_ssi = loss_per_frame.mean()  # scalar
-        print("SSI Loss per batch:", loss_ssi.item())
+        # print("SSI Loss per batch:", loss_ssi.item())
 
         return loss_ssi
 
@@ -306,5 +306,5 @@ class LossTGMVector(nn.Module):
 
         # 10) final mean
         loss_tgm = loss_frame.mean()
-        print("TGM Loss per batch:", loss_tgm.item())
+        # print("TGM Loss per batch:", loss_tgm.item())
         return loss_tgm
