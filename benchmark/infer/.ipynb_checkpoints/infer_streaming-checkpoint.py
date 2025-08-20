@@ -1,100 +1,91 @@
-# Copyright (2025) Bytedance Ltd. and/or its affiliates
-
-# Licensed under the Apache License, Version 2.0 (the "License"); 
-# you may not use this file except in compliance with the License. 
-# You may obtain a copy of the License at 
-#     http://www.apache.org/licenses/LICENSE-2.0 
-# Unless required by applicable law or agreed to in writing, software 
-# distributed under the License is distributed on an "AS IS" BASIS, 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-# See the License for the specific language governing permissions and 
-# limitations under the License.
 import argparse
-import os
-import sys
-import json
+import os, sys
 import cv2
-import numpy as np
+import json
 import torch
 from tqdm import tqdm
+import numpy as np
 
-# 프로젝트 루트(../..)를 PYTHONPATH에 추가하여 video_depth_anything 모듈을 찾을 수 있게 함
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, BASE_DIR)
 
 from video_depth_anything.video_depth_stream import VideoDepthAnything
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Streaming Inference for VideoDepthAnything')
-    parser.add_argument('--infer_path', type=str, required=True,
-                        help='Directory to save per-frame .npy depth outputs')
-    parser.add_argument('--json_file', type=str, required=True,
-                        help='Path to dataset JSON metadata (e.g., benchmark/datasets/scannet/scannet_video.json)')
-    parser.add_argument('--datasets', type=str, nargs='+', default=['scannet'],
-                        help='Dataset names to process (keys in the JSON)')
-    parser.add_argument('--input_size', type=int, default=518,
-                        help='Input resolution for the model')
-    parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'],
-                        help='Backbone encoder type')
-    parser.add_argument('--fp32', action='store_true',
-                        help='Run inference in float32 (default is float16)')
-    parser.add_argument('--use_causal_mask', action='store_true',
-                        help='Enable causal masking for streaming temporal attention')
+    parser = argparse.ArgumentParser()
+    # --- 기존 인수 설정은 그대로 유지 ---
+    parser.add_argument('--infer_path', type=str, default='')
+    parser.add_argument('--json_file', type=str, default='')
+    parser.add_argument('--datasets', type=str, nargs='+', default=['scannet', 'nyuv2'])
+    parser.add_argument('--input_size', type=int, default=518)
+    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitl'])
     args = parser.parse_args()
+    
+    DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
-    cfg = model_configs[args.encoder]
 
-    # Initialize model for streaming
-    model = VideoDepthAnything(use_causal_mask=args.use_causal_mask, num_frames=32, **cfg)
-    # ckpt = os.path.join(BASE_DIR, 'checkpoints', f'video_depth_anything_{args.encoder}.pth')
-    ckpt = os.path.join(BASE_DIR, 'outputs', 'experiment_10', f'best_model.pth')
-    ckpt_data = torch.load(ckpt, map_location='cpu')
-    raw_sd    = ckpt_data['model_state_dict']
-    fixed_sd  = {}
-    for k,v in raw_sd.items():
-        # remove the "module." prefix if present
-        name = k[len("module."):] if k.startswith("module.") else k
-        fixed_sd[name] = v
+    # 모델은 한 번만 로드하여 효율성을 높입니다.
+    video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], use_causal_mask=False)
+    video_depth_anything.load_state_dict(torch.load(f'./checkpoints/video_depth_anything_{args.encoder}.pth', map_location='cpu'), strict=True)
+    video_depth_anything = video_depth_anything.to(DEVICE).eval()
     
-    model.load_state_dict(fixed_sd, strict=True)
-    model = model.to(DEVICE).eval()
-
-    # Load JSON metadata
-    root_path = os.path.dirname(args.json_file)
-    with open(args.json_file, 'r') as f:
-        meta = json.load(f)
-
+    # video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], use_causal_mask=True)
+    # ckpt = os.path.join(BASE_DIR, 'outputs', 'experiment_11', f'best_model.pth')
+    # ckpt_data = torch.load(ckpt, map_location='cpu')
+    # raw_sd    = ckpt_data['model_state_dict']
+    # fixed_sd  = {}
+    # for k,v in raw_sd.items():
+    #     # remove the "module." prefix if present
+    #     name = k[len("module."):] if k.startswith("module.") else k
+    #     fixed_sd[name] = v
+    # video_depth_anything.load_state_dict(fixed_sd, strict=True)
+    # video_depth_anything = video_depth_anything.to(DEVICE).eval()
+    
     for dataset in args.datasets:
-        scenes = meta.get(dataset, [])
+        with open(args.json_file, 'r') as fs:
+            path_json = json.load(fs)
 
-        for entry in tqdm(scenes, desc=f"Streaming {dataset}"):
-            scene = list(entry.keys())[0]
-            frames = entry[scene]
+        json_data = path_json[dataset]
+        root_path = os.path.dirname(args.json_file)
 
-            # 이미지를 streaming처럼 하나씩 전달
-            for info in frames:
-                rel_img = info['image']  # e.g. "scannet/scene0019_01/color/0.jpg"
-                img_path = os.path.join(root_path, rel_img)
-                img = cv2.imread(img_path)
-                img = img[:, :, ::-1]  # BGR -> RGB
+        # tqdm을 사용하여 각 비디오 시퀀스 처리 진행률을 표시합니다.
+        for data in tqdm(json_data, desc=f"Processing {dataset}"):
+            for key in data.keys():
+                value = data[key]
+                
+                # --- 스트리밍 추론을 위한 핵심 수정 시작 ---
 
-                # Streaming inference: one frame at a time
-                depth = model.infer_video_depth_one(
-                    img,
-                    input_size=args.input_size,
-                    device=DEVICE,
-                    fp32=args.fp32,
-                )
+                # 1. 새 비디오 처리에 앞서 모델의 내부 상태를 직접 초기화합니다.
+                #    (클래스에 reset 메소드를 추가하는 것과 동일한 효과)
+                video_depth_anything.transform = None
+                video_depth_anything.frame_cache_list = []
+                video_depth_anything.frame_id_list = []
+                video_depth_anything.id = -1
+                
+                # 2. 각 비디오의 프레임을 하나씩 순회합니다.
+                for image_info in value:
+                    
+                    image_path = os.path.join(root_path, image_info['image'])
+                    infer_path = (args.infer_path + '/' + dataset + '/' + image_info['image']).replace('.jpg', '.npy').replace('.png', '.npy')
+                    os.makedirs(os.path.dirname(infer_path), exist_ok=True)
+                    
+                    # 프레임 읽기 및 BGR -> RGB 변환 (버그 수정)
+                    img = cv2.imread(image_path)
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    
+                    # 3. 단일 프레임 추론 함수 호출
+                    depth = video_depth_anything.infer_video_depth_one(
+                        img_rgb, 
+                        input_size=args.input_size, 
+                        device=DEVICE, 
+                        fp32=True # 원본 코드의 fp32=True 설정을 유지
+                    )
 
-                # Save .npy
-                save_rel = rel_img.replace('.jpg', '.npy').replace('.png', '.npy')
-                save_path = os.path.join(args.infer_path, dataset, save_rel)
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                np.save(save_path, depth)
-
-    print("Streaming .npy outputs generated.")
+                    # 4. 추론된 깊이 맵을 즉시 저장
+                    np.save(infer_path, depth)
+                
+                # --- 스트리밍 추론을 위한 핵심 수정 종료 ---

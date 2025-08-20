@@ -10,21 +10,21 @@ export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/scannet_stream"
+INFER_PATH="${ROOT}/benchmark/output/scannet_stream_vitl"
 
-# 2) JSON 메타데이터(500프레임)
-JSON_FILE="${ROOT}/benchmark/dataset_extract/datasets/scannet/scannet_video_500.json"
+# 2) JSON 메타데이터
+JSON_FILE="${ROOT}/benchmark/dataset_extract/datasets/scannet/scannet_video.json"
 
 # 3) GT 루트
 BENCHMARK_ROOT="${ROOT}/benchmark/dataset_extract/datasets"
 
 mkdir -p "${INFER_PATH}"
 
-# echo "▶ Streaming inference → ${INFER_PATH}"
-# python "${ROOT}/benchmark/infer/infer_streaming.py" \
-#   --infer_path "${INFER_PATH}" \
-#   --json_file  "${JSON_FILE}" \
-#   --datasets   scannet
+echo "▶ Streaming inference → ${INFER_PATH}"
+python "${ROOT}/benchmark/infer/infer_streaming.py" \
+  --infer_path "${INFER_PATH}" \
+  --json_file  "${JSON_FILE}" \
+  --datasets   scannet
 
 echo
 echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"

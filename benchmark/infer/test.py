@@ -18,7 +18,7 @@ if __name__ == '__main__':
     parser.add_argument('--json_file', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['scannet', 'nyuv2'])
     parser.add_argument('--input_size', type=int, default=518)
-    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitl'])
+    parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     args = parser.parse_args()
     
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -29,21 +29,17 @@ if __name__ == '__main__':
     }
 
     # 모델은 한 번만 로드하여 효율성을 높입니다.
-    video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], use_causal_mask=False)
-    video_depth_anything.load_state_dict(torch.load(f'./checkpoints/video_depth_anything_{args.encoder}.pth', map_location='cpu'), strict=True)
+    video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], use_causal_mask=True)
+    ckpt = os.path.join(BASE_DIR, 'outputs', 'experiment_11', f'best_model.pth')
+    ckpt_data = torch.load(ckpt, map_location='cpu')
+    raw_sd      = ckpt_data['model_state_dict']
+    fixed_sd    = {}
+    for k,v in raw_sd.items():
+        # remove the "module." prefix if present
+        name = k[len("module."):] if k.startswith("module.") else k
+        fixed_sd[name] = v
+    video_depth_anything.load_state_dict(fixed_sd, strict=True)
     video_depth_anything = video_depth_anything.to(DEVICE).eval()
-    
-    # video_depth_anything = VideoDepthAnything(**model_configs[args.encoder], use_causal_mask=True)
-    # ckpt = os.path.join(BASE_DIR, 'outputs', 'experiment_11', f'best_model.pth')
-    # ckpt_data = torch.load(ckpt, map_location='cpu')
-    # raw_sd    = ckpt_data['model_state_dict']
-    # fixed_sd  = {}
-    # for k,v in raw_sd.items():
-    #     # remove the "module." prefix if present
-    #     name = k[len("module."):] if k.startswith("module.") else k
-    #     fixed_sd[name] = v
-    # video_depth_anything.load_state_dict(fixed_sd, strict=True)
-    # video_depth_anything = video_depth_anything.to(DEVICE).eval()
     
     for dataset in args.datasets:
         with open(args.json_file, 'r') as fs:
@@ -73,19 +69,28 @@ if __name__ == '__main__':
                     infer_path = (args.infer_path + '/' + dataset + '/' + image_info['image']).replace('.jpg', '.npy').replace('.png', '.npy')
                     os.makedirs(os.path.dirname(infer_path), exist_ok=True)
                     
-                    # 프레임 읽기 및 BGR -> RGB 변환 (버그 수정)
-                    img = cv2.imread(image_path)
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # ===============================================================
+                    # 요청에 따라 수정된 부분
+                    # ===============================================================
                     
-                    # 3. 단일 프레임 추론 함수 호출
-                    depth = video_depth_anything.infer_video_depth_one(
-                        img_rgb, 
-                        input_size=args.input_size, 
-                        device=DEVICE, 
-                        fp32=True # 원본 코드의 fp32=True 설정을 유지
-                    )
+                    # 현재 처리 중인 이미지의 상대 경로를 출력합니다.
+                    print(image_info['image'])
+                    
+                    # # 프레임 읽기 및 BGR -> RGB 변환 (버그 수정)
+                    # img = cv2.imread(image_path)
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    
+                    # # 3. 단일 프레임 추론 함수 호출 (주석 처리)
+                    # depth = video_depth_anything.infer_video_depth_one(
+                    #     img_rgb, 
+                    #     input_size=args.input_size, 
+                    #     device=DEVICE, 
+                    #     fp32=True # 원본 코드의 fp32=True 설정을 유지
+                    # )
 
-                    # 4. 추론된 깊이 맵을 즉시 저장
-                    np.save(infer_path, depth)
+                    # # 4. 추론된 깊이 맵을 즉시 저장 (주석 처리)
+                    # np.save(infer_path, depth)
+                    
+                    # ===============================================================
                 
                 # --- 스트리밍 추론을 위한 핵심 수정 종료 ---

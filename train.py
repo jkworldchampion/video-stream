@@ -22,8 +22,16 @@ from video_depth_anything.video_depth_stream import VideoDepthAnything
 from benchmark.eval.metric import *          # abs_relative_difference, delta1_acc
 from benchmark.eval.eval_tae import tae_torch
 
+import warnings
+# UserWarning 카테고리에 해당하는 모든 경고를 무시합니다.
+# 'torch.tensor(sourceTensor)' 및 'meshgrid' 경고가 여기에 해당됩니다.
+warnings.filterwarnings('ignore', category=UserWarning)
+# 특정 메시지 내용을 포함하는 경고를 무시할 수도 있습니다.
+# 'preferred_linalg_library' 관련 경고를 숨깁니다.
+warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
+
 # ────────────────────────────── 기본 설정 ──────────────────────────────
-experiment = 10
+experiment = 11
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
@@ -452,8 +460,8 @@ def train(args):
         split="val",
     )
 
-    kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True,  num_workers=6)
-    kitti_val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=6)
+    kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True,  num_workers=4)
+    kitti_val_loader   = DataLoader(kitti_val,   batch_size=batch_size, shuffle=False, num_workers=4)
 
     # ScanNet val
     x_scannet, y_scannet, scannet_poses, scannet_Ks = get_list("", "scannet")
@@ -464,7 +472,7 @@ def train(args):
         Ks=scannet_Ks,
         pose_paths=scannet_poses,
     )
-    scannet_val_loader = DataLoader(scannet_data, batch_size=batch_size, shuffle=False, num_workers=6)
+    scannet_val_loader = DataLoader(scannet_data, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # ── 모델 ──
     logger.info("🏗️ Creating VideoDepthAnything model with streaming configuration...")
@@ -576,9 +584,9 @@ def train(args):
             prev_mask     = None
             prev_y        = None
 
-            # NEW: 배치별 EMA 스칼라 초기화
-            a_ema = torch.ones(B, 1, 1, 1, device=device)
-            b_ema = torch.zeros(B, 1, 1, 1, device=device)
+            # # NEW: 배치별 EMA 스칼라 초기화
+            # a_ema = torch.ones(B, 1, 1, 1, device=device)
+            # b_ema = torch.zeros(B, 1, 1, 1, device=device)
 
             for t in range(T):
                 if np.random.rand() < p_cache_reset:
@@ -590,7 +598,6 @@ def train(args):
                 with autocast():
                     # 1) 원시 예측 (disparity)
                     pred_t_raw, cache = model_stream_step(model, x_t, cache)   # [B,H,W]
-                    # pred_t_raw = pred_t_raw.clamp(min=1e-6)
                     pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
 
                     # 2) GT disparity & LS로 순간 스케일/시프트 추정
@@ -599,9 +606,9 @@ def train(args):
                     with torch.no_grad():
                         a_star, b_star = batch_ls_scale_shift(pred_t_raw, gt_disp_t, mask_t)  # <- no_grad
 
-                    # 3) EMA 업데이트 (이미 no_grad tensor)
-                    a_ema = ema_update(a_ema, a_star, ema_alpha)
-                    b_ema = ema_update(b_ema, b_star, ema_alpha)
+                    # # 3) EMA 업데이트 (이미 no_grad tensor)
+                    # a_ema = ema_update(a_ema, a_star, ema_alpha)
+                    # b_ema = ema_update(b_ema, b_star, ema_alpha)
                     
                     # # 4) 정렬된 예측으로 손실 계산 (정렬 스칼라는 detach)
                     # # 방법 A: 4D로 올려 연산 후 다시 내리기 (가장 안전)
@@ -610,11 +617,11 @@ def train(args):
                     # ).squeeze(1)                                                      # [B,H,W]
                     # 4) 정렬 예측으로 손실 계산 (정렬 스칼라는 detach 성격)
                     pred_t_aligned = (
-                        a_ema * pred_t_raw.unsqueeze(1) + b_ema
+                        a_star.detach() * pred_t_raw.unsqueeze(1) + b_star.detach()
                     ).squeeze(1)  # [B,H,W]
 
-                    # 5) 약한 정규화도 역전파 막기  (← 이 줄이 핵심)
-                    reg_loss = scale_reg_w * ( (a_star - 1.0).abs().mean() + (b_star - 0.0).abs().mean() )
+                    # # 5) 약한 정규화도 역전파 막기  (← 이 줄이 핵심)
+                    # reg_loss = scale_reg_w * ( (a_star - 1.0).abs().mean() + (b_star - 0.0).abs().mean() )
 
                     # SSI (framewise; GT는 min-max 정규화 disparity)
                     # GT disparity는 4D [B,1,H,W]로 맞춰 SSI에 전달
@@ -631,7 +638,7 @@ def train(args):
                     # TGM (pairwise; 동일 a_ema,b_ema로 두 프레임 모두 정렬)
                     if t > 0:
                         prev_aligned = (
-                            a_ema.detach() * prev_pred_raw.unsqueeze(1) + b_ema.detach()
+                            a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()
                         ).squeeze(1)  # [B,H,W]
                         curr_aligned = pred_t_aligned
                         pred_pair = torch.stack([prev_aligned, curr_aligned], dim=1)   # [B,2,H,W]
@@ -641,11 +648,11 @@ def train(args):
                     else:
                         tgm_loss  = pred_t_raw.new_tensor(0.0)
 
-                    # 5) 약한 정규화: a*≈1, b*≈0 유도 (순간치 기준)
-                    reg_loss = scale_reg_w * (torch.mean(torch.abs(a_star - 1.0)) +
-                                              torch.mean(torch.abs(b_star - 0.0)))
+                    # # 5) 약한 정규화: a*≈1, b*≈0 유도 (순간치 기준)
+                    # reg_loss = scale_reg_w * (torch.mean(torch.abs(a_star - 1.0)) +
+                    #                           torch.mean(torch.abs(b_star - 0.0)))
 
-                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + reg_loss
+                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
 
                 # 누적/업데이트
                 loss = loss / update_frequency
@@ -666,6 +673,10 @@ def train(args):
                     epoch_loss += accum_loss.item()
                     accum_loss = 0.0
                     step_in_window = 0
+
+                del loss, ssi_loss_t, pred_t_aligned
+                if 'tgm_loss' in locals(): # t > 0 일 때만 생성되므로 확인 후 삭제
+                    del tgm_loss
 
                 # if t % 4 == 0:
                 #     logger.info(
@@ -751,7 +762,9 @@ def train(args):
         }, latest_model_path)
         logger.info(f"📁 Latest model saved to {latest_model_path}")
 
+        torch.cuda.empty_cache()
         scheduler.step()
+        
 
     # 완료 로그
     logger.info("=" * 50)

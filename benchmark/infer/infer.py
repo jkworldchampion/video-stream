@@ -1,28 +1,23 @@
 import argparse
-import os
+import os, sys
 import cv2
 import json
 import torch
 from tqdm import tqdm
 import numpy as np
 
-import sys
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, BASE_DIR)
 
 from video_depth_anything.video_depth import VideoDepthAnything
 from utils.dc_utils import read_video_frames
 
-torch.backends.cudnn.benchmark = True
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--infer_path', type=str, default='')
-    
     parser.add_argument('--json_file', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['scannet', 'nyuv2'])
-    
-    parser.add_argument('--input_size', type=int, default=450)
+    parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
 
     args = parser.parse_args()
@@ -50,30 +45,17 @@ if __name__ == '__main__':
                 value = data[key]
                 infer_paths = []
                 
-                # videos = []
-                # for images in value:
+                videos = []
+                for images in value:
                     
-                #     image_path = os.path.join(root_path, images['image'])
-                #     infer_path = (args.infer_path + '/'+ dataset + '/' + images['image']).replace('.jpg', '.npy').replace('.png', '.npy')
-                #     infer_paths.append(infer_path)
+                    image_path = os.path.join(root_path, images['image'])
+                    infer_path = (args.infer_path + '/'+ dataset + '/' + images['image']).replace('.jpg', '.npy').replace('.png', '.npy')
+                    infer_paths.append(infer_path)
                     
-                #     img = cv2.imread(image_path)
-                #     videos.append(img)
-                # videos = np.stack(videos, axis=0)
-
-                from concurrent.futures import ThreadPoolExecutor
-                def _read_one(img_rel):
-                    p = os.path.join(root_path, img_rel)
-                    return cv2.imread(p)
-                img_list = [im['image'] for im in value]
-                infer_paths = [
-                    (args.infer_path + '/' + dataset + '/' + rel).replace('.jpg', '.npy').replace('.png', '.npy')
-                    for rel in img_list
-                ]
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    videos = list(ex.map(_read_one, img_list))
+                    img = cv2.imread(image_path)
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    videos.append(img)
                 videos = np.stack(videos, axis=0)
-
                 target_fps=1
                 depths, fps = video_depth_anything.infer_video_depth(videos, target_fps, input_size=args.input_size, device=DEVICE, fp32=True)
 

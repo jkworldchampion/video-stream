@@ -14,7 +14,7 @@ import torch
 from metric import *
 import metric
 
-device = 'cuda'
+device = 'cuda:0'
 eval_metrics = [
     "abs_relative_difference",
     "rmse_linear",
