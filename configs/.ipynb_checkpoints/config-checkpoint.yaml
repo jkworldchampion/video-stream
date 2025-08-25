@@ -4,7 +4,18 @@ hyper_parameter:
   ratio_ssi: 1
   ratio_tgm: 10
   ratio_ssi_image : 0.5
-  epochs: 200
+  epochs: 100
   patient: 5
-  batch_size: 16
+  batch_size: 4  # Increased for better multi-GPU utilization
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
+  
+  # Self-Forcing parameters
+  use_self_forcing: true
+  self_forcing_ratio: 0.3  # 30% 확률로 self-forcing 적용
+  self_forcing_start_epoch: 10  # 10 에폭부터 self-forcing 시작
+  
+  # Teacher-Student parameters
+  use_teacher_student: true
+  teacher_distill_weight: 1.0  # Distillation loss 가중치
+  feature_distill_layers: [2, 3]  # layer_3, layer_4에서 feature distillation
+  teacher_warmup_epochs: 5  # Teacher 워밍업 에폭 (선택적)

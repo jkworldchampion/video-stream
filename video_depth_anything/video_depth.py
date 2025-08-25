@@ -41,7 +41,8 @@ class VideoDepthAnything(nn.Module):
         use_bn=False,
         use_clstoken=False,
         num_frames=32,
-        pe='ape'
+        pe='ape',
+        use_causal_mask=False  # Teacher는 bidirectional이므로 False
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -53,7 +54,7 @@ class VideoDepthAnything(nn.Module):
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
-        self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
+        self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe, use_causal_mask=use_causal_mask)
 
     def forward(self, x):
         B, T, C, H, W = x.shape

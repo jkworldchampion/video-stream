@@ -14,7 +14,7 @@ import torch
 from metric import *
 import metric
 
-device = 'cuda:0'
+device = 'cuda:1'
 eval_metrics = [
     "abs_relative_difference",
     "rmse_linear",
@@ -64,66 +64,105 @@ def depth2disparity(depth, return_mask=False):
         return disparity
 
 def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
-    depth_errors = []
-    gts = []
-    infs = []
+    """
+    메모리 안전 + Depth 도메인 정렬(SSI) 평가.
+    - 시퀀스 전체 (a,b) 정합을 '누적 합(정규방정식)'으로 계산해 O(1) 메모리
+    - 이후 프레임별로 메트릭을 계산해 평균
+    """
     seq_length = args.max_eval_len
     dataset_max_depth = args.max_depth_eval
-    for i in range(len(infer_paths)):
+
+    # ---------- 1st pass: (a,b) 정합 계수 추정 (Depth 도메인) ----------
+    # 최소제곱 해: a,b = argmin || a*x + b - y ||^2
+    # 누적합으로 계산 (전 프레임, 유효 픽셀 전체):
+    # Sx = sum(x), Sy = sum(y), Sxx = sum(x^2), Sxy = sum(x*y), N = #pixels
+    Sx = Sy = Sxx = Sxy = 0.0
+    N  = 0
+
+    # 시퀀스 길이 제한 고려
+    num_frames = min(seq_length, len(infer_paths))
+
+    for i in range(num_frames):
+        if not os.path.exists(infer_paths[i]):
+            continue
+        # GT 로드(+스케일 보정) 및 크롭
+        depth_gt = get_gt(depth_gt_paths[i], factors[i], args)
+        depth_gt = depth_gt[args.a:args.b, args.c:args.d]
+
+        # 예측(depth) 로드 및 GT 크기에 맞춤
+        pred = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
+        # 유효 마스크
+        valid_mask = (depth_gt > 1e-3) & (depth_gt < dataset_max_depth)
+
+        if not np.any(valid_mask):
+            continue
+
+        # 안정화
+        pred = np.clip(pred, a_min=1e-3, a_max=None)
+
+        # 누적합 (float64 권장)
+        x = pred[valid_mask].astype(np.float64)
+        y = depth_gt[valid_mask].astype(np.float64)
+
+        Sx  += x.sum()
+        Sy  += y.sum()
+        Sxx += np.dot(x, x)          # sum(x^2)
+        Sxy += np.dot(x, y)          # sum(x*y)
+        N   += x.size
+
+    # (a,b) 계산 (퇴화 대비)
+    if N == 0:
+        # 유효 픽셀이 전혀 없으면 NaN 반환
+        return [float("nan")] * len(eval_metrics)
+
+    denom = (Sxx - (Sx * Sx) / N)
+    if abs(denom) < 1e-12:
+        a = 1.0
+        b = 0.0
+    else:
+        a = (Sxy - (Sx * Sy) / N) / denom
+        b = (Sy - a * Sx) / N
+
+    # ---------- 2nd pass: (a,b) 적용 후 프레임별 메트릭 계산 ----------
+    metric_funcs = [getattr(metric, _met) for _met in eval_metrics]
+    metrics_sum = np.zeros(len(metric_funcs), dtype=np.float64)
+    frames_count = 0
+
+    for i in range(num_frames):
         if not os.path.exists(infer_paths[i]):
             continue
         depth_gt = get_gt(depth_gt_paths[i], factors[i], args)
         depth_gt = depth_gt[args.a:args.b, args.c:args.d]
-        
-        infer = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
-        gts.append(depth_gt)
-        infs.append(infer)
 
-    # 유효한 프레임이 하나도 없으면 None 리턴
-    if len(gts) == 0:
-        return None
-    
-    gts = np.stack(gts, axis=0)
-    
-    infs = np.stack(infs, axis=0)
-    infs = infs[:seq_length]
-    gts = gts[:seq_length]
-    valid_mask = np.logical_and((gts>1e-3), (gts<dataset_max_depth))
-    
-    gt_disp_masked = 1. / (gts[valid_mask].reshape((-1,1)).astype(np.float64) + 1e-8)
-    infs = np.clip(infs, a_min=1e-3, a_max=None)
-    pred_disp_masked = infs[valid_mask].reshape((-1,1)).astype(np.float64)
+        pred = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
+        valid_mask = (depth_gt > 1e-3) & (depth_gt < dataset_max_depth)
+        if not np.any(valid_mask):
+            continue
 
-    _ones = np.ones_like(pred_disp_masked)
-    A = np.concatenate([pred_disp_masked, _ones], axis=-1)
-    X = np.linalg.lstsq(A, gt_disp_masked, rcond=None)[0]
-    scale, shift = X
-    aligned_pred = scale * infs + shift
-    aligned_pred = np.clip(aligned_pred, a_min=1e-3, a_max=None)
+        # Depth 도메인 정렬 적용
+        pred = np.clip(pred, a_min=1e-3, a_max=None)
+        pred_aligned = a * pred + b
+        pred_aligned = np.clip(pred_aligned, a_min=1e-3, a_max=dataset_max_depth)
 
-    pred_depth = depth2disparity(aligned_pred)
-    gt_depth = gts
-    pred_depth = np.clip(
-            pred_depth, a_min=1e-3, a_max=dataset_max_depth
-        )
-    sample_metric = []
-    metric_funcs = [getattr(metric, _met) for _met in eval_metrics]
+        # Torch(CPU) 텐서로 변환 (프레임 단위로만)
+        pred_ts = torch.from_numpy(pred_aligned[None, ...])  # [1, H, W]
+        gt_ts   = torch.from_numpy(depth_gt[None, ...])
+        mask_ts = torch.from_numpy(valid_mask[None, ...])
 
-    pred_depth_ts = torch.from_numpy(pred_depth).to(device)
-    gt_depth_ts = torch.from_numpy(gt_depth).to(device)
-    valid_mask_ts = torch.from_numpy(valid_mask).to(device)
+        # 프레임 1장의 메트릭 계산
+        for idx, met_func in enumerate(metric_funcs):
+            m = met_func(pred_ts, gt_ts, mask_ts).item()
+            metrics_sum[idx] += m
 
-    n = valid_mask.sum((-1, -2))
-    valid_frame = (n > 0)
-    pred_depth_ts = pred_depth_ts[valid_frame]
-    gt_depth_ts = gt_depth_ts[valid_frame]
-    valid_mask_ts = valid_mask_ts[valid_frame]
+        frames_count += 1
 
-    for met_func in metric_funcs:
-        _metric_name = met_func.__name__
-        _metric = met_func(pred_depth_ts, gt_depth_ts, valid_mask_ts).item()
-        sample_metric.append(_metric)
-    return sample_metric
+    if frames_count == 0:
+        return [float("nan")] * len(eval_metrics)
+
+    # 프레임 평균(원래 코드도 프레임단위 평균)
+    metrics_mean = (metrics_sum / frames_count).tolist()
+    return metrics_mean
+
 
 
 def main():
@@ -248,12 +287,8 @@ def main():
                 flow_paths = []
                 factors = []
                 for images in value:
-                    # infer_path = (args.infer_path + '/'+ dataset + '/' + images['image']).replace('.jpg', '.npy').replace('.png', '.npy')
-                    img_rel = images['image'].replace('color_origin', 'color')
-                    infer_path = (
-                        args.infer_path + '/' + dataset + '/' + img_rel
-                    ).replace('.jpg', '.npy').replace('.png', '.npy')
-                    # print(f"DEBUG infer_path: {infer_path}, exists? {os.path.exists(infer_path)}")
+                    infer_path = (args.infer_path + '/'+ dataset + '/' + images['image']).replace('.jpg', '.npy').replace('.png', '.npy')
+                    
                     infer_paths.append(infer_path)
                     depth_gt_paths.append(args.root_path + '/' + images['gt_depth'])
                     factors.append(images['factor'])
@@ -261,12 +296,7 @@ def main():
                 depth_gt_paths = depth_gt_paths[:args.max_eval_len]
                 factors = factors[:args.max_eval_len]
                 results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)
-                if results_single is None:
-                    # 유효 프레임 없으면 건너뛰기
-                    continue
-                # results_all.append(results_single)
-                results_all.append([m.item() if isinstance(m, torch.Tensor) else m
-                        for m in results_single])
+                results_all.append(results_single)
         final_results =  np.array(results_all)
         final_results_mean = np.mean(final_results, axis=0)
         result_dict = { 'name': dataset }

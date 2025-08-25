@@ -10,13 +10,13 @@ export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/scannet_stream_vitl"
+INFER_PATH="${ROOT}/benchmark/output/scannet_stream_13"
 
 # 2) JSON 메타데이터
-JSON_FILE="${ROOT}/benchmark/dataset_extract/datasets/scannet/scannet_video.json"
+JSON_FILE="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
 
 # 3) GT 루트
-BENCHMARK_ROOT="${ROOT}/benchmark/dataset_extract/datasets"
+BENCHMARK_ROOT="/workspace/stream/Video-Depth-Anything/datasets"
 
 mkdir -p "${INFER_PATH}"
 

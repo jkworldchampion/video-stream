@@ -325,7 +325,7 @@ class TemporalAttention(CrossAttention):
             # Check if cached states are compatible - only feature dimension needs to match
             # Batch dimension should already match since we're processing the same image resolution
             if cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print("Creating new compatible cache...")
+                # print("Creating new compatible cache...")
                 cached_hidden_states = torch.zeros(
                     hidden_states.shape[0], 0, hidden_states.shape[2],
                     device=hidden_states.device, dtype=hidden_states.dtype
@@ -365,8 +365,8 @@ class TemporalAttention(CrossAttention):
                 
             hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
             
-            # Ensure total temporal length doesn't exceed maximum
-            max_total_length = 32
+            # Ensure total temporal length doesn't exceed maximum (configurable)
+            max_total_length = getattr(self, 'max_total_length', 32)
             if hidden_states.shape[1] > max_total_length:
                 hidden_states = hidden_states[:, -max_total_length:, :]
 

@@ -15,7 +15,7 @@ benchmark_root=$2 # The parent directory that contaning [sintel, scannet, KITTI,
 python3 benchmark/eval/eval.py \
     --infer_path $pred_disp_root \
     --benchmark_path $benchmark_root \
-    --datasets scannet
+    --datasets scannet_500
 
 # #eval kitti
 # python3 benchmark/eval/eval.py \

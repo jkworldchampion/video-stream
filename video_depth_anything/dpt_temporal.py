@@ -28,11 +28,14 @@ class DPTHeadTemporal(DPTHead):
         use_clstoken=False,
         num_frames=32,
         pe='ape',
-        use_causal_mask=True
+        use_causal_mask=True,
+        use_self_forcing=False
     ):
         super().__init__(in_channels, features, use_bn, out_channels, use_clstoken)
 
         assert num_frames > 0
+        self.use_self_forcing = use_self_forcing
+        
         motion_module_kwargs = EasyDict(num_attention_heads                = 8,
                                         num_transformer_block              = 1,
                                         num_attention_blocks               = 2,
@@ -51,8 +54,20 @@ class DPTHeadTemporal(DPTHead):
             TemporalModule(in_channels=features,
                            **motion_module_kwargs)
         ])
+        
+        # Self-forcing을 위한 depth conditioning projection
+        if self.use_self_forcing:
+            # layer_3에 맞는 채널 수로 출력 (out_channels[2])
+            target_channels = out_channels[2]  # layer_3의 채널 수
+            self.depth_proj = nn.Sequential(
+                nn.Conv2d(1, target_channels//4, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(target_channels//4, target_channels//2, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(target_channels//2, target_channels, kernel_size=1)
+            )
 
-    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None):
+    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None, prev_depth=None):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -77,6 +92,18 @@ class DPTHeadTemporal(DPTHead):
             N = len(cached_hidden_state_list) // len(self.motion_modules)
         else:
             N = 0
+
+        # Self-forcing: 이전 depth가 주어진 경우 layer_3에 conditioning 정보 추가
+        if self.use_self_forcing and prev_depth is not None:
+            # prev_depth: [B, 1, H, W] -> layer_3와 같은 해상도로 resize
+            depth_cond = F.interpolate(prev_depth, size=layer_3.shape[-2:], mode='bilinear', align_corners=True)
+            depth_features = self.depth_proj(depth_cond)  # [B, features, H', W']
+            
+            # layer_3의 첫 번째 프레임에 depth conditioning 추가
+            layer_3_reshaped = layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            if T > 0:
+                layer_3_reshaped[:, :, 0] = layer_3_reshaped[:, :, 0] + depth_features
+            layer_3 = layer_3_reshaped.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
         layer_3, h0 = self.motion_modules[0](layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, cached_hidden_state_list[0:N] if N else None)
         layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
