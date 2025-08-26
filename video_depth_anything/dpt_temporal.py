@@ -36,6 +36,10 @@ class DPTHeadTemporal(DPTHead):
         assert num_frames > 0
         self.use_self_forcing = use_self_forcing
         
+        # Self-forcing을 위한 depth projection layer
+        if self.use_self_forcing:
+            self.depth_proj = nn.Conv2d(1, out_channels[2], kernel_size=3, padding=1)
+        
         motion_module_kwargs = EasyDict(num_attention_heads                = 8,
                                         num_transformer_block              = 1,
                                         num_attention_blocks               = 2,
@@ -67,7 +71,14 @@ class DPTHeadTemporal(DPTHead):
                 nn.Conv2d(target_channels//2, target_channels, kernel_size=1)
             )
 
-    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None, prev_depth=None):
+    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None, prev_depth=None, bidirectional_update_length=16, current_frame=0):
+        """
+        Forward pass with bidirectional update support.
+        
+        Args:
+            bidirectional_update_length: Number of recent frames to update bidirectionally
+            current_frame: Current frame index for bidirectional update logic
+        """
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -105,9 +116,15 @@ class DPTHeadTemporal(DPTHead):
                 layer_3_reshaped[:, :, 0] = layer_3_reshaped[:, :, 0] + depth_features
             layer_3 = layer_3_reshaped.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
-        layer_3, h0 = self.motion_modules[0](layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, cached_hidden_state_list[0:N] if N else None)
+        layer_3, h0 = self.motion_modules[0](layer_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, 
+                                             cached_hidden_state_list[0:N] if N else None,
+                                             bidirectional_update_length=bidirectional_update_length,
+                                             current_frame=current_frame)
         layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
-        layer_4, h1 = self.motion_modules[1](layer_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, cached_hidden_state_list[N:2*N] if N else None)
+        layer_4, h1 = self.motion_modules[1](layer_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, 
+                                             cached_hidden_state_list[N:2*N] if N else None,
+                                             bidirectional_update_length=bidirectional_update_length,
+                                             current_frame=current_frame)
         layer_4 = layer_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
         layer_1_rn = self.scratch.layer1_rn(layer_1)
@@ -116,10 +133,16 @@ class DPTHeadTemporal(DPTHead):
         layer_4_rn = self.scratch.layer4_rn(layer_4)
 
         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        path_4, h2 = self.motion_modules[2](path_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, cached_hidden_state_list[2*N:3*N] if N else None)
+        path_4, h2 = self.motion_modules[2](path_4.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, 
+                                            cached_hidden_state_list[2*N:3*N] if N else None,
+                                            bidirectional_update_length=bidirectional_update_length,
+                                            current_frame=current_frame)
         path_4 = path_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
         path_3 = self.scratch.refinenet3(path_4, layer_3_rn, size=layer_2_rn.shape[2:])
-        path_3, h3 = self.motion_modules[3](path_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, cached_hidden_state_list[3*N:] if N else None)
+        path_3, h3 = self.motion_modules[3](path_3.unflatten(0, (B, T)).permute(0, 2, 1, 3, 4), None, None, 
+                                            cached_hidden_state_list[3*N:] if N else None,
+                                            bidirectional_update_length=bidirectional_update_length,
+                                            current_frame=current_frame)
         path_3 = path_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
         batch_size = layer_1_rn.shape[0]

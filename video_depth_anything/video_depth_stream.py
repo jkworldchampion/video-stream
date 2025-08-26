@@ -68,10 +68,27 @@ class VideoDepthAnything(nn.Module):
         features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
         return features
 
-    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, prev_depth=None):
+    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, prev_depth=None, bidirectional_update_length=16, current_frame=0):
+        """
+        Forward pass for depth prediction with optional bidirectional update support.
+        
+        Args:
+            features: Input features from encoder
+            x_shape: Input tensor shape (B, T, C, H, W)
+            cached_hidden_state_list: Cached hidden states from previous frames
+            prev_depth: Previous depth for self-forcing
+            bidirectional_update_length: Number of recent frames to update bidirectionally (default: 16)
+            current_frame: Current frame index for bidirectional update logic
+        """
         B, T, _, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
-        depth, cur_cached_hidden_state_list = self.head(features, patch_h, patch_w, T, cached_hidden_state_list=cached_hidden_state_list, prev_depth=prev_depth)
+        depth, cur_cached_hidden_state_list = self.head(
+            features, patch_h, patch_w, T, 
+            cached_hidden_state_list=cached_hidden_state_list, 
+            prev_depth=prev_depth,
+            bidirectional_update_length=bidirectional_update_length,
+            current_frame=current_frame
+        )
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list

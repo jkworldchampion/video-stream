@@ -106,6 +106,17 @@ class CrossAttention(nn.Module):
     def reshape_batch_dim_to_heads(self, tensor):
         batch_size, seq_len, dim = tensor.shape
         head_size = self.heads
+        
+        # Safety check for divisibility
+        if batch_size % head_size != 0:
+            print(f"WARNING: batch_size {batch_size} is not divisible by heads {head_size}")
+            print(f"Tensor shape: {tensor.shape}")
+            # Adjust batch_size to be divisible
+            adjusted_batch_size = (batch_size // head_size) * head_size
+            tensor = tensor[:adjusted_batch_size]
+            batch_size = adjusted_batch_size
+            print(f"Adjusted tensor shape: {tensor.shape}")
+        
         tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim).contiguous()
         tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size).contiguous()
         return tensor

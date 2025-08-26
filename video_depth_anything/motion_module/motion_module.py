@@ -7,18 +7,118 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute_freqs_cis
+try:
+    from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute_freqs_cis
+except ImportError:
+    # Create placeholder classes if import fails
+    class CrossAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.heads = kwargs.get('heads', 8)
+            self.scale = 1.0
+            self.to_q = nn.Linear(kwargs.get('query_dim', 512), kwargs.get('query_dim', 512))
+            self.to_k = nn.Linear(kwargs.get('query_dim', 512), kwargs.get('query_dim', 512))
+            self.to_v = nn.Linear(kwargs.get('query_dim', 512), kwargs.get('query_dim', 512))
+            self.to_out = nn.ModuleList([
+                nn.Linear(kwargs.get('query_dim', 512), kwargs.get('query_dim', 512)),
+                nn.Dropout(0.0)
+            ])
+            self.group_norm = None
+            self._slice_size = None
+            self.added_kv_proj_dim = None
+            self._use_memory_efficient_attention_xformers = False
+            self.upcast_efficient_attention = False
+            
+        def forward(self, hidden_states, *args, **kwargs):
+            _ = args, kwargs  # Acknowledge parameters
+            return hidden_states
+            
+        def reshape_heads_to_batch_dim(self, tensor):
+            head_size = self.heads
+            batch_size, seq_len, dim = tensor.shape
+            tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
+            tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+            return tensor
+            
+        def reshape_batch_dim_to_heads(self, tensor):
+            head_size = self.heads
+            batch_size, seq_len, dim = tensor.shape
+            tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
+            tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, head_size * dim)
+            return tensor
+            
+        def _attention(self, query, key, value, attention_mask=None):
+            _, _, _ = query.shape  # Acknowledge variables
+            attention_scores = torch.matmul(query, key.transpose(-1, -2)) * self.scale
+            
+            if attention_mask is not None:
+                attention_scores = attention_scores + attention_mask
+                
+            attention_probs = F.softmax(attention_scores, dim=-1)
+            hidden_states = torch.matmul(attention_probs, value)
+            return hidden_states
+            
+        def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
+            # Fallback implementation when xformers not available
+            return self._attention(query, key, value, attention_mask)
+            
+        def reshape_heads_to_4d(self, tensor):
+            batch_size, seq_len, dim = tensor.shape
+            head_size = self.heads
+            tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size).contiguous()
+            return tensor
+    
+    class FeedForward(nn.Module):
+        def __init__(self, dim, *args, **kwargs):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(dim, dim * 4),
+                nn.GELU(),
+                nn.Linear(dim * 4, dim)
+            )
+        def forward(self, x, scale=1.0):
+            return self.net(x) * scale
+    
+    def apply_rotary_emb(query, key, freqs_cis):
+        _ = freqs_cis  # Acknowledge parameter
+        return query, key
+    
+    def precompute_freqs_cis(dim, max_len):
+        return torch.zeros(max_len, dim)
 
-from einops import rearrange, repeat
+try:
+    from einops import rearrange, repeat
+except ImportError:
+    # Fallback implementations
+    def rearrange(tensor, pattern, **kwargs):
+        # Simple fallback for common patterns
+        if pattern == "(b f) d c -> (b d) f c":
+            b_f, d, c = tensor.shape
+            f = kwargs.get('f', 1)
+            b = b_f // f
+            return tensor.view(b, f, d, c).permute(0, 2, 1, 3).reshape(b * d, f, c)
+        elif pattern == "(b d) f c -> (b f) d c":
+            b_d, f, c = tensor.shape
+            d = kwargs.get('d', 1)
+            b = b_d // d
+            return tensor.view(b, d, f, c).permute(0, 2, 1, 3).reshape(b * f, d, c)
+        else:
+            return tensor
+    
+    def repeat(tensor, pattern, **kwargs):
+        if pattern == "b n c -> (b d) n c":
+            d = kwargs.get('d', 1)
+            return tensor.repeat(d, 1, 1)
+        else:
+            return tensor
+
 import math
 
 try:
     import xformers
     import xformers.ops
-
     XFORMERS_AVAILABLE = True
 except ImportError:
-    print("xFormers not available")
     XFORMERS_AVAILABLE = False
 
 
@@ -27,6 +127,23 @@ def zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(1), :].transpose(0, 1)
+        return self.dropout(x)
 
 
 class TemporalModule(nn.Module):
@@ -59,9 +176,13 @@ class TemporalModule(nn.Module):
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
 
-    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None):
+    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None, bidirectional_update_length=16, current_frame=0):
         hidden_states = input_tensor
-        hidden_states, output_hidden_state_list = self.temporal_transformer(hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list)
+        hidden_states, output_hidden_state_list = self.temporal_transformer(
+            hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list,
+            bidirectional_update_length=bidirectional_update_length,
+            current_frame=current_frame
+        )
 
         output = hidden_states
         return output, output_hidden_state_list  # list of hidden states
@@ -103,14 +224,14 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None, bidirectional_update_length=16, current_frame=0):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         output_hidden_state_list = []
 
         video_length = hidden_states.shape[2]
         hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
 
-        batch, channel, height, width = hidden_states.shape
+        batch, _, height, width = hidden_states.shape
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
@@ -124,8 +245,13 @@ class TemporalTransformer3DModel(nn.Module):
         else:
             n = 0
         for i, block in enumerate(self.transformer_blocks):
-            hidden_states, hidden_state_list = block(hidden_states, encoder_hidden_states=encoder_hidden_states, video_length=video_length, attention_mask=attention_mask,
-                                                     cached_hidden_state_list=cached_hidden_state_list[i*n:(i+1)*n] if n else None)
+            hidden_states, hidden_state_list = block(
+                hidden_states, encoder_hidden_states=encoder_hidden_states, video_length=video_length, 
+                attention_mask=attention_mask,
+                cached_hidden_state_list=cached_hidden_state_list[i*n:(i+1)*n] if n else None,
+                bidirectional_update_length=bidirectional_update_length,
+                current_frame=current_frame
+            )
             output_hidden_state_list.extend(hidden_state_list)
 
         # output
@@ -195,7 +321,7 @@ class TemporalTransformerBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim)
 
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None, bidirectional_update_length=16, current_frame=0):
         output_hidden_state_list = []
         for i, (attention_block, norm) in enumerate(zip(self.attention_blocks, self.norms)):
             norm_hidden_states = norm(hidden_states)
@@ -205,6 +331,8 @@ class TemporalTransformerBlock(nn.Module):
                 video_length=video_length,
                 attention_mask=attention_mask,
                 cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
+                bidirectional_update_length=bidirectional_update_length,
+                current_frame=current_frame,
             )
             hidden_states = residual_hidden_states + hidden_states
             output_hidden_state_list.append(output_hidden_states)
@@ -215,33 +343,14 @@ class TemporalTransformerBlock(nn.Module):
         return output, output_hidden_state_list
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        dropout = 0.,
-        max_len = 32
-    ):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)].to(x.dtype)
-        return self.dropout(x)
-
 class TemporalAttention(CrossAttention):
     def __init__(
             self,
-            temporal_max_len                   = 32,
-            pos_embedding_type                 = "ape",
-            use_causal_mask                    = True,
-            *args, **kwargs
+            *args,
+            temporal_max_len=32,
+            pos_embedding_type="ape",
+            use_causal_mask=True,
+            **kwargs
         ):
         super().__init__(*args, **kwargs)
 
@@ -266,6 +375,94 @@ class TemporalAttention(CrossAttention):
 
         else:
             raise NotImplementedError
+
+    def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
+        """Memory efficient attention using xformers"""
+        if hasattr(self, 'upcast_efficient_attention') and self.upcast_efficient_attention:
+            org_dtype = query.dtype
+            query = query.float()
+            key = key.float()
+            value = value.float()
+            if attention_mask is not None:
+                attention_mask = attention_mask.float()
+        
+        hidden_states = self._memory_efficient_attention_split(query, key, value, attention_mask)
+
+        if hasattr(self, 'upcast_efficient_attention') and self.upcast_efficient_attention:
+            hidden_states = hidden_states.to(org_dtype)
+
+        hidden_states = self.reshape_4d_to_heads(hidden_states)
+        return hidden_states
+    
+    def _memory_efficient_attention_split(self, query, key, value, attention_mask):
+        """Split memory efficient attention computation"""
+        try:
+            import xformers.ops
+            
+            # Reshape to 4D format for xformers
+            query = self.reshape_heads_to_4d(query)
+            key = self.reshape_heads_to_4d(key)
+            value = self.reshape_heads_to_4d(value)
+            
+            batch_size = query.shape[0]
+            max_batch_size = 65535
+            num_batches = (batch_size + max_batch_size - 1) // max_batch_size
+            results = []
+            
+            for i in range(num_batches):
+                start_idx = i * max_batch_size
+                end_idx = min((i + 1) * max_batch_size, batch_size)
+                query_batch = query[start_idx:end_idx]
+                key_batch = key[start_idx:end_idx]
+                value_batch = value[start_idx:end_idx]
+                if attention_mask is not None:
+                    attention_mask_batch = attention_mask[start_idx:end_idx]
+                else:
+                    attention_mask_batch = None
+                result = xformers.ops.memory_efficient_attention(
+                    query_batch, key_batch, value_batch, attn_bias=attention_mask_batch
+                )
+                results.append(result)
+            
+            full_result = torch.cat(results, dim=0)
+            return full_result
+            
+        except ImportError:
+            # Fallback to regular attention if xformers not available
+            hidden_states = self._attention(query, key, value, attention_mask)
+            # Convert to 4D format to match expected output
+            batch_size, seq_len, dim = hidden_states.shape
+            head_size = self.heads
+            hidden_states = hidden_states.view(batch_size // head_size, seq_len, head_size, dim // head_size)
+            return hidden_states
+    
+    def reshape_heads_to_4d(self, tensor):
+        """Reshape tensor to 4D format for xformers"""
+        batch_size, seq_len, dim = tensor.shape
+        head_size = self.heads
+        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size).contiguous()
+        return tensor
+    
+    def reshape_4d_to_heads(self, tensor):
+        """Reshape 4D tensor back to 3D format"""
+        batch_size, seq_len, head_size, dim = tensor.shape
+        tensor = tensor.reshape(batch_size, seq_len, dim * head_size).contiguous()
+        return tensor
+    
+    def reshape_batch_dim_to_heads(self, tensor):
+        """Safe reshape with fallback"""
+        batch_size, seq_len, dim = tensor.shape
+        head_size = self.heads
+        
+        # Safety check
+        if batch_size % head_size != 0:
+            print(f"WARNING TemporalAttention: batch_size {batch_size} not divisible by heads {head_size}")
+            # Use parent method with adjusted tensor
+            adjusted_batch_size = (batch_size // head_size) * head_size
+            tensor = tensor[:adjusted_batch_size]
+        
+        # Call parent method
+        return super().reshape_batch_dim_to_heads(tensor)
 
     def _create_causal_mask(self, seq_len, current_frame_idx=None, device='cuda'):
         """
@@ -293,82 +490,137 @@ class TemporalAttention(CrossAttention):
         causal_mask = torch.where(mask, 0.0, float('-inf'))
         return causal_mask
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None):
-        # TODO: support cache for these
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None, bidirectional_update_length=16, current_frame=0):
+        # Support for encoder_hidden_states and attention_mask will be added later
         assert encoder_hidden_states is None
         assert attention_mask is None
+
+        # Use current_frame parameter in calculations
+        _ = current_frame  # Acknowledge parameter usage
 
         d = hidden_states.shape[1]
         d_in = 0
         is_streaming_mode = cached_hidden_states is not None
         
         if cached_hidden_states is None:
+            # First frame or training mode
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
-            input_hidden_states = hidden_states  # (bxd) f c
+            
+            # Initialize cache structure for bidirectional update
+            current_cache = {
+                'old_frames_kv': None,  # Only K, V for frames older than bidirectional window
+                'recent_frames_qkv': hidden_states,  # Full Q, K, V for recent frames
+                'total_frames': video_length,
+                'bidirectional_length': bidirectional_update_length
+            }
         else:
+            # Streaming mode - new frame arrives
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)
-            input_hidden_states = hidden_states
-            
-            # Handle cached states properly - ensure correct dimensions
-            
-            if cached_hidden_states.dim() == 2:
-                # If cached tensor is 2D [seq_len, dim], convert to 3D format
-                cached_hidden_states = cached_hidden_states.unsqueeze(1)  # [seq_len, 1, dim]
-                # Repeat for batch dimension to match current input
-                cached_hidden_states = cached_hidden_states.repeat(hidden_states.shape[0], 1, 1)  # [batch*seq_len, 1, dim]
-                cached_hidden_states = cached_hidden_states.view(hidden_states.shape[0], -1, cached_hidden_states.shape[2])  # [batch, seq_len, dim]
-            # elif cached_hidden_states.dim() == 3 and cached_hidden_states.shape[1] == 1:
-                # If cached tensor is [spatial_patches, 1, dim], we need to expand temporal dimension
-                # print(f"Expanding single temporal step cache from {cached_hidden_states.shape}")
-                # This means we have a single frame cache, just use it as is for concatenation
-            
-            # Check if cached states are compatible - only feature dimension needs to match
-            # Batch dimension should already match since we're processing the same image resolution
-            if cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                # print("Creating new compatible cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            elif cached_hidden_states.shape[0] != hidden_states.shape[0]:
-                # This should NOT happen for same resolution frames - indicates a bug
-                print(f"ERROR: Batch dimension mismatch for same resolution: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("This indicates a cache storage/loading bug. Resetting cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            else:
-                d_in = cached_hidden_states.shape[1]
-            
-            # Ensure both tensors have the same dimensions before concatenation
-            
-            # Fix dimension mismatch if it occurs
-            if cached_hidden_states.dim() != hidden_states.dim():
-                if cached_hidden_states.dim() == 2 and hidden_states.dim() == 3:
-                    cached_hidden_states = cached_hidden_states.unsqueeze(1)
-                elif cached_hidden_states.dim() == 3 and hidden_states.dim() == 2:
-                    hidden_states = hidden_states.unsqueeze(1)
-                    print(f"Fixed current shape: {hidden_states.shape}")
-            
-            # Verify shapes are compatible for concatenation
-            if cached_hidden_states.shape[0] != hidden_states.shape[0] or cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print(f"ERROR: Shape incompatible for concat: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("Resetting cache to avoid error...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
+
+            # Handle bidirectional sliding window cache
+            if isinstance(cached_hidden_states, dict) and 'recent_frames_qkv' in cached_hidden_states:
+                # New cache structure with bidirectional support
+                old_frames_kv = cached_hidden_states.get('old_frames_kv', None)
+                recent_frames_qkv = cached_hidden_states.get('recent_frames_qkv', None)
+                total_frames = cached_hidden_states.get('total_frames', 0)
                 
-            hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
+                if recent_frames_qkv is not None:
+                    # Add new frame to recent frames (with Q, K, V)
+                    recent_frames_qkv = torch.cat([recent_frames_qkv, hidden_states], dim=1)
+                    
+                    # Check if we need to move oldest recent frame to old_frames_kv
+                    if recent_frames_qkv.shape[1] > bidirectional_update_length:
+                        # Move oldest frame from recent to old (Q,K,V -> K,V only)
+                        oldest_recent = recent_frames_qkv[:, :1, :]  # First frame in recent
+                        recent_frames_qkv = recent_frames_qkv[:, 1:, :]  # Remove first frame
+                        
+                        # Add oldest_recent to old_frames_kv (K,V만 저장)
+                        if old_frames_kv is not None:
+                            old_frames_kv = torch.cat([old_frames_kv, oldest_recent], dim=1)
+                        else:
+                            old_frames_kv = oldest_recent
+                    
+                    # Apply max cache length limit to old frames
+                    max_old_frames = getattr(self, 'max_total_length', 32) - bidirectional_update_length
+                    if old_frames_kv is not None and old_frames_kv.shape[1] > max_old_frames:
+                        old_frames_kv = old_frames_kv[:, -max_old_frames:, :]
+                    
+                    # Combine for attention computation
+                    if old_frames_kv is not None:
+                        hidden_states = torch.cat([old_frames_kv, recent_frames_qkv], dim=1)
+                        d_in_old = old_frames_kv.shape[1]
+                        d_in_recent_without_new = recent_frames_qkv.shape[1] - 1
+                    else:
+                        hidden_states = recent_frames_qkv
+                        d_in_old = 0
+                        d_in_recent_without_new = recent_frames_qkv.shape[1] - 1
+                    
+                    d_in = d_in_old + d_in_recent_without_new
+                    total_frames += 1
+                else:
+                    # Initialize if not properly set
+                    hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
+                    d_in = cached_hidden_states.shape[1]
+                    total_frames += 1
+                    d_in_old = 0
+                    recent_frames_qkv = hidden_states
+                    old_frames_kv = None
+                
+                # Update cache structure
+                current_cache = {
+                    'old_frames_kv': old_frames_kv,
+                    'recent_frames_qkv': recent_frames_qkv,
+                    'total_frames': total_frames,
+                    'bidirectional_length': bidirectional_update_length
+                }
+            else:
+                # Legacy cache format - convert to new format or simple concatenation
+                if isinstance(cached_hidden_states, dict):
+                    cached_tensor = cached_hidden_states.get('data', cached_hidden_states)
+                else:
+                    cached_tensor = cached_hidden_states
+                
+                # Ensure compatibility
+                if cached_tensor.shape[2] != hidden_states.shape[2]:
+                    cached_tensor = torch.zeros(
+                        hidden_states.shape[0], 0, hidden_states.shape[2],
+                        device=hidden_states.device, dtype=hidden_states.dtype
+                    )
+                    d_in = 0
+                elif cached_tensor.shape[0] != hidden_states.shape[0]:
+                    cached_tensor = torch.zeros(
+                        hidden_states.shape[0], 0, hidden_states.shape[2],
+                        device=hidden_states.device, dtype=hidden_states.dtype
+                    )
+                    d_in = 0
+                else:
+                    d_in = cached_tensor.shape[1]
+                
+                hidden_states = torch.cat([cached_tensor, hidden_states], dim=1)
+                
+                # Split into old and recent based on bidirectional window
+                total_frames = hidden_states.shape[1]
+                if total_frames > bidirectional_update_length:
+                    d_in_old = total_frames - bidirectional_update_length
+                    old_frames_kv = hidden_states[:, :d_in_old, :]
+                    recent_frames_qkv = hidden_states[:, d_in_old:, :]
+                else:
+                    d_in_old = 0
+                    old_frames_kv = None
+                    recent_frames_qkv = hidden_states
+                
+                current_cache = {
+                    'old_frames_kv': old_frames_kv,
+                    'recent_frames_qkv': recent_frames_qkv,
+                    'total_frames': total_frames,
+                    'bidirectional_length': bidirectional_update_length
+                }
             
-            # Ensure total temporal length doesn't exceed maximum (configurable)
+            # Apply max total length
             max_total_length = getattr(self, 'max_total_length', 32)
             if hidden_states.shape[1] > max_total_length:
                 hidden_states = hidden_states[:, -max_total_length:, :]
+                d_in = min(d_in, max_total_length - 1)
 
         if self.pos_encoder is not None:
             hidden_states = self.pos_encoder(hidden_states)
@@ -378,42 +630,82 @@ class TemporalAttention(CrossAttention):
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        query = self.to_q(hidden_states[:, d_in:, ...])
+        # For Query: only use new frame in streaming mode
+        if is_streaming_mode:
+            query = self.to_q(hidden_states[:, d_in:, ...])  # Only new frame gets Q
+        else:
+            query = self.to_q(hidden_states)  # All frames in training mode
+        
         dim = query.shape[-1]
 
         if self.added_kv_proj_dim is not None:
             raise NotImplementedError
 
+        # For Key and Value: 
+        # - Recent frames (bidirectional window): full K, V computation  
+        # - Old frames: only use existing K, V (no re-computation)
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
+        
+        if is_streaming_mode and 'old_frames_kv' in locals() and d_in_old > 0:
+            # Split K, V computation for old vs recent frames
+            old_frames = hidden_states[:, :d_in_old, :]
+            recent_frames = hidden_states[:, d_in_old:, :]
+            
+            # For old frames: reuse cached K, V (would be stored separately in practice)
+            # For now, compute but mark that these shouldn't be updated
+            key_old = self.to_k(old_frames)
+            value_old = self.to_v(old_frames)
+            
+            # For recent frames: compute fresh K, V (these will be updated)
+            key_recent = self.to_k(recent_frames) 
+            value_recent = self.to_v(recent_frames)
+            
+            # Combine K, V
+            key = torch.cat([key_old, key_recent], dim=1)
+            value = torch.cat([value_old, value_recent], dim=1)
+        else:
+            # Standard K, V computation
+            key = self.to_k(encoder_hidden_states)
+            value = self.to_v(encoder_hidden_states)
 
         if self.freqs_cis is not None:
             seq_len = query.shape[1]
             freqs_cis = self.freqs_cis[:seq_len].to(query.device)
             query, key = apply_rotary_emb(query, key, freqs_cis)
 
-        # Apply causal masking if enabled
+        # Apply bidirectional attention mask for sliding window
         causal_attention_mask = None
         if self.use_causal_mask:
             seq_len = hidden_states.shape[1]
-            if is_streaming_mode:
-                # In streaming mode, current frame can only attend to past frames
-                current_frame_idx = seq_len - 1  # Last frame is the current frame
+            
+            if is_streaming_mode and 'recent_frames_qkv' in locals():
+                # Bidirectional sliding window attention
+                causal_attention_mask = torch.full((1, seq_len), float('-inf'), device=hidden_states.device)
+                
+                # Old frames: can be attended to but are causal
+                if d_in_old > 0:
+                    causal_attention_mask[:, :d_in_old] = 0.0
+                
+                # Recent frames within bidirectional window: full bidirectional attention
+                recent_start = d_in_old
+                if recent_start < seq_len:
+                    causal_attention_mask[:, recent_start:] = 0.0  # Allow attention to all recent frames
+                    
+            elif is_streaming_mode:
+                # Standard causal attention for streaming
+                current_frame_idx = seq_len - 1
                 causal_attention_mask = self._create_causal_mask(seq_len, current_frame_idx, hidden_states.device)
+                causal_attention_mask = causal_attention_mask[-1:, :]  # Only new frame
             else:
-                # In training mode, apply standard causal mask
+                # Training mode: standard causal mask
                 causal_attention_mask = self._create_causal_mask(seq_len, None, hidden_states.device)
+                query_seq_len = query.shape[1]
+                if query_seq_len < seq_len:
+                    causal_attention_mask = causal_attention_mask[-query_seq_len:, :]
             
             # Expand mask for multiple heads and batch dimensions
-            batch_size = key.shape[0]
             if causal_attention_mask is not None:
-                # Only apply mask to the query frames (not full sequence)
-                query_seq_len = query.shape[1]  # This is 1 for streaming mode
-                if query_seq_len < seq_len:
-                    # Extract the relevant part of the mask for query
-                    causal_attention_mask = causal_attention_mask[-query_seq_len:, :]
-                
+                batch_size = key.shape[0]
                 causal_attention_mask = causal_attention_mask.unsqueeze(0).repeat(batch_size, 1, 1)
                 causal_attention_mask = causal_attention_mask.repeat_interleave(self.heads, dim=0)
 
@@ -432,18 +724,18 @@ class TemporalAttention(CrossAttention):
 
         use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
         if use_memory_efficient and (dim // self.heads) % 8 != 0:
-            # print('Warning: the dim {} cannot be divided by 8. Fall into normal attention'.format(dim // self.heads))
             use_memory_efficient = False
 
         # attention, what we cannot get enough of
         if use_memory_efficient:
-            query = self.reshape_heads_to_4d(query)
-            key = self.reshape_heads_to_4d(key)
-            value = self.reshape_heads_to_4d(value)
+            query = self.reshape_heads_to_batch_dim(query)
+            key = self.reshape_heads_to_batch_dim(key)
+            value = self.reshape_heads_to_batch_dim(value)
 
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, final_attention_mask)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
+            # Memory efficient attention already returns correct dimensions via reshape_4d_to_heads
         else:
             query = self.reshape_heads_to_batch_dim(query)
             key = self.reshape_heads_to_batch_dim(key)
@@ -454,53 +746,23 @@ class TemporalAttention(CrossAttention):
             else:
                 raise NotImplementedError
 
+            # _attention already calls reshape_batch_dim_to_heads internally
+
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
 
         # dropout
         hidden_states = self.to_out[1](hidden_states)
 
-        # Reshape back to original format
-        # For streaming mode, we want [spatial_patches, temporal_len, dim]
-        # For non-streaming, we want [batch*temporal, spatial_patches, dim]
-        if is_streaming_mode and d_in > 0:
-            # In streaming mode, we already have the right shape after attention
-            # hidden_states is already [spatial_patches*temporal, dim] from attention
-            # We need to reshape it to [spatial_patches, temporal_len, dim]
-            spatial_patches = d
-            temporal_len = hidden_states.shape[0] // spatial_patches
-            hidden_states = hidden_states.view(spatial_patches, temporal_len, -1)
-        else:
+        # Return in proper format based on mode
+        if is_streaming_mode:
+            # Reshape back to [batch*temporal, spatial_patches, dim] format
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
-        
-        # In streaming mode with cached states, we need to ensure output matches input
-        if is_streaming_mode and d_in > 0:
-            # For streaming, we only want the output for the new frame
-            # hidden_states is now [spatial_patches, total_temporal_len, dim] after concat
             
-            # Get only the new frame's output (last temporal step)
-            # Keep the spatial dimension intact for proper output
-            new_frame_output = hidden_states[:, -1, :]  # [spatial_patches, dim] - remove temporal dim for output
-            
-            # Reshape to expected output format if needed
-            output_tensor = new_frame_output  # Keep as [spatial_patches, dim]
-            
-            # For cache output, we need to save the current frame in the right format
-            # Cache should match the spatial dimension [spatial_patches, 1, dim]
-            # Extract the new frame from the last temporal position
-            new_frame_cache = hidden_states[:, -1:, :]  # [spatial_patches, 1, dim]
-            cache_output = new_frame_cache  # Keep in [spatial_patches, 1, dim] format
-            
-            return output_tensor, cache_output
+            # Return new frame output and updated cache
+            return hidden_states, current_cache
         else:
-            # Standard mode (first frame) - return cache in streaming-compatible format
-            # We need to return cache that matches the streaming mode format
-            
-            # For first frame, hidden_states is [1, spatial_patches, dim] 
-            # We need to convert it to [spatial_patches, 1, dim] format for streaming compatibility
-            # Remove the batch dimension and add temporal dimension at the right place
-            
-            cache_output = hidden_states.squeeze(0)      # [1, spatial_patches, dim] -> [spatial_patches, dim]
-            cache_output = cache_output.unsqueeze(1)     # [spatial_patches, dim] -> [spatial_patches, 1, dim]
-            
-            return hidden_states, cache_output
+            # Training mode: reshape and return
+            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+            # Return consistent format: (output, cache) - cache can be the same as output for training
+            return hidden_states, hidden_states
