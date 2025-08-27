@@ -650,7 +650,9 @@ def train(args):
                             if key not in self.proj_layers:
                                 self.proj_layers[key] = torch.nn.Linear(s_tok.shape[-1], t_tok.shape[-1], bias=False)
                             s_tok = self.proj_layers[key](s_tok)
-                        feature_loss_raw = feature_loss_raw + F.mse_loss(s_tok, t_tok.detach())
+                        #feature_loss_raw = feature_loss_raw + F.mse_loss(s_tok, t_tok.detach())
+                        cos_sim = F.cosine_similarity(s_tok, t_tok.detach(), dim=-1, eps=1e-8)
+                        feature_loss_raw = feature_loss_raw + (1.0 - cos_sim.mean())
                     feature_loss_raw = feature_loss_raw / max(1, len(self.feature_layers))
 
                 depth_loss_w = self.depth_loss_weight * depth_loss_raw
@@ -1070,7 +1072,7 @@ def train(args):
                                 else:
                                     s_tok = s_feat
                                 
-                                # Ensure same device
+                                # Ensure same devicex
                                 if t_tok.device != s_tok.device:
                                     t_tok = t_tok.to(s_tok.device)
                                 
@@ -1081,7 +1083,9 @@ def train(args):
                                         model.proj_layers[key] = torch.nn.Linear(s_tok.shape[-1], t_tok.shape[-1], bias=False).to(s_tok.device)
                                     s_tok = model.proj_layers[key](s_tok)
                                 
-                                frame_feature_loss = frame_feature_loss + F.mse_loss(s_tok, t_tok.detach())
+                                #frame_feature_loss = frame_feature_loss + F.mse_loss(s_tok, t_tok.detach())
+                                cos_sim = F.cosine_similarity(s_tok, t_tok.detach(), dim=-1, eps=1e-8)
+                                frame_feature_loss = frame_feature_loss + (1.0 - cos_sim.mean())
                             
                             if len(model.feature_layers) > 0:
                                 frame_feature_loss = frame_feature_loss / len(model.feature_layers)
