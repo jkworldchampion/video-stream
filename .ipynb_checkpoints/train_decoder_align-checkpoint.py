@@ -589,7 +589,113 @@ def train(args):
                 self.scale_invariant = scale_invariant
                 self.depth_loss_weight = depth_loss_weight
                 self.proj_layers = torch.nn.ModuleDict()
+                self._register_decoder_hooks()
+                
+            def _get_module(self, root, dotted):
+                m = root
+                for p in dotted.split('.'):
+                    if hasattr(m, p):
+                        m = getattr(m, p)
+                    else:
+                        return None
+                return m
+            
+            class FeatureTap:
+                def __init__(self):
+                    self.last = None
+                def hook(self, module, inp, out):
+                    self.last = out
 
+            def _safe_key(self,name: str) -> str:
+                # dot은 모듈 경로 구분자로 쓰이므로 다른 문자로 치환
+                return name.replace('.', '__')
+            
+            def _register_decoder_hooks(self):
+                # tap할 디코더 레이어 이름들 (필요한 것만)
+                # DPTHeadTemporal 구조 기준: head.scratch.refinenet{4,3,2,1}, head.scratch.output_conv1 직전/직후 등
+                self.tap_names = [
+                    "head.scratch.refinenet4",
+                    "head.scratch.refinenet3",
+                    "head.scratch.refinenet2",
+                    "head.scratch.refinenet1",
+                    # "head.scratch.output_conv1",  # 원하면 활성화
+                ]
+            
+                self.taps_teacher = {}
+                self.taps_student = {}
+            
+                # DataParallel 고려: student는 .student 혹은 .student.module
+                stu_root = self.student.module if hasattr(self.student, "module") else self.student
+                tch_root = self.teacher
+            
+                for nm in self.tap_names:
+                    # teacher taps
+                    mod_t = self._get_module(tch_root, nm)
+                    if mod_t is not None:
+                        tap = self.FeatureTap()
+                        mod_t.register_forward_hook(tap.hook)
+                        self.taps_teacher[nm] = tap
+            
+                    # student taps
+                    mod_s = self._get_module(stu_root, nm)
+                    if mod_s is not None:
+                        tap = self.FeatureTap()
+                        mod_s.register_forward_hook(tap.hook)
+                        self.taps_student[nm] = tap
+            
+                # 디코더 채널 projection(학생→교사) 저장소
+                self.dec_proj = torch.nn.ModuleDict()
+
+            def _pick_current_frame(self, feat, B, T):
+                # feat: [B*T, C, H, W] 또는 [B, C, H, W]
+                if feat is None:
+                    return None
+                if feat.dim() == 4 and feat.shape[0] == B*T:
+                    # 교사: 마지막 프레임(-1)만
+                    return feat.view(B, T, *feat.shape[1:])[:, -1]  # [B, C, H, W]
+                elif feat.dim() == 4 and feat.shape[0] == B:
+                    # 학생: T=1
+                    return feat  # [B, C, H, W]
+                else:
+                    return None
+
+            @torch.no_grad()
+            def _ensure_proj(self, key_safe: str, Cs: int, Ct: int, device: torch.device):
+                # 이미 있으면 끝, 없으면 새로 만듦
+                if key_safe not in self.dec_proj:
+                    self.dec_proj[key_safe] = torch.nn.Conv2d(Cs, Ct, kernel_size=1, bias=False).to(device)
+            
+            def _align_and_loss(self, s, t, name, device, mode="cos"):
+                # s: student [B,Cs,Hs,Ws] (requires_grad=True)
+                # t: teacher [B,Ct,Ht,Wt] (no grad)
+                if s is None or t is None:
+                    return None
+            
+                # teacher 텐서를 학생 디바이스로 옮기고 grad 끊기
+                t = t.to(device).detach()
+            
+                # spatial align
+                if s.shape[-2:] != t.shape[-2:]:
+                    s = F.interpolate(s, size=t.shape[-2:], mode="bilinear", align_corners=True)
+            
+                Cs, Ct = s.shape[1], t.shape[1]
+            
+                # 채널 projection (학생 -> 교사)
+                raw_key  = f"decproj_{name}"               # 예: "decproj_head.scratch.refinenet4"
+                key_safe = self._safe_key(raw_key)              # 예: "decproj_head__scratch__refinenet4"
+                self._ensure_proj(key_safe, Cs, Ct, device)
+                s = self.dec_proj[key_safe](s)
+            
+                # loss
+                if mode == "cos":
+                    # per-pixel cosine: normalize along channel dim
+                    s_n = F.normalize(s, dim=1)
+                    t_n = F.normalize(t, dim=1)
+                    loss = (1.0 - (s_n * t_n).sum(dim=1)).mean()
+                else:
+                    loss = F.mse_loss(s, t)
+                return loss
+        
             def compute_teacher_student_loss(self, x, y):
                 device0 = x.device
                 with torch.no_grad():
@@ -1093,10 +1199,57 @@ def train(args):
                             if len(model.feature_layers) > 0:
                                 frame_feature_loss = frame_feature_loss / len(model.feature_layers)
                         
-                        # 가중치 적용된 Teacher-Student loss 저장 (값이 너무 큰 경우 스케일링)
-                        current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.1    
-                        current_distill_loss = model.distill_weight * frame_distill_loss * 0.1      
-                        current_feature_loss = model.feature_distill_weight * frame_feature_loss 
+                        # --- Decoder feature distillation (hooks) ---
+                        dec_feat_loss = pred_t_raw.new_tensor(0.0)
+                        
+                        if model.feature_distill_weight > 0:
+                            # B,T: 바로 위 문맥에서 사용 중인 값
+                            # 교사: CLIP_LEN = T_teacher, 학생: T_student = 1
+                            # 후크에서 꺼낸 출력들은 최근 forward에서 자동으로 채워져 있음
+                            Bcur, Tstu = B, 1
+                            Ttch = CLIP_LEN  # 교사 forward는 항상 CLIP_LEN
+                        
+                            # 각 tap 레이어에 대해 손실 누적
+                            valid_taps = 0
+                            for nm in model.tap_names:
+                                tap_t = model.taps_teacher.get(nm, None)
+                                tap_s = model.taps_student.get(nm, None)
+                                t_feat = tap_t.last if tap_t is not None else None
+                                s_feat = tap_s.last if tap_s is not None else None
+                        
+                                # 현재 프레임 꺼내기
+                                t_cur = model._pick_current_frame(t_feat, Bcur, Ttch)
+                                s_cur = model._pick_current_frame(s_feat, Bcur, Tstu)
+                        
+                                if (t_cur is None) or (s_cur is None):
+                                    continue
+                        
+                                one = model._align_and_loss(s_cur, t_cur, name=nm, device=pred_t_raw.device, mode="cos")
+                                if one is not None:
+                                    dec_feat_loss = dec_feat_loss + one
+                                    valid_taps += 1
+                        
+                            if valid_taps > 0:
+                                dec_feat_loss = dec_feat_loss / valid_taps
+
+                        if use_teacher_student:
+                            # 이미 optimizer가 들고 있는 모든 파라미터 id 집합
+                            existing = set(id(p) for g in optimizer.param_groups for p in g['params'])
+                        
+                            new_params = []
+                            for _, mod in model.dec_proj.items():
+                                for p in mod.parameters():
+                                    if id(p) not in existing:   # ✅ 항등으로 체크
+                                        new_params.append(p)
+                        
+                            if new_params:
+                                optimizer.add_param_group({'params': new_params})
+
+                        current_feature_loss = model.feature_distill_weight * dec_feat_loss * 0.1
+                        current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.01    
+                        current_distill_loss = model.distill_weight * frame_distill_loss * 0.01      
+                        #current_feature_loss = model.feature_distill_weight * frame_feature_loss 
+                                                
                         """
                         print(f"   weighted_depth_loss: {current_depth_loss.item():.6f} (weight={model.depth_loss_weight})")
                         print(f"   weighted_distill   : {current_distill_loss.item():.6f} (weight={model.distill_weight})")
@@ -1203,7 +1356,7 @@ def train(args):
                     if use_teacher_student:
                         # Teacher-Student loss를 SSI/TGM과 결합
                         loss = current_depth_loss + current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
-                        #loss = current_depth_loss + current_distill_loss
+                        #loss = current_depth_loss + current_distill_loss + current_feature_loss
                         current_ssi_loss = ssi_loss_t
                         current_tgm_loss = tgm_loss
                     else:

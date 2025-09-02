@@ -358,6 +358,10 @@ class TemporalAttention(CrossAttention):
         self._use_memory_efficient_attention_xformers = True
         self.use_causal_mask = use_causal_mask
 
+        # Attention output caching for Knowledge Distillation
+        self.attention_output_cache = None
+        self.enable_attention_caching = False
+
         self.pos_encoder = None
         self.freqs_cis = None
         if self.pos_embedding_type == "ape":
@@ -375,6 +379,16 @@ class TemporalAttention(CrossAttention):
 
         else:
             raise NotImplementedError
+    
+    def enable_kd_caching(self, enable=True):
+        """Enable/disable attention output caching for Knowledge Distillation"""
+        self.enable_attention_caching = enable
+        if not enable:
+            self.attention_output_cache = None
+    
+    def get_cached_attention_output(self):
+        """Get the cached attention output from last forward pass"""
+        return self.attention_output_cache
 
     def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
         """Memory efficient attention using xformers"""
@@ -750,6 +764,17 @@ class TemporalAttention(CrossAttention):
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
+
+        # Cache attention output for Knowledge Distillation (before dropout)
+        if self.enable_attention_caching:
+            # Store current frame attention output for KD
+            if is_streaming_mode:
+                # Only cache the new frame's attention output
+                self.attention_output_cache = hidden_states.detach().clone()
+            else:
+                # Cache the last frame's attention output for training
+                last_frame_output = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+                self.attention_output_cache = last_frame_output[-d:].detach().clone()  # Last frame only
 
         # dropout
         hidden_states = self.to_out[1](hidden_states)

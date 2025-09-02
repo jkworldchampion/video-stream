@@ -92,6 +92,10 @@ class VideoDepthAnything(nn.Module):
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list
+
+    def _unsqueeze_if_2d(self,x):
+        return x.unsqueeze(0) if isinstance(x, torch.Tensor) and x.dim() == 2 else x
+
     
     def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False):
         self.id += 1
@@ -182,12 +186,29 @@ class VideoDepthAnything(nn.Module):
                     # Validate cache dimensions for each layer
                     cur_cache = []
                     for i, layer_cache in enumerate(most_recent_cache):
-                        
+
+                        """
                         # Ensure cache has correct 3D format [spatial_patches, temporal_steps, dim]
                         if layer_cache.dim() == 2:
                             # Convert 2D to 3D by adding temporal dimension
                             layer_cache = layer_cache.unsqueeze(1)  # [spatial_patches, 1, dim]
-                        
+                        """
+
+                        if isinstance(layer_cache, torch.Tensor):
+                            layer_cache = self._unsqueeze_if_2d(layer_cache)
+                        elif isinstance(layer_cache, dict):
+                            # {"k": Tensor, "v": Tensor} 또는 레이어별 dict일 수 있음 → 텐서만 안전하게 처리
+                            layer_cache = {
+                                k: (self._unsqueeze_if_2d(v) if isinstance(v, torch.Tensor) else
+                                    {kk: self._unsqueeze_if_2d(vv) if isinstance(vv, torch.Tensor) else vv
+                                     for kk, vv in v.items()} if isinstance(v, dict) else v)
+                                for k, v in layer_cache.items()
+                            }
+                        elif layer_cache is None:
+                            pass
+                        else:
+                            # 다른 타입이면 일단 건드리지 않음
+                            pass
                         cur_cache.append(layer_cache)
                         
                 except (RuntimeError, ValueError, IndexError) as cache_error:

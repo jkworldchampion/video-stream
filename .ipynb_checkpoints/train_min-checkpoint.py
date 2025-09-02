@@ -504,7 +504,7 @@ def train(args):
     feature_distill_layers = hyper_params.get("feature_distill_layers", [2, 3])
     teacher_warmup_epochs = hyper_params.get("teacher_warmup_epochs", 5)
     cache_max_length = hyper_params.get("cache_max_length", 32)
-    distill_scale_invariant = hyper_params.get("distill_scale_invariant", False)
+    distill_scale_invariant = hyper_params.get("distill_scale_invariant", True)
     feature_distill_weight = hyper_params.get("feature_distill_weight", 1.0)
     log_gradient_norm = hyper_params.get("log_gradient_norm", True)
     log_scale_shift_stats = hyper_params.get("log_scale_shift_stats", True)
@@ -967,35 +967,38 @@ def train(args):
                         
                         # 프레임별 Teacher-Student loss 계산
                         y_t = y[:, t].squeeze(1) if y[:, t].dim() > 2 else y[:, t]  # [B,H,W]
-                        
+                                                
                         if model.scale_invariant:
-                            # Scale-invariant distillation
+                            # --- 1) GT로부터 정렬계수 a,b만 추정 (grad 불필요) ---
                             with torch.no_grad():
-                                gt_disp_t = 1.0 / y_t.clamp(min=1e-6)
-                                mask_t_ls = (y_t > 1e-3) & (y_t < 80.0)
-                                
-                                def align_single_frame(pred_depth):
-                                    pred_disp = 1.0 / pred_depth.clamp(min=1e-6)
-                                    B_, H_, W_ = pred_disp.shape
-                                    p_flat = pred_disp.view(B_, -1)
-                                    g_flat = gt_disp_t.view(B_, -1)
-                                    m_flat = mask_t_ls.view(B_, -1).float()
-                                    
-                                    A = torch.stack([p_flat, torch.ones_like(p_flat)], dim=-1) * m_flat.unsqueeze(-1)
-                                    b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
-                                    X = torch.linalg.lstsq(A, b_vec).solution
-                                    a = X[:, 0, 0].view(B_, 1, 1).clamp(min=1e-4, max=1e4)
-                                    b = X[:, 1, 0].view(B_, 1, 1).clamp(min=-1e4, max=1e4)
-                                    
-                                    aligned_disp = (pred_disp * a + b).clamp(min=1e-6)
-                                    return 1.0 / aligned_disp
-                                
-                                student_aligned = align_single_frame(pred_t_raw)
-                                teacher_aligned = align_single_frame(teacher_pred_t)
-                            
-                            # Depth space에서 L1 loss (더 안정적)
-                            frame_depth_loss = F.l1_loss(student_aligned, y_t)
-                            # Depth space에서 L1 loss로 변경 (MSE는 너무 큰 값 생성)
+                                gt_disp_t = 1.0 / y_t.clamp(min=1e-6)               # [B,H,W]
+                                mask_t_ls = (y_t > 1e-3) & (y_t < 80.0)             # [B,H,W]
+                        
+                                # pred는 a,b 추정에만 사용하므로 detach
+                                pred_disp_det = 1.0 / pred_t_raw.detach().clamp(min=1e-6)
+                                B_, H_, W_ = pred_disp_det.shape
+                                p_flat = pred_disp_det.view(B_, -1)
+                                g_flat = gt_disp_t.view(B_, -1)
+                                m_flat = mask_t_ls.view(B_, -1).float()
+                        
+                                A = torch.stack([p_flat, torch.ones_like(p_flat)], dim=-1) * m_flat.unsqueeze(-1)
+                                b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
+                                X = torch.linalg.lstsq(A, b_vec).solution
+                                a = X[:, 0, 0].view(B_, 1, 1).clamp(min=1e-4, max=1e4)    # [B,1,1]
+                                b = X[:, 1, 0].view(B_, 1, 1).clamp(min=-1e4, max=1e4)    # [B,1,1]
+                        
+                                # teacher는 grad 필요 없으니 여기서 정렬까지 완료
+                                t_disp = 1.0 / teacher_pred_t.clamp(min=1e-6)
+                                t_aligned_disp = (t_disp * a + b).clamp(min=1e-6)
+                                teacher_aligned = 1.0 / t_aligned_disp                 # [B,H,W]
+                        
+                            # --- 2) student 정렬은 grad 흐르게 계산 (a,b는 상수로 취급) ---
+                            s_disp = 1.0 / pred_t_raw.clamp(min=1e-6)                  # grad 유지
+                            s_aligned_disp = (s_disp * a.detach() + b.detach()).clamp(min=1e-6)
+                            student_aligned = 1.0 / s_aligned_disp                     # [B,H,W]
+                        
+                            # --- 3) 손실 계산 ---
+                            frame_depth_loss   = F.l1_loss(student_aligned, y_t)
                             frame_distill_loss = F.l1_loss(student_aligned, teacher_aligned)
                         else:
                             # Log space에서 계산하여 큰 값 방지
@@ -1091,9 +1094,14 @@ def train(args):
                                 frame_feature_loss = frame_feature_loss / len(model.feature_layers)
                         
                         # 가중치 적용된 Teacher-Student loss 저장 (값이 너무 큰 경우 스케일링)
-                        current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.01      # 1/100 스케일링
-                        current_distill_loss = model.distill_weight * frame_distill_loss * 0.01     # 1/100 스케일링  
-                        current_feature_loss = model.feature_distill_weight * frame_feature_loss * 0.1  # 1/10 스케일링
+                        current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.1    
+                        current_distill_loss = model.distill_weight * frame_distill_loss * 0.1      
+                        current_feature_loss = model.feature_distill_weight * frame_feature_loss 
+                        """
+                        print(f"   weighted_depth_loss: {current_depth_loss.item():.6f} (weight={model.depth_loss_weight})")
+                        print(f"   weighted_distill   : {current_distill_loss.item():.6f} (weight={model.distill_weight})")
+                        print(f"   weighted_feature   : {current_feature_loss.item():.6f} (weight={model.feature_distill_weight})")
+                        """
                         
                     else:
                         # 기존 방식 또는 Teacher-Student 미사용 (bidirectional update 적용)
@@ -1195,6 +1203,7 @@ def train(args):
                     if use_teacher_student:
                         # Teacher-Student loss를 SSI/TGM과 결합
                         loss = current_depth_loss + current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                        #loss = current_depth_loss + current_distill_loss
                         current_ssi_loss = ssi_loss_t
                         current_tgm_loss = tgm_loss
                     else:

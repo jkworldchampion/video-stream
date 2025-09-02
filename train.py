@@ -38,7 +38,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
-experiment = 19
+experiment = 21
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
@@ -76,13 +76,15 @@ def least_square_whole_clip(infs, gts, data_name):
     else:
         valid_mask = (gts > 1e-3) & (gts < 10.0)
 
-    gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).double() + 1e-6)
-    infs = infs.clamp(min=1e-3)
-    pred_disp_masked = infs[valid_mask].reshape((-1, 1)).double()
+    # autocast 비활성화 + float64 정밀도 보장 (lstsq 안정성)
+    with autocast(enabled=False):
+        gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).double() + 1e-6)
+        infs = infs.clamp(min=1e-3)
+        pred_disp_masked = infs[valid_mask].reshape((-1, 1)).double()
 
-    A = torch.cat([pred_disp_masked, torch.ones_like(pred_disp_masked)], dim=-1)
-    X = torch.linalg.lstsq(A, gt_disp_masked).solution
-    scale, shift = X[0].item(), X[1].item()
+        A = torch.cat([pred_disp_masked, torch.ones_like(pred_disp_masked)], dim=-1)
+        X = torch.linalg.lstsq(A, gt_disp_masked).solution
+        scale, shift = X[0].item(), X[1].item()
 
     aligned_pred = torch.clamp(scale * infs + shift, min=1e-3)
     depth = torch.zeros_like(aligned_pred)
@@ -232,10 +234,9 @@ def _detach_cache(cache):
         return cache.detach()
     return cache  # unknown type as-is
 
-def model_stream_step(model, x_t, cache=None, prev_depth=None, bidirectional_update_length=16, current_frame=0):
+def model_stream_step(model, x_t, cache=None, bidirectional_update_length=16, current_frame=0):
     """
     x_t: [B,1,3,H,W] (single-frame step)
-    prev_depth: [B,1,H,W] (previous predicted depth for self-forcing)
     bidirectional_update_length: number of recent frames to update bidirectionally
     current_frame: current frame index for bidirectional update
     return: pred_t [B, H, W], new_cache
@@ -256,13 +257,10 @@ def model_stream_step(model, x_t, cache=None, prev_depth=None, bidirectional_upd
         if 'bidirectional_update_length' in forward_depth_params and 'current_frame' in forward_depth_params:
             # 최신 bidirectional update 지원
             pred_t, new_cache = actual_model.forward_depth(
-                features, x_t.shape, cache, prev_depth, 
+                features, x_t.shape, cache, None, 
                 bidirectional_update_length=bidirectional_update_length,
                 current_frame=current_frame
             )
-        elif 'prev_depth' in forward_depth_params:
-            # self-forcing 지원하지만 bidirectional update 미지원
-            pred_t, new_cache = actual_model.forward_depth(features, x_t.shape, cache, prev_depth)
         else:
             # 기본 방식만 지원
             pred_t, new_cache = actual_model.forward_depth(features, x_t.shape, cache)
@@ -289,13 +287,10 @@ def model_stream_step(model, x_t, cache=None, prev_depth=None, bidirectional_upd
         if 'bidirectional_update_length' in forward_depth_params and 'current_frame' in forward_depth_params:
             # 최신 bidirectional update 지원
             pred_t, new_cache = actual_model.forward_depth(
-                temp_features, x_t.shape, cache, prev_depth,
+                temp_features, x_t.shape, cache, None,
                 bidirectional_update_length=bidirectional_update_length,
                 current_frame=current_frame
             )
-        elif 'prev_depth' in forward_depth_params:
-            # self-forcing 지원하지만 bidirectional update 미지원
-            pred_t, new_cache = actual_model.forward_depth(temp_features, x_t.shape, cache, prev_depth)
         else:
             # 기본 방식만 지원
             pred_t, new_cache = actual_model.forward_depth(temp_features, x_t.shape, cache)
@@ -397,15 +392,17 @@ def streaming_validate( model, loader, device, data_name, loss_ssi, loss_tgm, ra
                 raw_disp = pred_seq.clamp(min=1e-6)              # [B,T,H,W]
                 gt_disp  = (1.0 / y.clamp(min=1e-6)).squeeze(2)  # [B,T,H,W]
                 m_flat   = masks_seq.squeeze(2).view(Bv, -1).float()
-                p_flat   = raw_disp.view(Bv, -1)
-                g_flat   = gt_disp.view(Bv, -1)
+                # autocast 비활성화 + float32 캐스팅 (lstsq 안정성 보장)
+                with autocast(enabled=False):
+                    p_flat   = raw_disp.float().view(Bv, -1)
+                    g_flat   = gt_disp.float().view(Bv, -1)
 
-                A = torch.stack([p_flat, torch.ones_like(p_flat, device=device)], dim=-1)  # [B,P,2]
-                A = A * m_flat.unsqueeze(-1)
-                b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
-                X = torch.linalg.lstsq(A, b_vec).solution
-                a = X[:, 0, 0].view(Bv, 1, 1, 1)
-                b = X[:, 1, 0].view(Bv, 1, 1, 1)
+                    A = torch.stack([p_flat, torch.ones_like(p_flat, device=device)], dim=-1)  # [B,P,2]
+                    A = A * m_flat.unsqueeze(-1)
+                    b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
+                    X = torch.linalg.lstsq(A, b_vec).solution
+                    a = X[:, 0, 0].view(Bv, 1, 1, 1)
+                    b = X[:, 1, 0].view(Bv, 1, 1, 1)
                 aligned_disp = (raw_disp * a + b).clamp(min=MIN_DISP, max=MAX_DISP)  # [B,T,H,W]
 
                 save_dir = f"outputs/experiment_{experiment}/{tag}/epoch_{epoch}_batch_{batch_idx}"
@@ -435,17 +432,20 @@ def batch_ls_scale_shift(pred_disp, gt_disp, mask):
         g = gt_disp
 
     B, H, W = p.shape
-    m = mask.view(B, -1).float()                      # [B, P]
-    p_flat = p.view(B, -1)                            # [B, P]
-    g_flat = g.view(B, -1)                            # [B, P]
+    
+    # autocast 비활성화 + float32 캐스팅 (lstsq 안정성 보장)
+    with autocast(enabled=False):
+        m = mask.view(B, -1).float()                      # [B, P]
+        p_flat = p.float().view(B, -1)                    # [B, P]
+        g_flat = g.float().view(B, -1)                    # [B, P]
 
-    A = torch.stack([p_flat, torch.ones_like(p_flat, device=p.device)], dim=-1)  # [B,P,2]
-    A = A * m.unsqueeze(-1)
-    b_vec = g_flat.unsqueeze(-1) * m.unsqueeze(-1)
+        A = torch.stack([p_flat, torch.ones_like(p_flat, device=p.device)], dim=-1)  # [B,P,2]
+        A = A * m.unsqueeze(-1)
+        b_vec = g_flat.unsqueeze(-1) * m.unsqueeze(-1)
 
-    X = torch.linalg.lstsq(A, b_vec).solution        # [B,2,1]
-    a_star = X[:, 0, 0].view(B, 1, 1, 1)
-    b_star = X[:, 1, 0].view(B, 1, 1, 1)
+        X = torch.linalg.lstsq(A, b_vec).solution        # [B,2,1]
+        a_star = X[:, 0, 0].view(B, 1, 1, 1)
+        b_star = X[:, 1, 0].view(B, 1, 1, 1)
 
     # 안정성: a는 양수로, 극단치 클리핑
     a_star = a_star.clamp(min=1e-4, max=1e4)
@@ -493,16 +493,9 @@ def train(args):
     update_frequency = hyper_params.get("update_frequency", 4)    # 4~8 권장
     p_cache_reset    = hyper_params.get("p_cache_reset", 0.01)    # 캐시 드롭아웃
     
-    # Self-forcing parameters
-    use_self_forcing = hyper_params.get("use_self_forcing", False)
-    self_forcing_ratio = hyper_params.get("self_forcing_ratio", 0.3)
-    self_forcing_start_epoch = hyper_params.get("self_forcing_start_epoch", 10)
-    
     # Teacher-Student parameters
     use_teacher_student = hyper_params.get("use_teacher_student", True)
     teacher_distill_weight = hyper_params.get("teacher_distill_weight", 1.0)
-    feature_distill_layers = hyper_params.get("feature_distill_layers", [2, 3])
-    teacher_warmup_epochs = hyper_params.get("teacher_warmup_epochs", 5)
     cache_max_length = hyper_params.get("cache_max_length", 32)
     distill_scale_invariant = hyper_params.get("distill_scale_invariant", True)
     feature_distill_weight = hyper_params.get("feature_distill_weight", 1.0)
@@ -518,15 +511,13 @@ def train(args):
     
     logger.info(f"   • update_frequency (frames/step): {update_frequency}")
     logger.info(f"   • p_cache_reset: {p_cache_reset}")
-    logger.info(f"   • use_self_forcing: {use_self_forcing}")
     logger.info(f"   • use_teacher_student: {use_teacher_student}")
-    if use_self_forcing:
-        logger.info(f"   • self_forcing_ratio: {self_forcing_ratio}")
-        logger.info(f"   • self_forcing_start_epoch: {self_forcing_start_epoch}")
     if use_teacher_student:
         logger.info(f"   • teacher_distill_weight: {teacher_distill_weight}")
-        logger.info(f"   • feature_distill_layers: {feature_distill_layers}")
-        logger.info(f"   • teacher_warmup_epochs: {teacher_warmup_epochs}")
+        logger.info(f"   • attention_based_kd: True (replaces feature_distill_layers)")
+        logger.info(f"   • feature_distill_weight: {feature_distill_weight}")
+        logger.info(f"   • distill_scale_invariant: {distill_scale_invariant}")
+        logger.info(f"   • depth_loss_weight: {depth_loss_weight}")
 
 
     run = wandb.init(project="stream_teacher_student", entity="Depth-Finder", config=hyper_params)
@@ -575,106 +566,66 @@ def train(args):
         ).to(device)
         student_model = VideoDepthStudent(
             num_frames=CLIP_LEN, use_causal_mask=True, encoder="vits", features=64,
-            out_channels=[48, 96, 192, 384], use_self_forcing=use_self_forcing,
+            out_channels=[48, 96, 192, 384],
         ).to(device)
 
         class TeacherStudentWrapper(torch.nn.Module):
-            def __init__(self, teacher, student, distill_weight, feature_layers, feature_distill_weight, scale_invariant, depth_loss_weight):
+            def __init__(self, teacher, student, distill_weight, feature_distill_weight, scale_invariant, depth_loss_weight):
                 super().__init__()
                 self.teacher = teacher
                 self.student = student
                 self.distill_weight = distill_weight
-                self.feature_layers = feature_layers or []
                 self.feature_distill_weight = feature_distill_weight
                 self.scale_invariant = scale_invariant
                 self.depth_loss_weight = depth_loss_weight
                 self.proj_layers = torch.nn.ModuleDict()
 
-            def compute_teacher_student_loss(self, x, y):
-                device0 = x.device
-                with torch.no_grad():
-                    x_teacher = x.to('cuda:1') if torch.cuda.device_count() > 1 else x
-                    teacher_depth = self.teacher(x_teacher).to(device0)  # [B,T,H,W]
-                B, T = x.shape[:2]
-                cache = None  # Teacher니깐 없음
-                student_depths = []
-                for t in range(T):
-                    x_t = x[:, t:t+1] # time step을 
-                    sm = self.student.module if hasattr(self.student, 'module') else self.student
-                    feats_t = sm.forward_features(x_t)
-                    depth_t, cache = sm.forward_depth(feats_t, x_t.shape, cache)
-                    student_depths.append(depth_t.squeeze(1))
-                student_depth = torch.stack(student_depths, dim=1)
-                y_depth = y.squeeze(2) if (y.dim()==5 and y.shape[2]==1) else y
-                if self.scale_invariant:
-                    with torch.no_grad():
-                        gt_disp = 1.0 / y_depth.clamp(min=1e-6)
-                        mask = (y_depth > 1e-3) & (y_depth < 80.0)
-                        def align(pred_depth):
-                            pred_disp = 1.0 / pred_depth.clamp(min=1e-6)
-                            B_, T_, H_, W_ = pred_disp.shape
-                            p = pred_disp.view(B_, -1); g = gt_disp.view(B_, -1); m = mask.view(B_, -1).float()
-                            A = torch.stack([p, torch.ones_like(p)], dim=-1) * m.unsqueeze(-1)
-                            b_vec = g.unsqueeze(-1) * m.unsqueeze(-1)
-                            X = torch.linalg.lstsq(A, b_vec).solution
-                            a = X[:,0,0].view(B_,1,1,1).clamp(min=1e-4,max=1e4); b = X[:,1,0].view(B_,1,1,1).clamp(min=-1e4,max=1e4)
-                            aligned_disp = (pred_disp * a + b).clamp(min=1e-6)
-                            return 1.0 / aligned_disp
-                        student_aligned = align(student_depth)
-                        teacher_aligned = align(teacher_depth)
-                    depth_loss_raw = F.l1_loss(student_aligned, y_depth)
-                    distill_loss_raw = F.mse_loss(1.0/student_aligned.clamp(min=1e-6), 1.0/teacher_aligned.clamp(min=1e-6))
+            def forward(self, x, prev_depth=None):
+                """
+                Forward pass for streaming inference. Uses student model only.
+                Args:
+                    x: [B, T, 3, H, W] or [B, 1, 3, H, W] for streaming
+                    prev_depth: Not used (legacy parameter for compatibility)
+                Returns:
+                    depth: [B, T, H, W] or [B, H, W] for single frame
+                """
+                # For streaming inference, use student model
+                if hasattr(self.student, 'module'):
+                    # DataParallel wrapped
+                    return self.student.module.forward(x, prev_depth)
                 else:
-                    depth_loss_raw = F.l1_loss(student_depth, y_depth)
-                    distill_loss_raw = F.mse_loss(student_depth, teacher_depth.detach())
+                    # Single GPU
+                    return self.student.forward(x, prev_depth)
 
-                feature_loss_raw = student_depth.new_tensor(0.0)
-                if self.feature_distill_weight>0 and self.feature_layers:
-                    with torch.no_grad():
-                        teacher_feats = self.teacher.pretrained.get_intermediate_layers(
-                            x_teacher.flatten(0,1),
-                            self.teacher.intermediate_layer_idx[self.teacher.encoder],
-                            return_class_token=True
-                        )
-                    sm_all = self.student.module if hasattr(self.student, 'module') else self.student
-                    student_feats = sm_all.forward_features(x)
-                    for li in self.feature_layers:
-                        if li >= len(teacher_feats) or li >= len(student_feats):
-                            continue
-                        t_tok = teacher_feats[li][0] if (isinstance(teacher_feats[li], (list,tuple)) and len(teacher_feats[li])==2) else teacher_feats[li]
-                        s_tok = student_feats[li][0] if (isinstance(student_feats[li], (list,tuple)) and len(student_feats[li])==2) else student_feats[li]
-                        if t_tok.device != s_tok.device:
-                            t_tok = t_tok.to(s_tok.device)
-                        if t_tok.shape[-1] != s_tok.shape[-1]:
-                            key = f'proj_{li}'
-                            if key not in self.proj_layers:
-                                self.proj_layers[key] = torch.nn.Linear(s_tok.shape[-1], t_tok.shape[-1], bias=False)
-                            s_tok = self.proj_layers[key](s_tok)
-                        feature_loss_raw = feature_loss_raw + F.mse_loss(s_tok, t_tok.detach())
-                    feature_loss_raw = feature_loss_raw / max(1, len(self.feature_layers))
+            def forward_features(self, x):
+                """Forward features for streaming. Uses student model."""
+                if hasattr(self.student, 'module'):
+                    return self.student.module.forward_features(x)
+                else:
+                    return self.student.forward_features(x)
 
-                depth_loss_w = self.depth_loss_weight * depth_loss_raw
-                distill_loss_w = self.distill_weight * distill_loss_raw
-                feature_loss_w = self.feature_distill_weight * feature_loss_raw
-                total = depth_loss_w + distill_loss_w + feature_loss_w
-                return {
-                    'total_loss': total,
-                    'depth_loss': depth_loss_w,
-                    'distill_loss': distill_loss_w,
-                    'feature_loss': feature_loss_w,
-                    'student_depth': student_depth,
-                    'raw_depth_loss': depth_loss_raw,
-                    'raw_distill_loss': distill_loss_raw,
-                    'raw_feature_loss': feature_loss_raw,
-                }
+            def forward_depth(self, features, x_shape, cache=None, prev_depth=None, bidirectional_update_length=16, current_frame=0):
+                """Forward depth prediction for streaming. Uses student model."""
+                if hasattr(self.student, 'module'):
+                    return self.student.module.forward_depth(
+                        features, x_shape, cache, prev_depth, 
+                        bidirectional_update_length=bidirectional_update_length,
+                        current_frame=current_frame
+                    )
+                else:
+                    return self.student.forward_depth(
+                        features, x_shape, cache, prev_depth,
+                        bidirectional_update_length=bidirectional_update_length, 
+                        current_frame=current_frame
+                    )
 
-        model = TeacherStudentWrapper(teacher_model, student_model, teacher_distill_weight, feature_distill_layers, feature_distill_weight, distill_scale_invariant, depth_loss_weight)
+        model = TeacherStudentWrapper(teacher_model, student_model, teacher_distill_weight, feature_distill_weight, distill_scale_invariant, depth_loss_weight)
         logger.info("✅ Teacher-Student models created with causal masking enabled for streaming")
     else:
         logger.info("🏗️ Creating VideoDepthAnything model with streaming configuration...")
         model = VideoDepthStudent(
             num_frames=CLIP_LEN, use_causal_mask=True, encoder="vits", features=64,
-            out_channels=[48, 96, 192, 384], use_self_forcing=use_self_forcing,
+            out_channels=[48, 96, 192, 384],
         ).to(device)
         logger.info("✅ Model created with causal masking enabled for streaming")
 
@@ -781,15 +732,13 @@ def train(args):
             # 메모리 균형을 위한 전략: Teacher와 Student를 분리 배치
             logger.info("🔄 Optimizing GPU memory distribution for Teacher-Student...")
             
-            # Teacher를 GPU 1에, Student를 GPU 0에 배치
+            # Teacher를 GPU 1에 배치 (inference only, no DataParallel)
             model.teacher = model.teacher.to('cuda:1')
+            # Student를 GPU 0에 배치 (training, no DataParallel for streaming cache consistency)
             model.student = model.student.to('cuda:0')
             
-            # Student만 DataParallel로 래핑 (실제 훈련되는 모델)
-            model.student = torch.nn.DataParallel(model.student, device_ids=[0, 1])
-            
-            logger.info(f"   • Teacher model on GPU 1 (inference only)")
-            logger.info(f"   • Student model with DataParallel on GPUs [0, 1]")
+            logger.info(f"   • Teacher model on GPU 1 (inference only, no DataParallel)")
+            logger.info(f"   • Student model on GPU 0 (training, no DataParallel for streaming consistency)")
         else:
             model = torch.nn.DataParallel(model)
             logger.info(f"   • Model wrapped with DataParallel")
@@ -813,6 +762,15 @@ def train(args):
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
     logger.info(f"Total parameters: {total_params}")
+    logger.info(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
+    
+    # Initial projection layers 로깅
+    if use_teacher_student and hasattr(model, 'proj_layers'):
+        initial_proj_count = len(model.proj_layers)
+        logger.info(f"Initial projection layers: {initial_proj_count}")
+        if initial_proj_count > 0:
+            for key in model.proj_layers.keys():
+                logger.info(f"   • {key}: {model.proj_layers[key]}")
 
     loss_tgm = LossTGMVector(diff_depth_th=0.05)
     loss_ssi = Loss_ssi_basic()
@@ -829,6 +787,139 @@ def train(args):
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
 
+    # ── 체크포인트 로딩 ──
+    start_epoch = 0
+    
+    # 체크포인트 경로 결정: --resume_from 인자가 있으면 우선 사용, 없으면 latest_model.pth 확인
+    checkpoint_path = None
+    if args.resume_from:
+        if os.path.exists(args.resume_from):
+            checkpoint_path = args.resume_from
+            logger.info(f"🔄 Using specified checkpoint: {args.resume_from}")
+        else:
+            logger.warning(f"⚠️  Specified checkpoint not found: {args.resume_from}")
+            logger.info("🔍 Checking for default latest_model.pth...")
+    
+    if not checkpoint_path and os.path.exists(latest_model_path):
+        checkpoint_path = latest_model_path
+        logger.info(f"🔄 Using default checkpoint: {latest_model_path}")
+    
+    if checkpoint_path:
+        logger.info(f"📂 Loading checkpoint from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # DataParallel prefix 처리를 위한 헬퍼 함수
+            def remove_module_prefix(state_dict):
+                """DataParallel로 저장된 state_dict에서 'module.' prefix 제거"""
+                new_state_dict = {}
+                for key, value in state_dict.items():
+                    if key.startswith('module.'):
+                        new_key = key[7:]  # 'module.' 제거
+                        new_state_dict[new_key] = value
+                    else:
+                        new_state_dict[key] = value
+                return new_state_dict
+            
+            def add_module_prefix(state_dict):
+                """state_dict에 'module.' prefix 추가"""
+                new_state_dict = {}
+                for key, value in state_dict.items():
+                    if not key.startswith('module.'):
+                        new_key = f'module.{key}'
+                        new_state_dict[new_key] = value
+                    else:
+                        new_state_dict[key] = value
+                return new_state_dict
+            
+            # 모델 가중치 로딩 (Student만, Teacher는 VDA 고정 가중치 사용)
+            if 'model_state_dict' in checkpoint:
+                checkpoint_state = checkpoint['model_state_dict']
+                
+                if use_teacher_student:
+                    # Teacher-Student 모드: model_state_dict를 Student에 로딩
+                    student_model = model.student
+                    
+                    if hasattr(student_model, 'module'):
+                        # Student가 DataParallel로 래핑되어 있는 경우
+                        if any(key.startswith('module.') for key in checkpoint_state.keys()):
+                            # 체크포인트에 module prefix가 있으면 그대로 로딩
+                            student_model.load_state_dict(checkpoint_state)
+                        else:
+                            # 체크포인트에 module prefix가 없으면 추가해서 로딩
+                            checkpoint_state = add_module_prefix(checkpoint_state)
+                            student_model.load_state_dict(checkpoint_state)
+                    else:
+                        # Student가 DataParallel로 래핑되지 않은 경우
+                        if any(key.startswith('module.') for key in checkpoint_state.keys()):
+                            # 체크포인트에 module prefix가 있으면 제거해서 로딩
+                            checkpoint_state = remove_module_prefix(checkpoint_state)
+                            student_model.load_state_dict(checkpoint_state)
+                        else:
+                            # 체크포인트에 module prefix가 없으면 그대로 로딩
+                            student_model.load_state_dict(checkpoint_state)
+                    logger.info("   ✅ Student model weights loaded")
+                else:
+                    # 일반 모델의 경우
+                    if hasattr(model, 'module'):
+                        # 모델이 DataParallel로 래핑되어 있는 경우
+                        if any(key.startswith('module.') for key in checkpoint_state.keys()):
+                            # 체크포인트에 module prefix가 있으면 그대로 로딩
+                            model.load_state_dict(checkpoint_state)
+                        else:
+                            # 체크포인트에 module prefix가 없으면 추가해서 로딩
+                            checkpoint_state = add_module_prefix(checkpoint_state)
+                            model.load_state_dict(checkpoint_state)
+                    else:
+                        # 모델이 DataParallel로 래핑되지 않은 경우
+                        if any(key.startswith('module.') for key in checkpoint_state.keys()):
+                            # 체크포인트에 module prefix가 있으면 제거해서 로딩
+                            checkpoint_state = remove_module_prefix(checkpoint_state)
+                            model.load_state_dict(checkpoint_state)
+                        else:
+                            # 체크포인트에 module prefix가 없으면 그대로 로딩
+                            model.load_state_dict(checkpoint_state)
+                    logger.info("   ✅ Model weights loaded")
+            
+            # Optimizer 상태 로딩
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info("   ✅ Optimizer state loaded")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Failed to load optimizer state: {e}")
+                    logger.warning("   ⚠️ Starting with fresh optimizer state")
+            
+            # Scheduler 상태 로딩
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    logger.info("   ✅ Scheduler state loaded")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Failed to load scheduler state: {e}")
+                    logger.warning("   ⚠️ Starting with fresh scheduler state")
+            
+            # 에폭 정보 로딩
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                logger.info(f"   ✅ Resuming from epoch {start_epoch}")
+            
+            # 최고 성능 정보 로딩 (best 모델에서만 사용)
+            if 'best_scannet_absrel' in checkpoint:
+                best_scannet_absrel = checkpoint['best_scannet_absrel']
+                logger.info(f"   ✅ Best ScanNet AbsRel: {best_scannet_absrel:.4f}")
+            
+            # current 성능 정보 로딩 (latest 모델에서만 사용)
+            if 'current_scannet_absrel' in checkpoint:
+                logger.info(f"   ✅ Current ScanNet AbsRel: {checkpoint['current_scannet_absrel']:.4f}")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to load checkpoint: {e}")
+            logger.info("🔄 Starting from scratch...")
+            start_epoch = 0
+    else:
+        logger.info("🆕 No checkpoint found, starting from scratch")
+
     scaler = GradScaler()
 
     # 환경에 따라 필요시 선호 선형대수 라이브러리 설정
@@ -838,7 +929,6 @@ def train(args):
         pass
 
     # ── 학습 루프 ──
-    start_epoch = 0
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
         print()
         model.train()
@@ -858,7 +948,7 @@ def train(args):
 
         # Batch level tqdm
         batch_pbar = tqdm(enumerate(kitti_train_loader), 
-                         desc=f"Epoch {epoch+1}/{num_epochs} - Batches", 
+                         desc=f"Epoch {epoch+1}/{num_epochs} - Batches",
                          leave=False,
                          total=len(kitti_train_loader) if log_max_batches_per_epoch is None else min(log_max_batches_per_epoch, len(kitti_train_loader)))
         
@@ -868,26 +958,28 @@ def train(args):
             x, y = x.to(device), y.to(device)
             B, T = x.shape[:2]
             
-            # Batch progress update
+            # Batch progress update (안전한 tensor → scalar 변환)
+            loss_val = (accum_loss / max(1, step_in_window))
+            if torch.is_tensor(loss_val): 
+                loss_val = loss_val.item()
             batch_pbar.set_postfix({
-                'Loss': f'{accum_loss / max(1, step_in_window):.4f}',
+                'Loss': f'{loss_val:.4f}',
                 'Frames': epoch_frames,
                 'GPU_Mem': f'{torch.cuda.memory_allocated() / 1024**3:.1f}GB' if torch.cuda.is_available() else 'N/A'
             })
-            
-            # GPU 메모리 사용량 모니터링 (첫 번째 배치에서만)
-            if batch_idx == 0 and epoch == 0:
-                logger.info(f"📊 Batch processing info:")
-                logger.info(f"   • Batch size: {B}, Sequence length: {T}")
-                if torch.cuda.is_available():
-                    for i in range(torch.cuda.device_count()):
-                        allocated = torch.cuda.memory_allocated(i) / 1024**3
-                        cached = torch.cuda.memory_reserved(i) / 1024**3
-                        logger.info(f"   • GPU {i} memory: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
+
+            # # GPU 메모리 사용량 모니터링 (첫 번째 배치에서만)
+            # if batch_idx == 0 and epoch == 0:
+            #     logger.info(f"📊 Batch processing info:")
+            #     logger.info(f"   • Batch size: {B}, Sequence length: {T}")
+            #     if torch.cuda.is_available():
+            #         for i in range(torch.cuda.device_count()):
+            #             allocated = torch.cuda.memory_allocated(i) / 1024**3
+            #             cached = torch.cuda.memory_reserved(i) / 1024**3
+            #             logger.info(f"   • GPU {i} memory: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
 
             cache = None
             prev_pred_raw = None
-            prev_pred_depth = None  # Self-forcing을 위한 이전 depth
             prev_mask     = None
             prev_y        = None
             
@@ -910,55 +1002,83 @@ def train(args):
                 x_t = x[:, t:t+1]                                        # [B,1,3,H,W]
                 mask_t = get_mask(y[:, t:t+1], 1e-3, 80.0).to(device)    # [B,1,1,H,W]
                 
-                # Teacher 프레임 버퍼 관리 (항상 32개 유지)
+                # Teacher 프레임 버퍼 관리 (효율적인 tensor 슬라이딩 윈도우)
                 if teacher_frame_buffer is None:
-                    # 첫 프레임: 32번 복제하여 초기화
-                    teacher_frame_buffer = [x_t] * CLIP_LEN  # 32개 동일한 프레임
+                    # 첫 프레임: 32개 프레임으로 초기화 (proper tensor copying)
+                    # 안전한 임시 변수 사용 (바깥 스코프 T 변수 보호)
+                    _B, _C, _H, _W = x_t.shape[0], x_t.shape[2], x_t.shape[3], x_t.shape[4]
+                    teacher_frame_buffer = x_t.detach().clone().repeat(1, CLIP_LEN, 1, 1, 1)  # [B, 32, C, H, W]
                 else:
-                    # 새 프레임 추가: 가장 오래된 것 제거하고 최신 것 추가
-                    teacher_frame_buffer.pop(0)  # 맨 앞(가장 오래된) 제거
-                    teacher_frame_buffer.append(x_t)  # 맨 뒤에 최신 프레임 추가
+                    # 새 프레임 추가: 슬라이딩 윈도우 (가장 효율적)
+                    teacher_frame_buffer = torch.cat([
+                        teacher_frame_buffer[:, 1:, :, :, :],  # [B, 31, C, H, W] - 첫 프레임 제거
+                        x_t.detach().clone()  # [B, 1, C, H, W] - 새 프레임 추가 (proper detach)
+                    ], dim=1)  # [B, 32, C, H, W]
                 
-                # Teacher가 항상 32개 프레임으로 예측 (bidirectional)
-                with torch.no_grad():
-                    teacher_input = torch.cat(teacher_frame_buffer, dim=1)  # [B, 32, 3, H, W]
+                # Teacher-Student 방식: attention caching과 prediction을 한 번의 forward로 처리
+                if use_teacher_student:
+                    # Helper functions for attention caching
+                    def enable_attention_caching(module):
+                        for name, layer in module.named_modules():
+                            if hasattr(layer, 'enable_kd_caching'):
+                                layer.enable_kd_caching(True)
                     
-                    if torch.cuda.device_count() > 1:
-                        teacher_input_gpu = teacher_input.to('cuda:1')
-                        teacher_predictions = model.teacher(teacher_input_gpu).to(device)  # [B, 32, H, W]
-                    else:
-                        teacher_predictions = model.teacher(teacher_input)  # [B, 32, H, W]
+                    def disable_attention_caching(module):
+                        for name, layer in module.named_modules():
+                            if hasattr(layer, 'enable_kd_caching'):
+                                layer.enable_kd_caching(False)
                     
-                    # Teacher의 현재 시점(t) 예측 추출 (마지막 프레임이 현재 시점)
-                    teacher_pred_t = teacher_predictions[:, -1]  # [B, H, W]
-
-                # Self-forcing 결정: 에폭과 확률 조건 만족시 적용
-                use_self_forcing_now = (
-                    use_self_forcing and 
-                    epoch >= self_forcing_start_epoch and 
-                    t > 0 and 
-                    prev_pred_depth is not None and
-                    np.random.rand() < self_forcing_ratio
-                )
+                    def collect_attention_outputs(module, clear=True):
+                        attention_outputs = []
+                        for name, layer in module.named_modules():
+                            if hasattr(layer, 'get_cached_attention_output'):
+                                cached_output = layer.get_cached_attention_output()
+                                if cached_output is not None:
+                                    attention_outputs.append(cached_output)
+                                # 메모리 누수 방지: 수집 후 캐시 버퍼 클리어
+                                if clear:
+                                    if hasattr(layer, 'clear_attention_cache'):
+                                        layer.clear_attention_cache()
+                                    elif hasattr(layer, 'cached_attention_output'):
+                                        # Fallback: 직접 속성 삭제
+                                        layer.cached_attention_output = None
+                        return attention_outputs
+                    
+                    # Teacher forward with attention caching (한 번의 추론으로 prediction과 attention 모두 수집)
+                    with torch.no_grad():
+                        enable_attention_caching(model.teacher)
+                        
+                        # teacher_frame_buffer는 이미 [B, 32, C, H, W] format
+                        if torch.cuda.device_count() > 1:
+                            teacher_input_gpu = teacher_frame_buffer.to('cuda:1')
+                            # GPU 1에서 추론 후 마지막 프레임만 GPU 0으로 복사 (메모리 효율성)
+                            teacher_predictions = model.teacher(teacher_input_gpu)  # [B, 32, H, W] on cuda:1
+                            teacher_pred_t = teacher_predictions[:, -1].to(device)  # 마지막 프레임만 cuda:0으로 복사
+                        else:
+                            teacher_predictions = model.teacher(teacher_frame_buffer)  # [B, 32, H, W]
+                            teacher_pred_t = teacher_predictions[:, -1]  # [B, H, W]
+                        
+                        # Teacher 출력도 표준 형태로 변환 (KD, alignment 계산에서 일관성 보장)
+                        teacher_pred_t = to_BHW_pred(teacher_pred_t).clamp(min=1e-6)
+                        
+                        # Teacher attention outputs 수집 (메모리 누수 방지를 위한 캐시 클리어)
+                        teacher_attention_outputs = collect_attention_outputs(model.teacher, clear=True)
+                        disable_attention_caching(model.teacher)
 
                 with autocast():
-                    # Teacher-Student 방식: 각 프레임별로 개별 처리 (gradient graph 충돌 방지)
                     if use_teacher_student:
-                        # 현재 프레임에 대해서만 Student 예측 (bidirectional update 적용)
-                        if use_self_forcing_now:
-                            pred_t_raw, cache = model_stream_step(
-                                model, x_t, cache, prev_pred_depth, 
-                                bidirectional_update_length=bidirectional_update_length,
-                                current_frame=student_frame_count
-                            )
-                        else:
-                            pred_t_raw, cache = model_stream_step(
-                                model, x_t, cache, None,
-                                bidirectional_update_length=bidirectional_update_length,
-                                current_frame=student_frame_count
-                            )
+                        # Student forward with attention caching (한 번의 추론으로 prediction과 attention 모두 수집)
+                        enable_attention_caching(model.student)
+                        pred_t_raw, cache = model_stream_step(
+                            model.student, x_t, cache,
+                            bidirectional_update_length=bidirectional_update_length,
+                            current_frame=student_frame_count
+                        )
+                        # 즉시 표준 형태로 변환 (KD, alignment, loss 계산 전에)
+                        pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
                         
-                        # Teacher의 현재 시점 예측은 이미 위에서 계산됨 (bidirectional context 활용)
+                        student_attention_outputs = collect_attention_outputs(model.student, clear=True)
+                        disable_attention_caching(model.student)
                         
                         # Student 프레임 카운트 증가
                         student_frame_count += 1
@@ -967,124 +1087,100 @@ def train(args):
                         y_t = y[:, t].squeeze(1) if y[:, t].dim() > 2 else y[:, t]  # [B,H,W]
                         
                         if model.scale_invariant:
-                            # Scale-invariant distillation
+                            # VDA 논문에 맞춘 scale-invariant alignment (disparity space)
                             with torch.no_grad():
-                                gt_disp_t = 1.0 / y_t.clamp(min=1e-6)
+                                gt_disp_t = 1.0 / y_t.clamp(min=1e-6)  # GT depth → disparity
                                 mask_t_ls = (y_t > 1e-3) & (y_t < 80.0)
                                 
-                                def align_single_frame(pred_depth):
-                                    pred_disp = 1.0 / pred_depth.clamp(min=1e-6)
+                                def align_single_frame_vda(pred_disp):
+                                    # pred_disp는 이미 disparity (VDA 모델 출력)
                                     B_, H_, W_ = pred_disp.shape
-                                    p_flat = pred_disp.view(B_, -1)
-                                    g_flat = gt_disp_t.view(B_, -1)
-                                    m_flat = mask_t_ls.view(B_, -1).float()
                                     
-                                    A = torch.stack([p_flat, torch.ones_like(p_flat)], dim=-1) * m_flat.unsqueeze(-1)
-                                    b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
-                                    X = torch.linalg.lstsq(A, b_vec).solution
-                                    a = X[:, 0, 0].view(B_, 1, 1).clamp(min=1e-4, max=1e4)
-                                    b = X[:, 1, 0].view(B_, 1, 1).clamp(min=-1e4, max=1e4)
+                                    # autocast 비활성화 + float32 캐스팅 (lstsq 안정성 보장)
+                                    with autocast(enabled=False):
+                                        p_flat = pred_disp.float().clamp(min=1e-6).view(B_, -1)
+                                        g_flat = gt_disp_t.float().view(B_, -1)
+                                        m_flat = mask_t_ls.float().view(B_, -1)
+                                        
+                                        A = torch.stack([p_flat, torch.ones_like(p_flat)], dim=-1) * m_flat.unsqueeze(-1)
+                                        b_vec = g_flat.unsqueeze(-1) * m_flat.unsqueeze(-1)
+                                        X = torch.linalg.lstsq(A, b_vec).solution
+                                        a = X[:, 0, 0].view(B_, 1, 1).clamp(min=1e-4, max=1e4)
+                                        b = X[:, 1, 0].view(B_, 1, 1).clamp(min=-1e4, max=1e4)
                                     
+                                    # Align in disparity space, then convert to depth
                                     aligned_disp = (pred_disp * a + b).clamp(min=1e-6)
                                     return 1.0 / aligned_disp
                                 
-                                student_aligned = align_single_frame(pred_t_raw)
-                                teacher_aligned = align_single_frame(teacher_pred_t)
+                                student_aligned = align_single_frame_vda(pred_t_raw)  # pred_t_raw is disparity
+                                teacher_aligned = align_single_frame_vda(teacher_pred_t)  # teacher_pred_t is disparity
                             
                             # Depth space에서 L1 loss (더 안정적)
                             frame_depth_loss = F.l1_loss(student_aligned, y_t)
                             # Depth space에서 L1 loss로 변경 (MSE는 너무 큰 값 생성)
                             frame_distill_loss = F.l1_loss(student_aligned, teacher_aligned)
                         else:
+                            # Convert VDA disparity output to depth for loss computation
+                            student_depth = 1.0 / pred_t_raw.clamp(min=1e-6)
+                            teacher_depth = 1.0 / teacher_pred_t.clamp(min=1e-6)
+                            
                             # Log space에서 계산하여 큰 값 방지
-                            log_student = torch.log(pred_t_raw.clamp(min=1e-6))
-                            log_teacher = torch.log(teacher_pred_t.clamp(min=1e-6))
+                            log_student = torch.log(student_depth.clamp(min=1e-6))
+                            log_teacher = torch.log(teacher_depth.clamp(min=1e-6))
                             log_gt = torch.log(y_t.clamp(min=1e-6))
                             
                             frame_depth_loss = F.l1_loss(log_student, log_gt)
                             frame_distill_loss = F.l1_loss(log_student, log_teacher)
                         
-                        # Feature distillation (현재 프레임만)
+                        # Attention-based Knowledge Distillation (이미 수집된 attention outputs 사용)
                         frame_feature_loss = pred_t_raw.new_tensor(0.0)
-                        if model.feature_distill_weight > 0 and model.feature_layers:
-                            with torch.no_grad():
-                                if torch.cuda.device_count() > 1:
-                                    # Teacher는 전체 32개 프레임의 feature를 계산
-                                    teacher_input_gpu = torch.cat(teacher_frame_buffer, dim=1).to('cuda:1')
-                                    teacher_feats = model.teacher.pretrained.get_intermediate_layers(
-                                        teacher_input_gpu.flatten(0,1),
-                                        model.teacher.intermediate_layer_idx[model.teacher.encoder],
-                                        return_class_token=True
-                                    )
-                                    # 현재 시점의 feature만 추출 (마지막 프레임 = 현재 시점)
-                                    teacher_feats_current = []
-                                    for feat in teacher_feats:
-                                        if isinstance(feat, (list, tuple)) and len(feat) == 2:
-                                            # (token, patch) 형태인 경우
-                                            token_feat = feat[0].view(B, CLIP_LEN, -1, feat[0].shape[-1])[:, -1]  # [B, seq_len, dim]
-                                            patch_feat = feat[1].view(B, CLIP_LEN, -1, feat[1].shape[-1])[:, -1]  # [B, patch_num, dim] 
-                                            teacher_feats_current.append([token_feat.to(device), patch_feat.to(device)])
-                                        else:
-                                            # 단일 feature인 경우
-                                            feat_reshaped = feat.view(B, CLIP_LEN, -1, feat.shape[-1])[:, -1]  # [B, seq_len, dim]
-                                            teacher_feats_current.append(feat_reshaped.to(device))
-                                    teacher_feats = teacher_feats_current
-                                else:
-                                    # 단일 GPU에서는 전체 32개 프레임으로 teacher feature 계산
-                                    teacher_input_flat = torch.cat(teacher_frame_buffer, dim=1).flatten(0,1)
-                                    teacher_feats_all = model.teacher.pretrained.get_intermediate_layers(
-                                        teacher_input_flat,
-                                        model.teacher.intermediate_layer_idx[model.teacher.encoder],
-                                        return_class_token=True
-                                    )
-                                    # 현재 시점(마지막 프레임)의 feature만 추출
-                                    teacher_feats = []
-                                    for feat in teacher_feats_all:
-                                        if isinstance(feat, (list, tuple)) and len(feat) == 2:
-                                            token_feat = feat[0].view(B, CLIP_LEN, -1, feat[0].shape[-1])[:, -1]
-                                            patch_feat = feat[1].view(B, CLIP_LEN, -1, feat[1].shape[-1])[:, -1]
-                                            teacher_feats.append([token_feat, patch_feat])
-                                        else:
-                                            feat_reshaped = feat.view(B, CLIP_LEN, -1, feat.shape[-1])[:, -1]
-                                            teacher_feats.append(feat_reshaped)
-                            
-                            # Student features for current frame
-                            sm_all = model.student.module if hasattr(model.student, 'module') else model.student
-                            student_feats = sm_all.forward_features(x_t)
-                            
-                            for li in model.feature_layers:
-                                if li >= len(teacher_feats) or li >= len(student_feats):
-                                    continue
+                        if model.feature_distill_weight > 0:
+                            # 이미 수집된 attention outputs 사용 (중복 forward 방지)
+                            min_outputs = min(len(teacher_attention_outputs), len(student_attention_outputs))
+                            for i in range(min_outputs):
+                                teacher_out = teacher_attention_outputs[i]
+                                student_out = student_attention_outputs[i]
                                 
-                                t_feat = teacher_feats[li]
-                                s_feat = student_feats[li]
+                                # Device alignment
+                                if teacher_out.device != student_out.device:
+                                    teacher_out = teacher_out.to(student_out.device)
                                 
-                                # Handle tuple format (token, patch)
-                                if isinstance(t_feat, (list, tuple)) and len(t_feat) == 2:
-                                    t_tok = t_feat[0]
-                                else:
-                                    t_tok = t_feat
+                                # Dimension alignment if needed
+                                if teacher_out.shape != student_out.shape:
+                                    # Simple spatial dimension alignment
+                                    if teacher_out.shape[1] != student_out.shape[1]:  # spatial patches
+                                        min_patches = min(teacher_out.shape[1], student_out.shape[1])
+                                        teacher_out = teacher_out[:, :min_patches, :]
+                                        student_out = student_out[:, :min_patches, :]
                                     
-                                if isinstance(s_feat, (list, tuple)) and len(s_feat) == 2:
-                                    s_tok = s_feat[0]
-                                else:
-                                    s_tok = s_feat
+                                    # Channel dimension alignment
+                                    if teacher_out.shape[-1] != student_out.shape[-1]:
+                                        proj_key = f'attention_proj_layer{i}'
+                                        if proj_key not in model.proj_layers:
+                                            # 새 프로젝션 레이어 생성
+                                            proj_layer = torch.nn.Linear(
+                                                student_out.shape[-1], teacher_out.shape[-1], bias=False
+                                            ).to(student_out.device)
+                                            model.proj_layers[proj_key] = proj_layer
+                                            
+                                            # 동적 생성된 레이어 파라미터를 optimizer에 추가
+                                            try:
+                                                optimizer.add_param_group({
+                                                    'params': proj_layer.parameters(),
+                                                    'lr': optimizer.param_groups[0]['lr'],  # 기존 학습률 사용
+                                                    'weight_decay': optimizer.param_groups[0].get('weight_decay', 0)
+                                                })
+                                                logger.info(f"🔧 Added projection layer '{proj_key}' to optimizer: "
+                                                           f"{student_out.shape[-1]} → {teacher_out.shape[-1]} "
+                                                           f"(params: {sum(p.numel() for p in proj_layer.parameters())})")
+                                            except Exception as e:
+                                                logger.warning(f"⚠️ Failed to add projection layer to optimizer: {e}")
+                                                logger.warning("   Projection layer created but may not be trained!")
+                                        
+                                        student_out = model.proj_layers[proj_key](student_out)
                                 
-                                # Ensure same device
-                                if t_tok.device != s_tok.device:
-                                    t_tok = t_tok.to(s_tok.device)
-                                
-                                # Project if different dimensions
-                                if t_tok.shape[-1] != s_tok.shape[-1]:
-                                    key = f'proj_{li}'
-                                    if key not in model.proj_layers:
-                                        model.proj_layers[key] = torch.nn.Linear(s_tok.shape[-1], t_tok.shape[-1], bias=False).to(s_tok.device)
-                                    s_tok = model.proj_layers[key](s_tok)
-                                
-                                frame_feature_loss = frame_feature_loss + F.mse_loss(s_tok, t_tok.detach())
-                            
-                            if len(model.feature_layers) > 0:
-                                frame_feature_loss = frame_feature_loss / len(model.feature_layers)
+                                # MSE loss between attention outputs
+                                frame_feature_loss = frame_feature_loss + F.mse_loss(student_out, teacher_out.detach())
                         
                         # 가중치 적용된 Teacher-Student loss 저장 (값이 너무 큰 경우 스케일링)
                         current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.01      # 1/100 스케일링
@@ -1093,23 +1189,16 @@ def train(args):
                         
                     else:
                         # 기존 방식 또는 Teacher-Student 미사용 (bidirectional update 적용)
-                        if use_self_forcing_now:
-                            pred_t_raw, cache = model_stream_step(
-                                model, x_t, cache, prev_pred_depth,
-                                bidirectional_update_length=bidirectional_update_length,
-                                current_frame=student_frame_count
-                            )
-                        else:
-                            pred_t_raw, cache = model_stream_step(
-                                model, x_t, cache, None,
-                                bidirectional_update_length=bidirectional_update_length,
-                                current_frame=student_frame_count
-                            )
+                        pred_t_raw, cache = model_stream_step(
+                            model, x_t, cache,
+                            bidirectional_update_length=bidirectional_update_length,
+                            current_frame=student_frame_count
+                        )
+                        # 즉시 표준 형태로 변환 (alignment, loss 계산 전에)
+                        pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
                         
                         # Student 프레임 카운트 증가 (Teacher-Student 미사용 시에도)
                         student_frame_count += 1
-                    
-                    pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
                     
                     # GPU 병렬화 확인 (첫 번째 배치, 첫 번째 에폭, 첫 번째 프레임에서만)
                     if batch_idx == 0 and epoch == 0 and t == 0:
@@ -1149,24 +1238,33 @@ def train(args):
                     # a_ema = ema_update(a_ema, a_star, ema_alpha)
                     # b_ema = ema_update(b_ema, b_star, ema_alpha)
                     
-                    # # 4) 정렬된 예측으로 손실 계산 (정렬 스칼라는 detach)
-                    # # 방법 A: 4D로 올려 연산 후 다시 내리기 (가장 안전)
-                    # pred_t_aligned = (
-                    #     a_ema.detach() * pred_t_raw.unsqueeze(1) + b_ema.detach()     # [B,1,1,1]*[B,1,H,W] → [B,1,H,W]
-                    # ).squeeze(1)                                                      # [B,H,W]
-                    # 4) 정렬 예측으로 손실 계산 (정렬 스칼라는 detach 성격)
-                    pred_t_aligned = (
+                    # 4) VDA 논문 평가 절차에 맞춘 depth/disparity 처리
+                    # VDA 모델 출력: disparity (inverse depth)
+                    # GT: depth → disparity 변환하여 alignment 수행
+                    
+                    # pred_t_raw는 이미 disparity (VDA 모델 출력)
+                    # gt_disp_t도 이미 disparity (1.0 / depth)로 변환됨
+                    
+                    # Scale-invariant alignment in disparity space
+                    pred_t_aligned_disp = (
                         a_star.detach() * pred_t_raw.unsqueeze(1) + b_star.detach()
-                    ).squeeze(1)  # [B,H,W]
+                    ).squeeze(1)  # [B,H,W] - aligned disparity
+                    
+                    # Convert aligned disparity back to depth for loss computation
+                    pred_t_aligned_depth = 1.0 / (pred_t_aligned_disp.clamp(min=1e-6))  # [B,H,W]
+                    gt_depth_t = y[:, t:t+1].squeeze(1).squeeze(1)  # [B,H,W] - GT depth
 
                     # # 5) 약한 정규화도 역전파 막기  (← 이 줄이 핵심)
                     # reg_loss = scale_reg_w * ( (a_star - 1.0).abs().mean() + (b_star - 0.0).abs().mean() )
 
                     # SSI (framewise; GT는 min-max 정규화 disparity)
-                    # GT disparity는 4D [B,1,H,W]로 맞춰 SSI에 전달
-                    disp_normed_t = norm_ssi(y[:, t:t+1], mask_t).squeeze(2)   # [B,1,H,W]
+                    # SSI loss calculation (in depth space for proper evaluation)
+                    # GT는 여전히 depth이므로 norm_ssi에서 depth→disparity 변환됨
+                    disp_normed_t = norm_ssi(y[:, t:t+1], mask_t).squeeze(2)   # [B,1,H,W] - normalized GT disparity
                     mask4 = mask_t.squeeze(2)                                  # [B,1,H,W]
-                    pred4 = pred_t_aligned.unsqueeze(1)                        # [B,1,H,W]
+                    
+                    # Use aligned disparity for SSI computation (consistent with norm_ssi)
+                    pred4 = pred_t_aligned_disp.unsqueeze(1)                   # [B,1,H,W] - aligned disparity
 
                     assert pred4.dim()==4 and pred4.size(1)==1,  f"pred4 {pred4.shape}"
                     assert disp_normed_t.dim()==4 and disp_normed_t.size(1)==1, f"disp {disp_normed_t.shape}"
@@ -1174,13 +1272,18 @@ def train(args):
 
                     ssi_loss_t = loss_ssi(pred4, disp_normed_t, mask4)
 
-                    # TGM (pairwise; 동일 a_ema,b_ema로 두 프레임 모두 정렬)
+                    # TGM (pairwise; 동일 scale/shift로 두 프레임 모두 정렬)
                     if t > 0:
-                        prev_aligned = (
+                        # Previous frame aligned disparity
+                        prev_aligned_disp = (
                             a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()
                         ).squeeze(1)  # [B,H,W]
-                        curr_aligned = pred_t_aligned
-                        pred_pair = torch.stack([prev_aligned, curr_aligned], dim=1)   # [B,2,H,W]
+                        
+                        # Convert both to depth for TGM loss (temporal consistency in depth space)
+                        prev_aligned_depth = 1.0 / (prev_aligned_disp.clamp(min=1e-6))
+                        curr_aligned_depth = pred_t_aligned_depth
+                        
+                        pred_pair = torch.stack([prev_aligned_depth, curr_aligned_depth], dim=1)   # [B,2,H,W]
                         y_pair    = torch.cat([prev_y, y[:, t:t+1]], dim=1)            # [B,2,1,H,W]
                         m_pair    = torch.cat([prev_mask, mask_t], dim=1)              # [B,2,1,H,W]
                         tgm_loss  = loss_tgm(pred_pair, y_pair, m_pair.squeeze(2))
@@ -1211,11 +1314,6 @@ def train(args):
                 cache = _detach_cache(cache)
                 prev_pred_raw = pred_t_raw.detach()
                 
-                # Self-forcing을 위한 이전 depth 저장 (aligned depth를 depth로 변환)
-                with torch.no_grad():
-                    pred_depth_t = 1.0 / (pred_t_aligned.detach().clamp(min=1e-6))  # disparity -> depth
-                    prev_pred_depth = pred_depth_t.unsqueeze(1).clamp(min=1e-3, max=80.0)  # [B,1,H,W]
-                
                 prev_mask     = mask_t
                 prev_y        = y[:, t:t+1]
 
@@ -1225,12 +1323,24 @@ def train(args):
                     scaler.scale(accum_loss).backward()
                     # gradient norm 측정
                     if log_gradient_norm:
-                        total_norm = 0.0
-                        for p in (model.student.parameters() if use_teacher_student else model.parameters()):
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2).item()
-                                total_norm += param_norm ** 2
-                        total_norm = total_norm ** 0.5
+                        if use_teacher_student:
+                            total_norm = 0.0
+                            for p in model.student.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2).item()
+                                    total_norm += param_norm ** 2
+                            for p in model.proj_layers.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2).item()
+                                    total_norm += param_norm ** 2
+                            total_norm = total_norm ** 0.5
+                        else:
+                            total_norm = 0.0
+                            for p in model.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2).item()
+                                    total_norm += param_norm ** 2
+                            total_norm = total_norm ** 0.5
                         grad_norm_list.append(total_norm)
                     scaler.step(optimizer)
                     scaler.update()
@@ -1248,11 +1358,15 @@ def train(args):
                     epoch_feature_loss += current_feature_loss.item() * B
                 
                 # Frame progress update
+                # Frame progress update (안전한 tensor → scalar 변환)
+                def safe_item(tensor_val):
+                    return tensor_val.item() if torch.is_tensor(tensor_val) else float(tensor_val)
+                
                 frame_pbar.set_postfix({
-                    'SSI': f'{current_ssi_loss.item():.4f}',
-                    'TGM': f'{current_tgm_loss.item():.4f}',
-                    'Depth': f'{current_depth_loss.item():.4f}' if use_teacher_student else 'N/A',
-                    'Distill': f'{current_distill_loss.item():.4f}' if use_teacher_student else 'N/A'
+                    'SSI': f'{safe_item(current_ssi_loss):.4f}',
+                    'TGM': f'{safe_item(current_tgm_loss):.4f}',
+                    'Depth': f'{safe_item(current_depth_loss):.4f}' if use_teacher_student else 'N/A',
+                    'Distill': f'{safe_item(current_distill_loss):.4f}' if use_teacher_student else 'N/A'
                 })
 
             # per-batch wandb.log 제거 (epoch 말에만 집계 보고)
@@ -1260,7 +1374,47 @@ def train(args):
             # Close frame progress bar
             frame_pbar.close()
 
-            del loss, ssi_loss_t, pred_t_aligned
+            # 마지막 잔여 누적 gradient flush (update_frequency로 나눠떨어지지 않는 경우)
+            if step_in_window > 0:
+                remaining_steps = step_in_window
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(accum_loss).backward()
+                
+                # gradient norm 측정 (남은 gradient에 대해서도)
+                if log_gradient_norm:
+                    if use_teacher_student:
+                        total_norm = 0.0
+                        for p in model.student.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        for p in model.proj_layers.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** (1. / 2)
+                    else:
+                        total_norm = 0.0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** (1. / 2)
+                    grad_norm_list.append(total_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_loss += accum_loss.item() if torch.is_tensor(accum_loss) else float(accum_loss)
+                accum_loss = 0.0
+                step_in_window = 0
+                logger.info(f"   🔄 Flushed remaining {remaining_steps} accumulated gradients")
+
+            # 메모리 정리: 주요 텐서들 삭제 (적절한 변수명 사용)
+            del loss, ssi_loss_t
+            if 'pred_t_aligned_disp' in locals():
+                del pred_t_aligned_disp
+            if 'pred_t_aligned_depth' in locals():
+                del pred_t_aligned_depth
             if 'tgm_loss' in locals():
                 del tgm_loss
 
@@ -1431,5 +1585,6 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
+    parser.add_argument("--resume_from", type=str, default="./outputs/experiment_20/latest_model.pth")
     args = parser.parse_args()
     train(args)

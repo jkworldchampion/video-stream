@@ -10,7 +10,7 @@ export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/scannet_stream_13"
+INFER_PATH="${ROOT}/benchmark/output/scannet_stream_20"
 
 # 2) JSON 메타데이터
 JSON_FILE="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"

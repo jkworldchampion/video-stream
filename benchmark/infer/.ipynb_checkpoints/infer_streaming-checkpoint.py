@@ -85,14 +85,14 @@ if __name__ == '__main__':
     parser.add_argument('--datasets', type=str, nargs='+', default=['scannet'])
     parser.add_argument('--input_size', type=int, default=518)
     # 인코더 인자 제공(선택); 미지정 또는 불일치 시 체크포인트로 자동 교정
-    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitl'])
+    parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     args = parser.parse_args()
 
     # 1번 코드 스타일: 디바이스 선택 유지
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     # 1번 코드: 실험 가중치 경로 그대로 사용
-    ckpt_path = os.path.join(BASE_DIR, 'outputs', 'experiment_11', 'best_model.pth')
+    ckpt_path = os.path.join(BASE_DIR, 'outputs', 'experiment_20', 'latest_model.pth')
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"체크포인트가 없습니다: {ckpt_path}")
 
