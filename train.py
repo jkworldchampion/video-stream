@@ -38,7 +38,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
-experiment = 21
+experiment = 23
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
@@ -338,7 +338,7 @@ def streaming_validate( model, loader, device, data_name, loss_ssi, loss_tgm, ra
             for t in range(T):
                 x_t = x[:, t:t+1]  # [B,1,3,H,W]
                 pred_t, cache = model_stream_step(
-                    model, x_t, cache, None,
+                    model, x_t, cache,
                     bidirectional_update_length=bidirectional_update_length,
                     current_frame=val_frame_count
                 )
@@ -502,8 +502,7 @@ def train(args):
     log_gradient_norm = hyper_params.get("log_gradient_norm", True)
     log_scale_shift_stats = hyper_params.get("log_scale_shift_stats", True)
     log_max_batches_per_epoch = hyper_params.get("log_max_batches_per_epoch", None)
-    # 추가: config.yaml에 정의된 depth_loss_weight (없으면 1.0 기본값)
-    depth_loss_weight = hyper_params.get("depth_loss_weight", 1.0)
+    # depth_loss_weight 제거: Student는 SSI/TGM loss로 GT supervision 충분
     
     # Bidirectional Cache Update parameters
     bidirectional_update_length = CLIP_LEN // 2  # 16 frames for bidirectional update
@@ -517,7 +516,7 @@ def train(args):
         logger.info(f"   • attention_based_kd: True (replaces feature_distill_layers)")
         logger.info(f"   • feature_distill_weight: {feature_distill_weight}")
         logger.info(f"   • distill_scale_invariant: {distill_scale_invariant}")
-        logger.info(f"   • depth_loss_weight: {depth_loss_weight}")
+        # depth_loss_weight 로깅 제거
 
 
     run = wandb.init(project="stream_teacher_student", entity="Depth-Finder", config=hyper_params)
@@ -570,14 +569,14 @@ def train(args):
         ).to(device)
 
         class TeacherStudentWrapper(torch.nn.Module):
-            def __init__(self, teacher, student, distill_weight, feature_distill_weight, scale_invariant, depth_loss_weight):
+            def __init__(self, teacher, student, distill_weight, feature_distill_weight, scale_invariant):
                 super().__init__()
                 self.teacher = teacher
                 self.student = student
                 self.distill_weight = distill_weight
                 self.feature_distill_weight = feature_distill_weight
                 self.scale_invariant = scale_invariant
-                self.depth_loss_weight = depth_loss_weight
+                # depth_loss_weight 제거: Student는 SSI/TGM로 GT supervision 충분
                 self.proj_layers = torch.nn.ModuleDict()
 
             def forward(self, x, prev_depth=None):
@@ -619,7 +618,7 @@ def train(args):
                         current_frame=current_frame
                     )
 
-        model = TeacherStudentWrapper(teacher_model, student_model, teacher_distill_weight, feature_distill_weight, distill_scale_invariant, depth_loss_weight)
+        model = TeacherStudentWrapper(teacher_model, student_model, teacher_distill_weight, feature_distill_weight, distill_scale_invariant)
         logger.info("✅ Teacher-Student models created with causal masking enabled for streaming")
     else:
         logger.info("🏗️ Creating VideoDepthAnything model with streaming configuration...")
@@ -790,19 +789,19 @@ def train(args):
     # ── 체크포인트 로딩 ──
     start_epoch = 0
     
-    # 체크포인트 경로 결정: --resume_from 인자가 있으면 우선 사용, 없으면 latest_model.pth 확인
+    # 체크포인트 경로 결정: --resume_from 인자가 명시적으로 지정된 경우만 로딩
     checkpoint_path = None
-    if args.resume_from:
+    if args.resume_from is not None:
         if os.path.exists(args.resume_from):
             checkpoint_path = args.resume_from
             logger.info(f"🔄 Using specified checkpoint: {args.resume_from}")
         else:
             logger.warning(f"⚠️  Specified checkpoint not found: {args.resume_from}")
-            logger.info("🔍 Checking for default latest_model.pth...")
+            logger.warning("❌ Training will start from scratch with pretrained weights")
+    else:
+        logger.info("🆕 No checkpoint specified (--resume_from=None), starting fresh with pretrained weights")
     
-    if not checkpoint_path and os.path.exists(latest_model_path):
-        checkpoint_path = latest_model_path
-        logger.info(f"🔄 Using default checkpoint: {latest_model_path}")
+    # 더 이상 자동으로 latest_model.pth를 로딩하지 않음
     
     if checkpoint_path:
         logger.info(f"📂 Loading checkpoint from {checkpoint_path}")
@@ -939,7 +938,6 @@ def train(args):
         epoch_frames = 0
         epoch_ssi_loss = 0.0
         epoch_tgm_loss = 0.0
-        epoch_depth_loss = 0.0
         epoch_distill_loss = 0.0
         epoch_feature_loss = 0.0
         scale_list = []  # a*
@@ -958,12 +956,14 @@ def train(args):
             x, y = x.to(device), y.to(device)
             B, T = x.shape[:2]
             
+            # 현재 배치의 loss 추적 (progress bar 표시용)
+            batch_loss_sum = 0.0
+            batch_frame_count = 0
+            
             # Batch progress update (안전한 tensor → scalar 변환)
-            loss_val = (accum_loss / max(1, step_in_window))
-            if torch.is_tensor(loss_val): 
-                loss_val = loss_val.item()
+            current_loss_display = batch_loss_sum / max(1, batch_frame_count) if batch_frame_count > 0 else 0.0
             batch_pbar.set_postfix({
-                'Loss': f'{loss_val:.4f}',
+                'Loss': f'{current_loss_display:.4f}',
                 'Frames': epoch_frames,
                 'GPU_Mem': f'{torch.cuda.memory_allocated() / 1024**3:.1f}GB' if torch.cuda.is_available() else 'N/A'
             })
@@ -1044,25 +1044,28 @@ def train(args):
                                         layer.cached_attention_output = None
                         return attention_outputs
                     
-                    # Teacher forward with attention caching (한 번의 추론으로 prediction과 attention 모두 수집)
+                    # Teacher forward with attention caching (단일 프레임 처리로 차원 일치)
                     with torch.no_grad():
                         enable_attention_caching(model.teacher)
                         
-                        # teacher_frame_buffer는 이미 [B, 32, C, H, W] format
+                        # Teacher도 현재 프레임만 처리하여 차원 일치 보장 (Knowledge Distillation용)
+                        # teacher_frame_buffer[:, -1:, :, :, :] 사용하여 마지막 프레임만 추출
+                        teacher_current_frame = teacher_frame_buffer[:, -1:, :, :, :]  # [B, 1, C, H, W]
+                        
                         if torch.cuda.device_count() > 1:
-                            teacher_input_gpu = teacher_frame_buffer.to('cuda:1')
-                            # GPU 1에서 추론 후 마지막 프레임만 GPU 0으로 복사 (메모리 효율성)
-                            teacher_predictions = model.teacher(teacher_input_gpu)  # [B, 32, H, W] on cuda:1
-                            teacher_pred_t = teacher_predictions[:, -1].to(device)  # 마지막 프레임만 cuda:0으로 복사
+                            teacher_input_gpu = teacher_current_frame.to('cuda:1')
+                            # GPU 1에서 단일 프레임 추론
+                            teacher_predictions = model.teacher(teacher_input_gpu)  # [B, 1, H, W] on cuda:1
+                            teacher_pred_t = teacher_predictions[:, 0].to(device)  # [B, H, W] to cuda:0
                         else:
-                            teacher_predictions = model.teacher(teacher_frame_buffer)  # [B, 32, H, W]
-                            teacher_pred_t = teacher_predictions[:, -1]  # [B, H, W]
+                            teacher_predictions = model.teacher(teacher_current_frame)  # [B, 1, H, W]
+                            teacher_pred_t = teacher_predictions[:, 0]  # [B, H, W]
                         
                         # Teacher 출력도 표준 형태로 변환 (KD, alignment 계산에서 일관성 보장)
                         teacher_pred_t = to_BHW_pred(teacher_pred_t).clamp(min=1e-6)
                         
-                        # Teacher attention outputs 수집 (메모리 누수 방지를 위한 캐시 클리어)
-                        teacher_attention_outputs = collect_attention_outputs(model.teacher, clear=True)
+                        # Teacher attention outputs 수집 (단일 프레임이므로 추가 처리 불필요)
+                        teacher_attention_current = collect_attention_outputs(model.teacher, clear=True)
                         disable_attention_caching(model.teacher)
 
                 with autocast():
@@ -1115,77 +1118,143 @@ def train(args):
                                 student_aligned = align_single_frame_vda(pred_t_raw)  # pred_t_raw is disparity
                                 teacher_aligned = align_single_frame_vda(teacher_pred_t)  # teacher_pred_t is disparity
                             
-                            # Depth space에서 L1 loss (더 안정적)
-                            frame_depth_loss = F.l1_loss(student_aligned, y_t)
-                            # Depth space에서 L1 loss로 변경 (MSE는 너무 큰 값 생성)
+                            # Teacher-Student distillation loss (depth space L1 loss)
                             frame_distill_loss = F.l1_loss(student_aligned, teacher_aligned)
                         else:
                             # Convert VDA disparity output to depth for loss computation
                             student_depth = 1.0 / pred_t_raw.clamp(min=1e-6)
                             teacher_depth = 1.0 / teacher_pred_t.clamp(min=1e-6)
                             
-                            # Log space에서 계산하여 큰 값 방지
+                            # Log space에서 계산하여 큰 값 방지 (Teacher-Student distillation만)
                             log_student = torch.log(student_depth.clamp(min=1e-6))
                             log_teacher = torch.log(teacher_depth.clamp(min=1e-6))
-                            log_gt = torch.log(y_t.clamp(min=1e-6))
                             
-                            frame_depth_loss = F.l1_loss(log_student, log_gt)
+                            # Teacher-Student distillation loss만 계산 (GT supervision은 SSI/TGM에서 처리)
                             frame_distill_loss = F.l1_loss(log_student, log_teacher)
                         
                         # Attention-based Knowledge Distillation (이미 수집된 attention outputs 사용)
                         frame_feature_loss = pred_t_raw.new_tensor(0.0)
                         if model.feature_distill_weight > 0:
-                            # 이미 수집된 attention outputs 사용 (중복 forward 방지)
-                            min_outputs = min(len(teacher_attention_outputs), len(student_attention_outputs))
+                            # 현재 프레임에 해당하는 Teacher attention과 Student attention 비교
+                            min_outputs = min(len(teacher_attention_current), len(student_attention_outputs))
                             for i in range(min_outputs):
-                                teacher_out = teacher_attention_outputs[i]
+                                teacher_out = teacher_attention_current[i]
                                 student_out = student_attention_outputs[i]
+                                
+                                # 디버깅 정보 출력 (첫 번째 배치, 첫 번째 프레임에서만)
+                                if epoch == 0 and batch_idx == 0 and t == 0 and i < 3:
+                                    logger.info(f"🔍 Attention layer {i} shapes: "
+                                              f"Teacher {teacher_out.shape if teacher_out is not None else 'None'} "
+                                              f"vs Student {student_out.shape if student_out is not None else 'None'}")
+                                
+                                # None 체크
+                                if teacher_out is None or student_out is None:
+                                    continue
                                 
                                 # Device alignment
                                 if teacher_out.device != student_out.device:
                                     teacher_out = teacher_out.to(student_out.device)
                                 
-                                # Dimension alignment if needed
-                                if teacher_out.shape != student_out.shape:
-                                    # Simple spatial dimension alignment
-                                    if teacher_out.shape[1] != student_out.shape[1]:  # spatial patches
-                                        min_patches = min(teacher_out.shape[1], student_out.shape[1])
-                                        teacher_out = teacher_out[:, :min_patches, :]
-                                        student_out = student_out[:, :min_patches, :]
-                                    
-                                    # Channel dimension alignment
-                                    if teacher_out.shape[-1] != student_out.shape[-1]:
-                                        proj_key = f'attention_proj_layer{i}'
-                                        if proj_key not in model.proj_layers:
-                                            # 새 프로젝션 레이어 생성
-                                            proj_layer = torch.nn.Linear(
-                                                student_out.shape[-1], teacher_out.shape[-1], bias=False
-                                            ).to(student_out.device)
-                                            model.proj_layers[proj_key] = proj_layer
-                                            
-                                            # 동적 생성된 레이어 파라미터를 optimizer에 추가
-                                            try:
-                                                optimizer.add_param_group({
-                                                    'params': proj_layer.parameters(),
-                                                    'lr': optimizer.param_groups[0]['lr'],  # 기존 학습률 사용
-                                                    'weight_decay': optimizer.param_groups[0].get('weight_decay', 0)
-                                                })
-                                                logger.info(f"🔧 Added projection layer '{proj_key}' to optimizer: "
-                                                           f"{student_out.shape[-1]} → {teacher_out.shape[-1]} "
-                                                           f"(params: {sum(p.numel() for p in proj_layer.parameters())})")
-                                            except Exception as e:
-                                                logger.warning(f"⚠️ Failed to add projection layer to optimizer: {e}")
-                                                logger.warning("   Projection layer created but may not be trained!")
-                                        
-                                        student_out = model.proj_layers[proj_key](student_out)
+                                # Extract the most recent frame features for fair comparison
+                                # Teacher: Always outputs current frame features
+                                # Student: May have accumulated temporal features, extract current frame
                                 
-                                # MSE loss between attention outputs
-                                frame_feature_loss = frame_feature_loss + F.mse_loss(student_out, teacher_out.detach())
+                                # For Student with accumulated temporal features (streaming mode)
+                                if student_out.shape[0] == teacher_out.shape[0] * teacher_out.shape[1]:
+                                    # Student: [B*spatial_patches, 1, channels] → [B, spatial_patches, channels]
+                                    # Reshape to match Teacher's current frame format
+                                    B_teacher = teacher_out.shape[0]
+                                    spatial_patches = student_out.shape[0] // B_teacher
+                                    student_out_reshaped = student_out.view(B_teacher, spatial_patches, student_out.shape[-1])
+                                    
+                                    # Now both have same shape: [B, spatial_patches, channels]
+                                    teacher_current = teacher_out
+                                    student_current = student_out_reshaped
+                                    
+                                elif teacher_out.shape[0] != student_out.shape[0]:
+                                    # Alternative handling for other dimension mismatches
+                                    if teacher_out.shape[0] > student_out.shape[0]:
+                                        target_batch_size = student_out.shape[0]
+                                        teacher_current = teacher_out[-target_batch_size:, ...]
+                                        student_current = student_out
+                                    else:
+                                        teacher_current = teacher_out
+                                        student_current = student_out[:teacher_out.shape[0], ...]
+                                else:
+                                    # Shapes already match
+                                    teacher_current = teacher_out
+                                    student_current = student_out
+                                # 공간 차원 정렬 (spatial patches) - 필요한 경우에만
+                                if teacher_current.dim() >= 2 and student_current.dim() >= 2:
+                                    if teacher_current.shape[1] != student_current.shape[1]:
+                                        min_patches = min(teacher_current.shape[1], student_current.shape[1])
+                                        teacher_current = teacher_current[:, :min_patches, :]
+                                        student_current = student_current[:, :min_patches, :]
+                                
+                                # Channel dimension alignment
+                                if teacher_current.shape[-1] != student_current.shape[-1]:
+                                    proj_key = f'attention_proj_layer{i}'
+                                    if proj_key not in model.proj_layers:
+                                        # 새 프로젝션 레이어 생성
+                                        proj_layer = torch.nn.Linear(
+                                            student_current.shape[-1], teacher_current.shape[-1], bias=False
+                                        ).to(student_current.device)
+                                        model.proj_layers[proj_key] = proj_layer
+                                        
+                                        # 동적 생성된 레이어 파라미터를 optimizer에 추가
+                                        try:
+                                            optimizer.add_param_group({
+                                                'params': proj_layer.parameters(),
+                                                'lr': optimizer.param_groups[0]['lr'],  # 기존 학습률 사용
+                                                'weight_decay': optimizer.param_groups[0].get('weight_decay', 0)
+                                            })
+                                            logger.info(f"🔧 Added projection layer '{proj_key}' to optimizer: "
+                                                       f"{student_current.shape[-1]} → {teacher_current.shape[-1]} "
+                                                       f"(params: {sum(p.numel() for p in proj_layer.parameters())})")
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ Failed to add projection layer to optimizer: {e}")
+                                            logger.warning("   Projection layer created but may not be trained!")
+                                    
+                                    student_current = model.proj_layers[proj_key](student_current)
+                                
+                                # L1 loss between current frame attention outputs (더 안정적, MSE보다 작은 값)
+                                if teacher_current.shape == student_current.shape:
+                                    # 첫 번째 에폭에서 attention 값 범위 확인 (디버깅)
+                                    if epoch == 0 and batch_idx == 0 and t == 0 and i < 3:
+                                        t_mean = teacher_current.mean().item()
+                                        t_std = teacher_current.std().item()
+                                        s_mean = student_current.mean().item()
+                                        s_std = student_current.std().item()
+                                        logger.info(f"📊 Attention layer {i} values: "
+                                                   f"Teacher(μ={t_mean:.3f}, σ={t_std:.3f}) "
+                                                   f"Student(μ={s_mean:.3f}, σ={s_std:.3f})")
+                                    
+                                    # Attention 값들을 정규화하여 안정적인 distillation
+                                    # Cosine similarity loss 사용 (값 범위가 -1~1로 제한됨)
+                                    teacher_flat = teacher_current.view(-1, teacher_current.shape[-1])  # [B*patches, dim]
+                                    student_flat = student_current.view(-1, student_current.shape[-1])  # [B*patches, dim]
+                                    
+                                    # Cosine similarity (결과: [-1, 1])
+                                    cos_sim = F.cosine_similarity(teacher_flat, student_flat, dim=1)  # [B*patches]
+                                    
+                                    # Cosine distance loss (1 - cosine_similarity, 결과: [0, 2])
+                                    cos_loss = (1.0 - cos_sim).mean()  # 평균값: [0, 2] 범위
+                                    
+                                    frame_feature_loss = frame_feature_loss + cos_loss
+                                    
+                                    # 첫 번째 에폭에서 성공적인 정렬 확인
+                                    if epoch == 0 and batch_idx == 0 and t == 0 and i < 3:
+                                        logger.info(f"✅ Successfully aligned attention layer {i}: {teacher_current.shape}")
+                                else:
+                                    # 여전히 차원 불일치인 경우
+                                    if epoch == 0 and batch_idx == 0 and t < 3:
+                                        logger.warning(f"⚠️ Still mismatched at layer {i}: "
+                                                     f"Student {student_current.shape} vs Teacher {teacher_current.shape}")
                         
-                        # 가중치 적용된 Teacher-Student loss 저장 (값이 너무 큰 경우 스케일링)
-                        current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.01      # 1/100 스케일링
+                        # 가중치 적용된 Teacher-Student loss 저장 (depth_loss 제거, distill과 feature만 사용)
                         current_distill_loss = model.distill_weight * frame_distill_loss * 0.01     # 1/100 스케일링  
-                        current_feature_loss = model.feature_distill_weight * frame_feature_loss * 0.1  # 1/10 스케일링
+                        current_feature_loss = model.feature_distill_weight * frame_feature_loss    # Cosine loss는 별도 스케일링 불필요
+                        # current_depth_loss 제거: Student는 SSI/TGM loss로 GT supervision 충분
                         
                     else:
                         # 기존 방식 또는 Teacher-Student 미사용 (bidirectional update 적용)
@@ -1292,8 +1361,8 @@ def train(args):
 
                     # Loss 계산
                     if use_teacher_student:
-                        # Teacher-Student loss를 SSI/TGM과 결합
-                        loss = current_depth_loss + current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                        # Teacher-Student loss를 SSI/TGM과 결합 (depth_loss 제거)
+                        loss = current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
                         current_ssi_loss = ssi_loss_t
                         current_tgm_loss = tgm_loss
                     else:
@@ -1301,9 +1370,12 @@ def train(args):
                         loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
                         current_ssi_loss = ssi_loss_t
                         current_tgm_loss = tgm_loss
-                        current_depth_loss = pred_t_raw.new_tensor(0.0)
                         current_distill_loss = pred_t_raw.new_tensor(0.0)
                         current_feature_loss = pred_t_raw.new_tensor(0.0)
+
+                # 배치 레벨 loss 추적 업데이트
+                batch_loss_sum += loss.item() * B  # 배치 크기로 가중
+                batch_frame_count += B
 
                 # 누적/업데이트
                 loss = loss / update_frequency
@@ -1353,7 +1425,6 @@ def train(args):
                 epoch_ssi_loss += current_ssi_loss.item() * B
                 epoch_tgm_loss += current_tgm_loss.item() * B
                 if use_teacher_student:
-                    epoch_depth_loss += current_depth_loss.item() * B
                     epoch_distill_loss += current_distill_loss.item() * B
                     epoch_feature_loss += current_feature_loss.item() * B
                 
@@ -1365,8 +1436,15 @@ def train(args):
                 frame_pbar.set_postfix({
                     'SSI': f'{safe_item(current_ssi_loss):.4f}',
                     'TGM': f'{safe_item(current_tgm_loss):.4f}',
-                    'Depth': f'{safe_item(current_depth_loss):.4f}' if use_teacher_student else 'N/A',
                     'Distill': f'{safe_item(current_distill_loss):.4f}' if use_teacher_student else 'N/A'
+                })
+                
+                # 배치 progress bar도 주기적으로 업데이트 (프레임마다)
+                current_loss_display = batch_loss_sum / max(1, batch_frame_count) if batch_frame_count > 0 else 0.0
+                batch_pbar.set_postfix({
+                    'Loss': f'{current_loss_display:.4f}',
+                    'Frames': epoch_frames,
+                    'GPU_Mem': f'{torch.cuda.memory_allocated() / 1024**3:.1f}GB' if torch.cuda.is_available() else 'N/A'
                 })
 
             # per-batch wandb.log 제거 (epoch 말에만 집계 보고)
@@ -1407,7 +1485,7 @@ def train(args):
                 epoch_loss += accum_loss.item() if torch.is_tensor(accum_loss) else float(accum_loss)
                 accum_loss = 0.0
                 step_in_window = 0
-                logger.info(f"   🔄 Flushed remaining {remaining_steps} accumulated gradients")
+                # logger.info(f"   🔄 Flushed remaining {remaining_steps} accumulated gradients")  # 로그 제거
 
             # 메모리 정리: 주요 텐서들 삭제 (적절한 변수명 사용)
             del loss, ssi_loss_t
@@ -1434,11 +1512,10 @@ def train(args):
         if epoch_frames > 0:
             mean_ssi = epoch_ssi_loss / epoch_frames
             mean_tgm = epoch_tgm_loss / epoch_frames
-            mean_depth = epoch_depth_loss / epoch_frames if use_teacher_student else 0.0
             mean_distill = epoch_distill_loss / epoch_frames if use_teacher_student else 0.0
             mean_feature = epoch_feature_loss / epoch_frames if use_teacher_student and epoch_feature_loss>0 else 0.0
         else:
-            mean_ssi = mean_tgm = mean_depth = mean_distill = mean_feature = 0.0
+            mean_ssi = mean_tgm = mean_distill = mean_feature = 0.0
         # 안전한 통계 계산 (NaN/Inf 필터)
         def _finite_stats(values):
             if not values:
@@ -1489,7 +1566,6 @@ def train(args):
         }
         if use_teacher_student:
             log_dict.update({
-                "train/epoch_depth": mean_depth,
                 "train/epoch_distill": mean_distill,
             })
             if mean_feature>0:
@@ -1585,6 +1661,6 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
-    parser.add_argument("--resume_from", type=str, default="./outputs/experiment_20/latest_model.pth")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from. If None, starts fresh with pretrained weights.")
     args = parser.parse_args()
     train(args)

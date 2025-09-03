@@ -17,8 +17,8 @@ hyper_parameter:
   # ---- 추가 Teacher-Student / Streaming 설정 ----
   cache_max_length: 32            # Temporal cache 최대 길이 (기존 32 하드코딩 -> 하이퍼파라미터화)
   distill_scale_invariant: true   # Distillation 시 scale/shift 정렬 적용 여부
-  feature_distill_weight: 1.0     # Feature distillation loss 가중치
-  depth_loss_weight: 1.0          # (신규) Depth supervision loss 가중치 (프레임 분할 후 적용) - GT 절대 depth와 비교하지 않음
+  feature_distill_weight: 0.01    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)
+  # ---- depth_loss_weight 제거: Student는 SSI/TGM으로 GT supervision, Teacher distillation만 추가 학습
   # 조정안 적용: distill_weight↓, feature_distill_weight↑ (실제 값은 train.py에서 override 가능)
 
   # ---- 캐시/스케일 정렬 추가 옵션 ----
