@@ -27,8 +27,7 @@ class DPTHeadTemporal(DPTHead):
         out_channels=[256, 512, 1024, 1024], 
         use_clstoken=False,
         num_frames=32,
-        pe='ape',
-        use_causal_mask=True
+        pe='ape'
     ):
         super().__init__(in_channels, features, use_bn, out_channels, use_clstoken)
 
@@ -38,8 +37,7 @@ class DPTHeadTemporal(DPTHead):
                                         num_attention_blocks               = 2,
                                         temporal_max_len                   = num_frames,
                                         zero_initialize                    = True,
-                                        pos_embedding_type                 = pe,
-                                        use_causal_mask                    = use_causal_mask)
+                                        pos_embedding_type                 = pe)
 
         self.motion_modules = nn.ModuleList([
             TemporalModule(in_channels=out_channels[2], 
