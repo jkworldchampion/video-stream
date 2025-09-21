@@ -92,7 +92,7 @@ if __name__ == '__main__':
     DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     # 1번 코드: 실험 가중치 경로 그대로 사용
-    ckpt_path = os.path.join(BASE_DIR, 'outputs', 'experiment_21', 'best_model.pth')
+    ckpt_path = os.path.join(BASE_DIR, 'outputs', 'experiment_19', 'best_model.pth')
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"체크포인트가 없습니다: {ckpt_path}")
 

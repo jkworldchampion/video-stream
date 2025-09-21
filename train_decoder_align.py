@@ -38,7 +38,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
-experiment = 19
+experiment = 35
 os.makedirs("logs", exist_ok=True)
 
 logging.basicConfig(
@@ -1245,7 +1245,7 @@ def train(args):
                             if new_params:
                                 optimizer.add_param_group({'params': new_params})
 
-                        current_feature_loss = model.feature_distill_weight * dec_feat_loss * 0.1
+                        current_feature_loss = model.feature_distill_weight * dec_feat_loss
                         current_depth_loss = model.depth_loss_weight * frame_depth_loss * 0.01    
                         current_distill_loss = model.distill_weight * frame_distill_loss * 0.01      
                         #current_feature_loss = model.feature_distill_weight * frame_feature_loss 
@@ -1355,8 +1355,8 @@ def train(args):
                     # Loss 계산
                     if use_teacher_student:
                         # Teacher-Student loss를 SSI/TGM과 결합
-                        loss = current_depth_loss + current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
-                        #loss = current_depth_loss + current_distill_loss + current_feature_loss
+                        #loss = current_depth_loss + current_distill_loss + current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                        loss = current_feature_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
                         current_ssi_loss = ssi_loss_t
                         current_tgm_loss = tgm_loss
                     else:

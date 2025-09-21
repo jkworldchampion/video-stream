@@ -1,0 +1,12 @@
+hyper_parameter:
+  learning_rate: 0.0001  # 1e-4 -> 1.0e-4 for float representation
+  clip_len: 32  # 32 -> 16으로 줄여서 메모리 사용량 감소
+  ratio_ssi: 1
+  ratio_tgm: 10
+  epochs: 30
+  batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
+  update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
+  
+  # Teacher-Student parameters
+  pred_distill_weight: 1.0  # Distillation loss 가중치
+  cache_distill_weight: 1.0    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)

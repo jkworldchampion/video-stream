@@ -588,35 +588,20 @@ def train(args):
                 Returns:
                     depth: [B, T, H, W] or [B, H, W] for single frame
                 """
-                # For streaming inference, use student model
-                if hasattr(self.student, 'module'):
-                    # DataParallel wrapped
-                    return self.student.module.forward(x, prev_depth)
-                else:
-                    # Single GPU
-                    return self.student.forward(x, prev_depth)
+                # For streaming inference, use student model (always single GPU)
+                return self.student.forward(x, prev_depth)
 
             def forward_features(self, x):
-                """Forward features for streaming. Uses student model."""
-                if hasattr(self.student, 'module'):
-                    return self.student.module.forward_features(x)
-                else:
-                    return self.student.forward_features(x)
+                """Forward features for streaming. Uses student model (always single GPU)."""
+                return self.student.forward_features(x)
 
             def forward_depth(self, features, x_shape, cache=None, prev_depth=None, bidirectional_update_length=16, current_frame=0):
-                """Forward depth prediction for streaming. Uses student model."""
-                if hasattr(self.student, 'module'):
-                    return self.student.module.forward_depth(
-                        features, x_shape, cache, prev_depth, 
-                        bidirectional_update_length=bidirectional_update_length,
-                        current_frame=current_frame
-                    )
-                else:
-                    return self.student.forward_depth(
-                        features, x_shape, cache, prev_depth,
-                        bidirectional_update_length=bidirectional_update_length, 
-                        current_frame=current_frame
-                    )
+                """Forward depth prediction for streaming. Uses student model (always single GPU)."""
+                return self.student.forward_depth(
+                    features, x_shape, cache, prev_depth,
+                    bidirectional_update_length=bidirectional_update_length, 
+                    current_frame=current_frame
+                )
 
         model = TeacherStudentWrapper(teacher_model, student_model, teacher_distill_weight, feature_distill_weight, distill_scale_invariant)
         logger.info("✅ Teacher-Student models created with causal masking enabled for streaming")
@@ -649,39 +634,18 @@ def train(args):
     # Pretrained 로드
     if args.pretrained_ckpt:
         logger.info(f"📂 Loading pretrained weights from {args.pretrained_ckpt}")
-        ckpt = torch.load(args.pretrained_ckpt, map_location="cpu")
-        if isinstance(ckpt, dict):
-            if "model_state_dict" in ckpt:
-                state_dict = ckpt["model_state_dict"]
-            elif "state_dict" in ckpt:
-                state_dict = ckpt["state_dict"]
-            else:
-                state_dict = ckpt
-        else:
-            state_dict = ckpt
-
+        state_dict = torch.load(args.pretrained_ckpt, map_location="cpu")
+        
         if use_teacher_student:
-            # Student 가중치만 로드 (추론 호환성 중시)
-            student_dict = model.student.state_dict()
-            student_filtered = {k: v for k, v in state_dict.items() if k in student_dict and v.size() == student_dict[k].size()}
-            student_dict.update(student_filtered)
-            model.student.load_state_dict(student_dict, strict=True)
-            skipped = set(state_dict.keys()) - set(student_filtered.keys())
+            # Teacher와 Student 모두에 동일한 pretrained 가중치 로드
+            model.teacher.load_state_dict(state_dict, strict=True)
+            model.student.load_state_dict(state_dict, strict=True)
+            logger.info("✅ Both Teacher and Student loaded with pretrained weights")
         else:
-            model_dict = model.state_dict()
-            filtered = {k: v for k, v in state_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
-            skipped = set(state_dict.keys()) - set(filtered.keys())
-
-            model_dict.update(filtered)
-            model.load_state_dict(model_dict, strict=True)
-
-        if skipped:
-            logger.warning(f"⚠️ Skipped loading {len(skipped)} parameters (shape mismatch):")
-            for s in list(skipped)[:5]:
-                logger.warning(f"   • {s}")
-            if len(skipped) > 5:
-                logger.warning(f"   • ... and {len(skipped) - 5} more")
-        logger.info("✅ Pretrained weights loaded successfully")
+            model.load_state_dict(state_dict, strict=True)
+            logger.info("✅ Model loaded with pretrained weights")
+    else:
+        logger.warning("⚠️ No pretrained checkpoint provided - models will start with random weights")
 
     # 학습 전략: encoder freeze, head만 학습
     logger.info("🔒 Configuring training strategy: Encoder frozen, Decoder trainable")
