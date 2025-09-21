@@ -5,3 +5,6 @@ __pycache__
 */__pycache__
 *.pyc
 gradio*
+benchmark/output
+logs
+wandb

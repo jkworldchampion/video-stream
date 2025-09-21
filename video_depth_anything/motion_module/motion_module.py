@@ -40,7 +40,6 @@ class TemporalModule(nn.Module):
         temporal_max_len                   = 32,
         zero_initialize                    = True,
         pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
     ):
         super().__init__()
 
@@ -53,7 +52,6 @@ class TemporalModule(nn.Module):
             norm_num_groups=norm_num_groups,
             temporal_max_len=temporal_max_len,
             pos_embedding_type=pos_embedding_type,
-            use_causal_mask=use_causal_mask,
         )
 
         if zero_initialize:
@@ -78,7 +76,6 @@ class TemporalTransformer3DModel(nn.Module):
         norm_num_groups                    = 32,
         temporal_max_len                   = 32,
         pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
     ):
         super().__init__()
 
@@ -96,7 +93,6 @@ class TemporalTransformer3DModel(nn.Module):
                     num_attention_blocks=num_attention_blocks,
                     temporal_max_len=temporal_max_len,
                     pos_embedding_type=pos_embedding_type,
-                    use_causal_mask=use_causal_mask,
                 )
                 for d in range(num_layers)
             ]
@@ -130,27 +126,7 @@ class TemporalTransformer3DModel(nn.Module):
 
         # output
         hidden_states = self.proj_out(hidden_states)
-        
-        # Safe reshape: use the original spatial dimensions
-        try:
-            hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
-        except RuntimeError as e:
-            # If reshape fails, try to infer correct dimensions
-            print(f"Original reshape failed: {e}")
-            total_elements = hidden_states.numel()
-            
-            # Calculate dimensions based on residual tensor
-            target_batch, _, target_height, target_width = residual.shape
-            expected_elements = target_batch * target_height * target_width * inner_dim
-            
-            if total_elements == expected_elements:
-                hidden_states = hidden_states.reshape(target_batch, target_height, target_width, inner_dim).permute(0, 3, 1, 2).contiguous()
-                print(f"Successfully reshaped using residual dimensions: {hidden_states.shape}")
-            else:
-                # Last resort: create zero tensor with correct shape
-                print(f"Creating zero tensor. Total elements: {total_elements}, Expected: {expected_elements}")
-                hidden_states = torch.zeros(target_batch, inner_dim, target_height, target_width, 
-                                           device=hidden_states.device, dtype=hidden_states.dtype)
+        hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
 
         output = hidden_states + residual
         output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
@@ -167,7 +143,6 @@ class TemporalTransformerBlock(nn.Module):
         num_attention_blocks               = 2,
         temporal_max_len                   = 32,
         pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
     ):
         super().__init__()
 
@@ -179,7 +154,6 @@ class TemporalTransformerBlock(nn.Module):
                         dim_head=attention_head_dim,
                         temporal_max_len=temporal_max_len,
                         pos_embedding_type=pos_embedding_type,
-                        use_causal_mask=use_causal_mask,
                 )
                 for i in range(num_attention_blocks)
             ]
@@ -240,14 +214,12 @@ class TemporalAttention(CrossAttention):
             self,
             temporal_max_len                   = 32,
             pos_embedding_type                 = "ape",
-            use_causal_mask                    = True,
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
 
         self.pos_embedding_type = pos_embedding_type
         self._use_memory_efficient_attention_xformers = True
-        self.use_causal_mask = use_causal_mask
 
         self.pos_encoder = None
         self.freqs_cis = None
@@ -267,32 +239,6 @@ class TemporalAttention(CrossAttention):
         else:
             raise NotImplementedError
 
-    def _create_causal_mask(self, seq_len, current_frame_idx=None, device='cuda'):
-        """
-        Create causal mask for temporal attention.
-        For streaming mode, mask out future frames beyond current_frame_idx.
-        For training mode, create lower triangular mask.
-        
-        Args:
-            seq_len: Sequence length (number of frames)
-            current_frame_idx: Index of current frame in streaming mode (None for training)
-            device: Device to create mask on
-            
-        Returns:
-            Causal mask of shape (seq_len, seq_len)
-        """
-        if current_frame_idx is not None:
-            # Streaming mode: only allow attention to past and current frames
-            mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
-            mask[:, :current_frame_idx + 1] = True
-        else:
-            # Training mode: standard causal mask (lower triangular)
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
-        
-        # Convert to attention bias (large negative values for masked positions)
-        causal_mask = torch.where(mask, 0.0, float('-inf'))
-        return causal_mask
-
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None):
         # TODO: support cache for these
         assert encoder_hidden_states is None
@@ -300,75 +246,14 @@ class TemporalAttention(CrossAttention):
 
         d = hidden_states.shape[1]
         d_in = 0
-        is_streaming_mode = cached_hidden_states is not None
-        
         if cached_hidden_states is None:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
             input_hidden_states = hidden_states  # (bxd) f c
         else:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)
             input_hidden_states = hidden_states
-            
-            # Handle cached states properly - ensure correct dimensions
-            
-            if cached_hidden_states.dim() == 2:
-                # If cached tensor is 2D [seq_len, dim], convert to 3D format
-                cached_hidden_states = cached_hidden_states.unsqueeze(1)  # [seq_len, 1, dim]
-                # Repeat for batch dimension to match current input
-                cached_hidden_states = cached_hidden_states.repeat(hidden_states.shape[0], 1, 1)  # [batch*seq_len, 1, dim]
-                cached_hidden_states = cached_hidden_states.view(hidden_states.shape[0], -1, cached_hidden_states.shape[2])  # [batch, seq_len, dim]
-            # elif cached_hidden_states.dim() == 3 and cached_hidden_states.shape[1] == 1:
-                # If cached tensor is [spatial_patches, 1, dim], we need to expand temporal dimension
-                # print(f"Expanding single temporal step cache from {cached_hidden_states.shape}")
-                # This means we have a single frame cache, just use it as is for concatenation
-            
-            # Check if cached states are compatible - only feature dimension needs to match
-            # Batch dimension should already match since we're processing the same image resolution
-            if cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print("Creating new compatible cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            elif cached_hidden_states.shape[0] != hidden_states.shape[0]:
-                # This should NOT happen for same resolution frames - indicates a bug
-                print(f"ERROR: Batch dimension mismatch for same resolution: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("This indicates a cache storage/loading bug. Resetting cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            else:
-                d_in = cached_hidden_states.shape[1]
-            
-            # Ensure both tensors have the same dimensions before concatenation
-            
-            # Fix dimension mismatch if it occurs
-            if cached_hidden_states.dim() != hidden_states.dim():
-                if cached_hidden_states.dim() == 2 and hidden_states.dim() == 3:
-                    cached_hidden_states = cached_hidden_states.unsqueeze(1)
-                elif cached_hidden_states.dim() == 3 and hidden_states.dim() == 2:
-                    hidden_states = hidden_states.unsqueeze(1)
-                    print(f"Fixed current shape: {hidden_states.shape}")
-            
-            # Verify shapes are compatible for concatenation
-            if cached_hidden_states.shape[0] != hidden_states.shape[0] or cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print(f"ERROR: Shape incompatible for concat: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("Resetting cache to avoid error...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-                
+            d_in = cached_hidden_states.shape[1]
             hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
-            
-            # Ensure total temporal length doesn't exceed maximum
-            max_total_length = 32
-            if hidden_states.shape[1] > max_total_length:
-                hidden_states = hidden_states[:, -max_total_length:, :]
 
         if self.pos_encoder is not None:
             hidden_states = self.pos_encoder(hidden_states)
@@ -393,42 +278,12 @@ class TemporalAttention(CrossAttention):
             freqs_cis = self.freqs_cis[:seq_len].to(query.device)
             query, key = apply_rotary_emb(query, key, freqs_cis)
 
-        # Apply causal masking if enabled
-        causal_attention_mask = None
-        if self.use_causal_mask:
-            seq_len = hidden_states.shape[1]
-            if is_streaming_mode:
-                # In streaming mode, current frame can only attend to past frames
-                current_frame_idx = seq_len - 1  # Last frame is the current frame
-                causal_attention_mask = self._create_causal_mask(seq_len, current_frame_idx, hidden_states.device)
-            else:
-                # In training mode, apply standard causal mask
-                causal_attention_mask = self._create_causal_mask(seq_len, None, hidden_states.device)
-            
-            # Expand mask for multiple heads and batch dimensions
-            batch_size = key.shape[0]
-            if causal_attention_mask is not None:
-                # Only apply mask to the query frames (not full sequence)
-                query_seq_len = query.shape[1]  # This is 1 for streaming mode
-                if query_seq_len < seq_len:
-                    # Extract the relevant part of the mask for query
-                    causal_attention_mask = causal_attention_mask[-query_seq_len:, :]
-                
-                causal_attention_mask = causal_attention_mask.unsqueeze(0).repeat(batch_size, 1, 1)
-                causal_attention_mask = causal_attention_mask.repeat_interleave(self.heads, dim=0)
-
-        # Combine with existing attention mask if provided
-        final_attention_mask = causal_attention_mask
         if attention_mask is not None:
             if attention_mask.shape[-1] != query.shape[1]:
                 target_length = query.shape[1]
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
-            
-            if final_attention_mask is not None:
-                final_attention_mask = final_attention_mask + attention_mask
-            else:
-                final_attention_mask = attention_mask
+
 
         use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
         if use_memory_efficient and (dim // self.heads) % 8 != 0:
@@ -441,7 +296,7 @@ class TemporalAttention(CrossAttention):
             key = self.reshape_heads_to_4d(key)
             value = self.reshape_heads_to_4d(value)
 
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, final_attention_mask)
+            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
@@ -450,9 +305,10 @@ class TemporalAttention(CrossAttention):
             value = self.reshape_heads_to_batch_dim(value)
 
             if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value, final_attention_mask)
+                hidden_states = self._attention(query, key, value, attention_mask)
             else:
                 raise NotImplementedError
+                # hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -460,47 +316,6 @@ class TemporalAttention(CrossAttention):
         # dropout
         hidden_states = self.to_out[1](hidden_states)
 
-        # Reshape back to original format
-        # For streaming mode, we want [spatial_patches, temporal_len, dim]
-        # For non-streaming, we want [batch*temporal, spatial_patches, dim]
-        if is_streaming_mode and d_in > 0:
-            # In streaming mode, we already have the right shape after attention
-            # hidden_states is already [spatial_patches*temporal, dim] from attention
-            # We need to reshape it to [spatial_patches, temporal_len, dim]
-            spatial_patches = d
-            temporal_len = hidden_states.shape[0] // spatial_patches
-            hidden_states = hidden_states.view(spatial_patches, temporal_len, -1)
-        else:
-            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
-        
-        # In streaming mode with cached states, we need to ensure output matches input
-        if is_streaming_mode and d_in > 0:
-            # For streaming, we only want the output for the new frame
-            # hidden_states is now [spatial_patches, total_temporal_len, dim] after concat
-            
-            # Get only the new frame's output (last temporal step)
-            # Keep the spatial dimension intact for proper output
-            new_frame_output = hidden_states[:, -1, :]  # [spatial_patches, dim] - remove temporal dim for output
-            
-            # Reshape to expected output format if needed
-            output_tensor = new_frame_output  # Keep as [spatial_patches, dim]
-            
-            # For cache output, we need to save the current frame in the right format
-            # Cache should match the spatial dimension [spatial_patches, 1, dim]
-            # Extract the new frame from the last temporal position
-            new_frame_cache = hidden_states[:, -1:, :]  # [spatial_patches, 1, dim]
-            cache_output = new_frame_cache  # Keep in [spatial_patches, 1, dim] format
-            
-            return output_tensor, cache_output
-        else:
-            # Standard mode (first frame) - return cache in streaming-compatible format
-            # We need to return cache that matches the streaming mode format
-            
-            # For first frame, hidden_states is [1, spatial_patches, dim] 
-            # We need to convert it to [spatial_patches, 1, dim] format for streaming compatibility
-            # Remove the batch dimension and add temporal dimension at the right place
-            
-            cache_output = hidden_states.squeeze(0)      # [1, spatial_patches, dim] -> [spatial_patches, dim]
-            cache_output = cache_output.unsqueeze(1)     # [spatial_patches, dim] -> [spatial_patches, 1, dim]
-            
-            return hidden_states, cache_output
+        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+
+        return hidden_states, input_hidden_states
