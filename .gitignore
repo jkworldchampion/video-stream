@@ -9,3 +9,5 @@ gradio*
 /benchmark/output
 logs
 wandb/
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/

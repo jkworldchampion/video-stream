@@ -210,6 +210,9 @@ def train(args):
     batch_size = hyper_params["batch_size"]
     CLIP_LEN   = hyper_params["clip_len"]           # W=32
 
+    if args.epochs is not None:
+        num_epochs = int(args.epochs)
+
     # KD 하이퍼
     kd_weight  = hyper_params.get("kd_weight", 1.0)
     kd_top_r   = hyper_params.get("kd_top_r", 64)
@@ -217,6 +220,8 @@ def train(args):
     w_attn_kl  = hyper_params.get("w_attn_kl", 1.0)
     w_kv_cos   = hyper_params.get("w_kv_cos", 1.0)
     w_ctx_cos  = hyper_params.get("w_ctx_cos", 0.0)
+
+    lambda_delta = hyper_params.get("lambda_delta", 1e-4)
 
     # Stage-2: teacher dropout & attn entropy reg
     stage2_epochs = hyper_params.get("stage2_epochs", 5)  # 마지막 5 epoch
@@ -276,6 +281,46 @@ def train(args):
     loss_ssi = Loss_ssi_basic()
     scaler = GradScaler()
 
+    # ----- Resume (optional) -----
+    start_epoch = 0
+    best_delta1 = 0.0  # 이어서 학습 시에도 유지/갱신
+
+    if args.resume_from and os.path.isfile(args.resume_from):
+        ckpt = torch.load(args.resume_from, map_location="cpu")
+
+        # 1) 학생 모델 가중치
+        sd = ckpt.get("model_state_dict", ckpt)
+        # 혹시 모듈 프리픽스가 있어도 안전하게 로드
+        try:
+            model.student.load_state_dict(sd, strict=True)
+        except RuntimeError:
+            from collections import OrderedDict
+            clean = OrderedDict()
+            for k, v in sd.items():
+                nk = k
+                if nk.startswith("module."): nk = nk[len("module."):]
+                if nk.startswith("student."): nk = nk[len("student."):]
+                clean[nk] = v
+            model.student.load_state_dict(clean, strict=False)
+
+        # 2) 옵티마이저/스케줄러 상태(있으면)
+        if "optimizer_state_dict" in ckpt:
+            try: optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as e: logger.warning(f"Optimizer state load skipped: {e}")
+
+        if "scheduler_state_dict" in ckpt:
+            try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception as e: logger.warning(f"Scheduler state load skipped: {e}")
+
+        # 3) 베스트 스코어 & 스타트 에폭
+        if "best_val_delta1" in ckpt:
+            try: best_delta1 = float(ckpt["best_val_delta1"])
+            except: pass
+        if "epoch" in ckpt:
+            start_epoch = int(ckpt["epoch"]) + 1
+
+        logger.info(f"▶ Resumed from '{args.resume_from}' | start_epoch={start_epoch} / target_epochs={num_epochs} | best_delta1={best_delta1:.4f}")
+
     wandb.watch(model.student, log="all")
     best_delta1 = 0.0
     best_epoch  = 0
@@ -327,7 +372,7 @@ def train(args):
 
 
     # --------------------- Training ---------------------
-    for epoch in tqdm(range(num_epochs), desc="Epoch", leave=False):
+    for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
         model.train()
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = epoch_kd = 0.0
@@ -553,5 +598,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
+    parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
     args = parser.parse_args()
     train(args)

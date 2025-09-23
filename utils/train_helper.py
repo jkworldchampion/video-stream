@@ -907,7 +907,8 @@ def validate_with_infer_eval_subset(
     dataset_eval_tag="scannet_500",  # eval 설정 preset (run.sh에서는 scannet_500)
     device="cuda",
     input_size=518,
-    scenes_to_eval=2,          # ⬅️ 대표성 위해 2 scene만
+    scenes_to_eval=2,          # 시간관계상 2 scene만
+    scene_indices=[0,44],      # 계산할 씬 index
     fp32=True,
 ):
     """
@@ -928,7 +929,14 @@ def validate_with_infer_eval_subset(
     # 2) Inference (subset)
     processed = 0
     seq_registry = []  # 평가 시 동일 순서/동일 subset을 재사용하기 위해 기록
-    for data in tqdm(path_json[dataset], desc=f"[VAL] Streaming {dataset} (subset={scenes_to_eval})"):
+
+    # 사용할 인덱스 결정
+    if scene_indices is not None:
+        target_indices = set(scene_indices)   # lookup 빠르게 하도록 set
+    else:
+        target_indices = set(range(min(scenes_to_eval, len(all_scenes))))
+    
+    for i, data in enumerate(tqdm(path_json[dataset], desc=f"[VAL] Streaming {dataset} (subset)")):
         for key in data.keys():
             if processed >= scenes_to_eval:
                 break
@@ -955,7 +963,11 @@ def validate_with_infer_eval_subset(
 
             seq_registry.append((key, frames))
             processed += 1
-        if processed >= scenes_to_eval:
+            
+            # scene_indices 모드가 아닐 때만 early stop
+            if scene_indices is None and processed >= scenes_to_eval:
+                break
+        if scene_indices is None and processed >= scenes_to_eval:
             break
 
     torch.cuda.empty_cache(); gc.collect()
