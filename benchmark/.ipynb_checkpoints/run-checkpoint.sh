@@ -33,12 +33,7 @@ echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
 python "${ROOT}/benchmark/eval/eval.py" \
   --infer_path "${INFER_PATH}" \
   --benchmark_path "${BENCHMARK_ROOT}" \
-  --datasets scannet_500 \
-  --wandb \
-  --wandb_project evaluation \
-  --wandb_run_name "experiment_31_$(date +%Y%m%d_%H%M)" \
-  --wandb_group "streaming" \
-  --wandb_mode online
+  --datasets scannet_500
 
 echo
 echo "✅ All done!"

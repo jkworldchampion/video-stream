@@ -229,6 +229,15 @@ class TemporalAttention(CrossAttention):
         # KD 훅 상태
         self._kd_cache_enabled = False
         self._kd_cache = None
+        
+        self.enable_refiner = True
+        self.refiner_alpha = 0.5   # norm clamp 비율(예)
+        c = self.heads * self.dim_head
+        hidden = max(128, c // 2)
+        self.kv_refiner = nn.Sequential(
+            nn.Linear(3 * c, hidden), nn.GELU(),
+            nn.Linear(hidden, 2 * c + 2)  # ΔK(c) | ΔV(c) | log_s(1) | logit_g(1)
+        )
 
     # ===== KD hook API =====
     def enable_kd_caching(self, flag: bool = True):
@@ -286,7 +295,7 @@ class TemporalAttention(CrossAttention):
         assert encoder_hidden_states is None
         assert attention_mask is None
 
-        d = hidden_states.shape[1]  # tokens per frame
+        d = hidden_states.shape[1]  # tokens-per-frame (spatial tokens)
 
         # (b*f, d, c) -> (b*d, f, c)
         if cached_hidden_states is None:
@@ -298,38 +307,72 @@ class TemporalAttention(CrossAttention):
             now = hidden_states
             past = cached_hidden_states
 
-        # Positional
+        # Positional(APE or RoPE-prep)
         if self.pos_encoder is not None:
             now_pos  = self.pos_encoder(now)
             past_pos = self.pos_encoder(past) if past is not None else None
         else:
             now_pos, past_pos = now, past
 
-        # Q/K/V
-        q_now = self.to_q(now_pos)
-        k_now = self.to_k(now_pos)
-        v_now = self.to_v(now_pos)
+        # Q/K/V (concat-head 차원 C = heads*dim_head)
+        q_now = self.to_q(now_pos)   # [(b*d), q(=1), C]
+        k_now = self.to_k(now_pos)   # [(b*d), 1, C]
+        v_now = self.to_v(now_pos)   # [(b*d), 1, C]
 
+        sel_idx = None          # for logging
+        ref_stats = {}          # dK/dV/g/s/clamp_violation 저장용
         if stream_mode and (past_pos is not None):
-            k_past_all = self.to_k(past_pos)
-            v_past_all = self.to_v(past_pos)
+            k_past_all = self.to_k(past_pos)   # [(b*d), Tp, C]
+            v_past_all = self.to_v(past_pos)   # [(b*d), Tp, C]
 
+            # --- Top-R selector ---
             if (select_top_r is not None) and (select_top_r > 0) and (k_past_all.shape[1] > select_top_r):
-                score = torch.matmul(q_now, k_past_all.transpose(-1, -2))  # (b*d, f_now, Tpast)
-                idx = torch.topk(score.squeeze(1), k=select_top_r, dim=-1, largest=True, sorted=False).indices
-                gidx = idx.unsqueeze(-1).expand(-1, -1, k_past_all.shape[-1])
-                k_sel = torch.gather(k_past_all, dim=1, index=gidx)
-                v_sel = torch.gather(v_past_all, dim=1, index=gidx)
+                # 점수: [(b*d), 1, Tp]
+                score = torch.matmul(q_now, k_past_all.transpose(-1, -2))
+                sel_idx = torch.topk(score.squeeze(1), k=select_top_r, dim=-1, largest=True, sorted=False).indices  # [(b*d), R]
+                gidx = sel_idx.unsqueeze(-1).expand(-1, -1, k_past_all.shape[-1])                                   # [(b*d), R, C]
+                k_sel = torch.gather(k_past_all, dim=1, index=gidx)  # [(b*d), R, C]
+                v_sel = torch.gather(v_past_all, dim=1, index=gidx)  # [(b*d), R, C]
             else:
-                k_sel, v_sel = k_past_all, v_past_all
+                k_sel, v_sel = k_past_all, v_past_all                # [(b*d), Tp, C]
 
-            key   = torch.cat([k_sel, k_now], dim=1)  # (b*d, K, C)
-            value = torch.cat([v_sel, v_now], dim=1)
-            query = q_now                                # (b*d, q, C)
+            # --- 🔧 KV-Refiner (선택된 과거 토큰에만 적용) ---
+            if self.enable_refiner and (k_sel is not None) and (k_sel.numel() > 0):
+                B0, R, C = k_sel.shape
+                # q_len=1 가정 → q를 R에 맞춰 broadcast
+                q_rep = q_now.expand(B0, R, C)                       # [(b*d), R, C]
+                inp   = torch.cat([q_rep, k_sel, v_sel], dim=-1)     # [(b*d), R, 3C]
+                out   = self.kv_refiner(inp)                         # [(b*d), R, 2C+2]
+                dK, dV, log_s, logit_g = torch.split(out, [C, C, 1, 1], dim=-1)
+                s = F.softplus(log_s) + 1e-5                         # ≥ 0
+                g = torch.sigmoid(logit_g)                           # 0~1 gate
+
+                k_ref = k_sel + g * dK * s
+                v_ref = v_sel + g * dV * s
+
+                # norm clamp 위반 페널티(위반분만 제곱 평균)
+                eps = 1e-6
+                k_base = k_sel.norm(dim=-1, keepdim=True) + eps
+                v_base = v_sel.norm(dim=-1, keepdim=True) + eps
+                k_over = torch.clamp(dK.norm(dim=-1, keepdim=True) - self.refiner_alpha * k_base, min=0.0)
+                v_over = torch.clamp(dV.norm(dim=-1, keepdim=True) - self.refiner_alpha * v_base, min=0.0)
+                clamp_violation = (k_over.pow(2) + v_over.pow(2)).mean()
+
+                # refined를 사용
+                k_sel, v_sel = k_ref, v_ref
+
+                # 통계 저장(캐시에 넣기 위해)
+                ref_stats = {"dK": dK, "dV": dV, "g": g, "s": s, "clamp_violation": clamp_violation}
+
+            # 현재 프레임과 concat
+            key   = torch.cat([k_sel, k_now], dim=1)     # [(b*d), K, C]
+            value = torch.cat([v_sel, v_now], dim=1)     # [(b*d), K, C]
+            query = q_now                                # [(b*d), q, C]
         else:
-            key, value, query = k_now, v_now, q_now
+            # 과거 없음(offline/단일)
+            key, value, query = k_now, v_now, q_now      # [(b*d), 1, C]
 
-        # RoPE
+        # RoPE (원한다면 q/k에 적용)
         if self.freqs_cis is not None:
             k_len = key.shape[1]
             q_len = query.shape[1]
@@ -337,8 +380,7 @@ class TemporalAttention(CrossAttention):
             freqs_q = self._scaled_rope(q_len, device=query.device, rope_dt=rope_dt)
             query, key = apply_rotary_emb(query, key, (freqs_q, freqs_k))
 
-        # ==== Manual SDPA (always) ====
-        # reshape to [B*H, L, Dh]
+        # ===== Manual SDPA (항상) =====
         def _to_bh(x):
             B_, L_, C_ = x.shape
             H = self.heads
@@ -347,43 +389,53 @@ class TemporalAttention(CrossAttention):
             x = x.view(B_, L_, H, Dh).permute(0, 2, 1, 3).reshape(B_ * H, L_, Dh).contiguous()
             return x, Dh
 
-        q_bh, Dh_q = _to_bh(query)
-        k_bh, Dh_k = _to_bh(key)
-        v_bh, Dh_v = _to_bh(value)
-        assert Dh_q == Dh_k == Dh_v, f"Head dims mismatch: {Dh_q}, {Dh_k}, {Dh_v}"
+        q_bh, Dh = _to_bh(query)         # [B*H, q, Dh]
+        k_bh, _  = _to_bh(key)           # [B*H, k, Dh]
+        v_bh, _  = _to_bh(value)         # [B*H, k, Dh]
 
-        scale = (Dh_q ** -0.5)
+        scale = (Dh ** -0.5)
         scores = torch.bmm(q_bh, k_bh.transpose(1, 2)) * scale  # [B*H, q, k]
-        attn = torch.softmax(scores, dim=-1)                    # [B*H, q, k]
+        attn   = torch.softmax(scores, dim=-1)                  # [B*H, q, k]
         ctx_bh = torch.bmm(attn, v_bh)                          # [B*H, q, Dh]
 
-        # merge heads: [B*H, q, Dh] -> [B, q, H*Dh]
+        # merge heads → [B0, q, C]
         BxH, q_len, Dh = ctx_bh.shape
         H = self.heads
-        assert BxH % H == 0, f"Batch*heads {BxH} not divisible by heads {H}"
+        assert BxH % H == 0
         B0 = BxH // H
-        out = ctx_bh.view(B0, H, q_len, Dh).permute(0, 2, 1, 3).reshape(B0, q_len, H * Dh).contiguous()
-
-        # to_out: Linear(H*Dh -> C), Dropout
-        hidden_states = self.to_out[1](self.to_out[0](out))     # [B0, q, C]
+        ctx_merged = ctx_bh.view(B0, H, q_len, Dh).permute(0, 2, 1, 3).reshape(B0, q_len, H * Dh).contiguous()
+        hidden_states = self.to_out[1](self.to_out[0](ctx_merged))  # [B0, q, C]
 
         # back to (b*f, d, c)
         hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d).contiguous()
 
-        # KD cache (정확 로깅)
+        # ===== 정확 KD 캐시 =====
         if self._kd_cache_enabled:
-            self._kd_cache = {
-                "attn": attn,     # [B*H, q, k]
-                "q_bh": q_bh,     # [B*H, q, Dh]
-                "k_bh": k_bh,     # [B*H, k, Dh]
-                "v_bh": v_bh,     # [B*H, k, Dh]
-                "ctx_bh": ctx_bh, # [B*H, q, Dh] = A·V
-            }
+            # head-avg attn: [B0, q, k]
+            attn_avg = attn.view(B0, H, q_len, -1).mean(dim=1).contiguous()
 
-        # return
+            # K/V를 concat-head 공간으로 병합해 저장: [B0, k, C]
+            k_merged = k_bh.view(B0, H, -1, Dh).permute(0, 2, 1, 3).reshape(B0, -1, H * Dh).contiguous()
+            v_merged = v_bh.view(B0, H, -1, Dh).permute(0, 2, 1, 3).reshape(B0, -1, H * Dh).contiguous()
+
+            cache_dict = {
+                "attn":    attn_avg,     # [B0, q(=1), k]
+                "K":       k_merged,     # [B0, k, C]
+                "V":       v_merged,     # [B0, k, C]
+                "context": ctx_merged,   # [B0, q(=1), C]
+            }
+            if sel_idx is not None:
+                cache_dict["selected_indices"] = sel_idx  # [(b*d), R]
+            # Refiner 통계(있을 때만)
+            cache_dict.update({k: v for k, v in ref_stats.items()})
+
+            self._kd_cache = cache_dict
+
+        # ===== 선택 리턴 =====
         if return_attn or return_qkv:
-            extra = {"attn": attn}
+            extra = {"attn": attn_avg if self._kd_cache_enabled else None}
         else:
             extra = None
 
         return hidden_states, extra
+
