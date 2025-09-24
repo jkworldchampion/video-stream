@@ -14,6 +14,13 @@ import torch
 from metric import *
 import metric
 
+# --- wandb (옵션) 추가 시작 ---
+try:
+    import wandb
+except Exception:
+    wandb = None
+# --- wandb (옵션) 추가 끝 ---
+
 device = 'cuda'
 eval_metrics = [
     "abs_relative_difference",
@@ -128,11 +135,33 @@ def main():
     parser.add_argument('--infer_type', type=str, default='npy')
     parser.add_argument('--benchmark_path', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['vkitti', 'kitti', 'sintel', 'nyu_v2', 'tartanair', 'bonn', 'ip_lidar'])
+    # --- wandb 옵션 (최소 추가) ---
+    parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='depth-eval', help='wandb project name')
+    parser.add_argument('--wandb_run_name', type=str, default='', help='wandb run name')
+    parser.add_argument('--wandb_group', type=str, default='', help='wandb group')
+    parser.add_argument('--wandb_mode', type=str, default='online', choices=['online','offline','disabled'], help='wandb mode')
     
     args = parser.parse_args()
 
     results_save_path = os.path.join(args.infer_path, 'results.txt')
-   
+    
+    # --- wandb 초기화 (옵션) ---
+    if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+        wandb.init(
+            project=args.wandb_project,
+            name=(args.wandb_run_name if args.wandb_run_name else None),
+            group=(args.wandb_group if args.wandb_group else None),
+            mode=args.wandb_mode,
+            config={
+                'infer_path': args.infer_path,
+                'benchmark_path': args.benchmark_path,
+                'datasets': args.datasets,
+                'eval_metrics': eval_metrics,
+            }
+        )
+        global_step = 0  # wandb 스텝 카운터(옵션)
+
     for dataset in args.datasets:
 
         file = open(results_save_path, 'a')
@@ -253,6 +282,20 @@ def main():
                 factors = factors[:args.max_eval_len]
                 results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)
                 results_all.append(results_single)
+                
+                # --- wandb: 시퀀스별 로그 (최소 추가) ---
+                if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+                    log_dict = {
+                        'dataset': dataset,
+                        'sequence': str(key),
+                        eval_metrics[0]: results_single[0],
+                        eval_metrics[1]: results_single[1],
+                        eval_metrics[2]: results_single[2],
+                    }
+                    wandb.log(log_dict, step=global_step)
+                    global_step += 1
+                    
+                    
         final_results =  np.array(results_all)
         final_results_mean = np.mean(final_results, axis=0)
         result_dict = { 'name': dataset }
@@ -261,5 +304,15 @@ def main():
             print(f"{metric}: {final_results_mean[i]:04f}")
             file.write(f"{metric}: {final_results_mean[i]:04f}\n")
         file.write(f'<{line} {dataset} finish {line}>\n')
+        
+        # --- wandb: 데이터셋 평균 로그 (최소 추가) ---
+        if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+            wandb.log({
+                f'{dataset}_mean/{eval_metrics[0]}': final_results_mean[0],
+                f'{dataset}_mean/{eval_metrics[1]}': final_results_mean[1],
+                f'{dataset}_mean/{eval_metrics[2]}': final_results_mean[2],
+            }, step=global_step)
+
+        
 if __name__ == '__main__':
     main()

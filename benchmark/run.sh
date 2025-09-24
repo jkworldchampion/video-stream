@@ -11,7 +11,7 @@ export PYTHONUNBUFFERED=1
 
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/scannet_stream_29"
+INFER_PATH="${ROOT}/benchmark/output/scannet_stream_31_epoch_65"
 
 # 2) JSON 메타데이터
 JSON_FILE="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
@@ -33,9 +33,12 @@ echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
 python "${ROOT}/benchmark/eval/eval.py" \
   --infer_path "${INFER_PATH}" \
   --benchmark_path "${BENCHMARK_ROOT}" \
-  --datasets scannet_500
+  --datasets scannet_500 \
+  --wandb \
+  --wandb_project evaluation \
+  --wandb_run_name "experiment_31_epoch_65_$(date +%Y%m%d_%H%M)" \
+  --wandb_group "streaming" \
+  --wandb_mode online
 
 echo
 echo "✅ All done!"
-
-python "${ROOT}/train.py"
