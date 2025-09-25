@@ -1,16 +1,5 @@
-# Copyright (2025) Bytedance Ltd. and/or its affiliates 
-
-# Licensed under the Apache License, Version 2.0 (the "License"); 
-# you may not use this file except in compliance with the License. 
-# You may obtain a copy of the License at 
-
-#     http://www.apache.org/licenses/LICENSE-2.0 
-
-# Unless required by applicable law or agreed to in writing, software 
-# distributed under the License is distributed on an "AS IS" BASIS, 
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-# See the License for the specific language governing permissions and 
-# limitations under the License. 
+# video_depth_stream.py
+import copy
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -39,12 +28,13 @@ class VideoDepthAnything(nn.Module):
         use_clstoken=False,
         num_frames=32,
         pe='ape',
-        # ▼ 스트리밍 옵션 (필요 없으면 기본값으로 두면 됨)
+        # ▼ 스트리밍 옵션
         stream_mode=True,
-        select_top_r=None,     # None이면 비활성, 정수면 과거 토큰 Top-R만 사용
-        rope_dt=None,          # None이면 비활성, float이면 RoPE에 시간스케일 전달
-        return_attn=False,     # True면 어텐션 가중치 반환(디버깅/디스틸용)
-        return_qkv=False,      # True면 Q/K/V 반환(디버깅/디스틸용)
+        select_top_r=None,     # 과거 토큰 Top-R
+        update_top_u=None,     # Refiner Top-U
+        rope_dt=None,          # RoPE 시간스케일
+        return_attn=False,
+        return_qkv=False,
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -73,6 +63,7 @@ class VideoDepthAnything(nn.Module):
         # --- 스트리밍 하이퍼파라미터 저장 ---
         self.stream_mode   = stream_mode
         self.select_top_r  = select_top_r
+        self.update_top_u  = update_top_u
         self.rope_dt       = rope_dt
         self.return_attn   = return_attn
         self.return_qkv    = return_qkv
@@ -102,8 +93,9 @@ class VideoDepthAnything(nn.Module):
             stream_kwargs["stream_mode"] = bool(self.stream_mode)
         if self.select_top_r is not None:
             stream_kwargs["select_top_r"] = int(self.select_top_r)
+        if self.update_top_u is not None:
+            stream_kwargs["update_top_u"] = int(self.update_top_u)
         if self.rope_dt is not None:
-            # float → torch.scalar 로 캐스팅하여 디바이스/dtype 맞추기
             stream_kwargs["rope_dt"] = float(self.rope_dt)
         if self.return_attn:
             stream_kwargs["return_attn"] = True
@@ -119,11 +111,16 @@ class VideoDepthAnything(nn.Module):
         depth = F.relu(depth)
         return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list  # [B, T, H, W]
     
+    def reset_stream(self):
+        self.transform = None
+        self.frame_id_list.clear()
+        self.frame_cache_list.clear()
+        self.id = -1
+
     @torch.no_grad()
     def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False):
         """
         스트리밍 추론: 프레임을 1장씩 넣고, hidden-state 캐시를 누적 재사용.
-        (기존 파이프라인과 동일한 캐시 포맷 유지)
         """
         self.id += 1
 
@@ -133,7 +130,7 @@ class VideoDepthAnything(nn.Module):
             self.frame_height = frame_height
             self.frame_width = frame_width
             ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
-            if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
+            if ratio > 1.78:
                 input_size = int(input_size * 1.777 / ratio)
                 input_size = round(input_size / 14) * 14
 
@@ -154,9 +151,10 @@ class VideoDepthAnything(nn.Module):
             # Inference the first frame
             cur_list = [torch.from_numpy(self.transform({'image': frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0)]
             cur_input = torch.cat(cur_list, dim=1).to(device)
-            
+
+            device_type = str(cur_input.device.type)
             with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
+                with torch.autocast(device_type=device_type, enabled=(not fp32)):
                     cur_feature = self.forward_features(cur_input)
                     x_shape = cur_input.shape
                     depth, cached_hidden_state_list = self.forward_depth(cur_feature, x_shape)
@@ -164,8 +162,8 @@ class VideoDepthAnything(nn.Module):
             depth = depth.to(cur_input.dtype)
             depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
 
-            # 초기 캐시 복제(윈도우 시뮬레이션)
-            self.frame_cache_list = [cached_hidden_state_list] * INFER_LEN
+            # 초기 캐시 복제(윈도우 시뮬레이션) - 깊은 복사로 별칭 방지
+            self.frame_cache_list = [copy.deepcopy(cached_hidden_state_list) for _ in range(INFER_LEN)]
             self.frame_id_list.extend([0] * (INFER_LEN - 1))
 
             new_depth = depth[0][0].cpu().numpy()
@@ -174,47 +172,41 @@ class VideoDepthAnything(nn.Module):
             assert frame_height == self.frame_height
             assert frame_width == self.frame_width
 
-            # infer feature
             cur_input = torch.from_numpy(self.transform({'image': frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0).to(device)
+            device_type = str(cur_input.device.type)
             with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
+                with torch.autocast(device_type=device_type, enabled=(not fp32)):
                     cur_feature = self.forward_features(cur_input)
                     x_shape = cur_input.shape
 
-            # 과거 캐시 묶기 (기존 포맷 그대로 유지)
-            # --- 기존 캐시 윈도우 구성 ---
+            # 과거 캐시 묶기
             cur_list = self.frame_cache_list[0:2] + self.frame_cache_list[-INFER_LEN + 3:]
-            # 기대 길이 확인
             assert len(cur_list) == INFER_LEN - 1, f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
 
-            # --- 안전한 캐시 병합 (None 방지) ---
             def _valid_frame_cache(fc):
-                # 각 프레임 캐시는 list/tuple 이고, 모든 엔트리가 Tensor 이어야 함
                 return isinstance(fc, (list, tuple)) and all((t is None) or torch.is_tensor(t) for t in fc)
 
-            # 하나라도 형식이 이상하면 캐시 사용 포기
             if not all(_valid_frame_cache(h) for h in cur_list):
                 cur_cache = None
             else:
-                L = min(len(h) for h in cur_list)  # 레이어 수(혹시 불일치 대비)
+                L = min(len(h) for h in cur_list)
                 per_layer = []
                 cache_ok = True
                 for i in range(L):
                     elems = [h[i] for h in cur_list]
-                    # 레이어 i에 None이 섞여 있으면 전체 캐시 사용 포기(모델 내부 n 분배가 깨질 수 있음)
                     if any(e is None for e in elems):
                         cache_ok = False
                         break
                     try:
                         per_layer.append(torch.cat(elems, dim=1))  # 시간축 concat
-                    except Exception:
+                    except Exception as e:
                         cache_ok = False
+                        # print(f"[cache-merge] layer {i} cat failed: shapes={[tuple(t.shape) for t in elems]} | err={e}")
                         break
                 cur_cache = per_layer if cache_ok and len(per_layer) == L else None
 
-            # infer depth
             with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
+                with torch.autocast(device_type=device_type, enabled=(not fp32)):
                     depth, new_cache = self.forward_depth(cur_feature, x_shape, cached_hidden_state_list=cur_cache)
 
             depth = depth.to(cur_input.dtype)
@@ -223,15 +215,14 @@ class VideoDepthAnything(nn.Module):
             depth_list = [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
             new_depth = depth_list[-1]
 
-            # --- 캐시 push (불량 캐시는 마지막 정상값으로 보정) ---
+            # 캐시 push (불량 캐시는 마지막 정상값으로 보정)
             if new_cache is None or (isinstance(new_cache, (list, tuple)) and any(t is None for t in new_cache)):
-                # 마지막 캐시가 존재하면 복제, 아니면 그냥 현재 new_cache(=None) 넣지 않음
                 if len(self.frame_cache_list) > 0 and self.frame_cache_list[-1] is not None:
-                    self.frame_cache_list.append(self.frame_cache_list[-1])
+                    self.frame_cache_list.append(copy.deepcopy(self.frame_cache_list[-1]))
                 else:
-                    self.frame_cache_list.append(new_cache)  # 초기 단계 보호
+                    self.frame_cache_list.append(new_cache)
             else:
-                self.frame_cache_list.append(new_cache)
+                self.frame_cache_list.append(copy.deepcopy(new_cache))
 
         # adjust the sliding window
         self.frame_id_list.append(self.id)
