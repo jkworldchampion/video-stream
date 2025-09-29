@@ -230,6 +230,38 @@ class TemporalAttention(CrossAttention):
         self._kd_cache_enabled = False
         self._kd_cache = None
 
+        # KV 메모리 어댑터: 시간축 상에서 K/V를 미세 보정하기 위한 경량 모듈
+        # - 1x1 → GELU → depthwise-3x1 → GELU → 1x1 의 얕은 FF로 시간축 필터링 + 채널 혼합
+        # - 마지막 1x1을 0으로 초기화하여 초기에는 출력 0 → 원래 K/V에 더해져 항등 효과
+        self._kv_memory_enabled = False
+        try:
+            # dim_head = out_features / heads (to_q는 [in -> heads*dim_head])
+            dim_head = int(self.to_q.out_features // self.heads)
+            self.kv_k_ff = nn.Sequential(
+                nn.Conv1d(dim_head, dim_head, kernel_size=1, bias=True),
+                nn.GELU(),
+                nn.Conv1d(dim_head, dim_head, kernel_size=3, padding=1, groups=dim_head, bias=True),
+                nn.GELU(),
+                nn.Conv1d(dim_head, dim_head, kernel_size=1, bias=True),
+            )
+            self.kv_v_ff = nn.Sequential(
+                nn.Conv1d(dim_head, dim_head, kernel_size=1, bias=True),
+                nn.GELU(),
+                nn.Conv1d(dim_head, dim_head, kernel_size=3, padding=1, groups=dim_head, bias=True),
+                nn.GELU(),
+                nn.Conv1d(dim_head, dim_head, kernel_size=1, bias=True),
+            )
+            # Zero-init 마지막 1x1 conv → 초기 출력 0
+            with torch.no_grad():
+                last_k = self.kv_k_ff[-1]
+                last_v = self.kv_v_ff[-1]
+                last_k.weight.zero_(); last_k.bias.zero_()
+                last_v.weight.zero_(); last_v.bias.zero_()
+        except Exception:
+            # 방어적: 어떤 이유로든 초기화 실패 시 메모리 어댑터 비활성화
+            self.kv_k_ff = None
+            self.kv_v_ff = None
+
     # ===== KD hook API =====
     def enable_kd_caching(self, flag: bool = True):
         self._kd_cache_enabled = bool(flag)
@@ -241,6 +273,10 @@ class TemporalAttention(CrossAttention):
 
     def get_cached_attention_output(self):
         return self._kd_cache
+
+    # KV 메모리 어댑터 제어
+    def enable_kv_memory(self, flag: bool = True):
+        self._kv_memory_enabled = bool(flag)
 
     # ===== Rope scaling =====
     def _scaled_rope(self, seq_len, device, rope_dt=None):
@@ -352,6 +388,13 @@ class TemporalAttention(CrossAttention):
         v_bh, Dh_v = _to_bh(value)
         assert Dh_q == Dh_k == Dh_v, f"Head dims mismatch: {Dh_q}, {Dh_k}, {Dh_v}"
 
+        # 메모리 어댑터 적용: 과거+현재 토큰 순서(axis=1)를 따라 시간 필터링으로 미세 보정
+        if self._kv_memory_enabled and (self.kv_k_ff is not None) and (self.kv_v_ff is not None):
+            # Conv1d expects [N, C_in, L]; 현재는 [N, L, Dh]
+            if k_bh.shape[1] >= 3:  # 최소 커널 적용 가능 길이
+                k_bh = k_bh + self.kv_k_ff(k_bh.transpose(1, 2)).transpose(1, 2)
+                v_bh = v_bh + self.kv_v_ff(v_bh.transpose(1, 2)).transpose(1, 2)
+
         scale = (Dh_q ** -0.5)
         scores = torch.bmm(q_bh, k_bh.transpose(1, 2)) * scale  # [B*H, q, k]
         attn = torch.softmax(scores, dim=-1)                    # [B*H, q, k]
@@ -378,6 +421,9 @@ class TemporalAttention(CrossAttention):
                 "k_bh": k_bh,     # [B*H, k, Dh]
                 "v_bh": v_bh,     # [B*H, k, Dh]
                 "ctx_bh": ctx_bh, # [B*H, q, Dh] = A·V
+                "tokens_per_frame": d,  # 각 프레임 토큰 수
+                "num_heads": self.heads,
+                "batch_size": B0,
             }
 
         # return

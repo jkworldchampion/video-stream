@@ -12,6 +12,45 @@ import matplotlib.pyplot as plt
 import json
 
 
+IMG_EXTS   = {'.png', '.jpg', '.jpeg', '.bmp'}
+DEPTH_EXTS = {'.png', '.npy', '.exr', '.pfm'}  # 프로젝트에 맞게 필요시 수정
+def _is_hidden_or_ckpt(path: str) -> bool:
+    base = os.path.basename(path)
+    return (base.startswith('.')) or ('.ipynb_checkpoints' in path)
+
+def _sorted_files(dir_path: str, allowed_exts: set) -> list:
+    """dir_path 안에서 허용 확장자만, 파일만, 숨김/체크포인트 제외하여 정렬 반환."""
+    if not os.path.isdir(dir_path):
+        return []
+    try:
+        entries = []
+        for e in os.scandir(dir_path):
+            if not e.is_file():
+                continue
+            if _is_hidden_or_ckpt(e.path):
+                continue
+            ext = os.path.splitext(e.name)[1].lower()
+            if ext in allowed_exts:
+                entries.append(e.path)
+        # 자연스러운 정렬 (_natural_key가 있으면 사용, 없으면 기본 정렬)
+        try:
+            entries.sort(key=_natural_key)  # dataLoader.py에 이미 있을 가능성 높음
+        except Exception:
+            entries.sort()
+        return entries
+    except FileNotFoundError:
+        return []
+
+def to_tensor_safe_from_numpy(arr: np.ndarray, dtype=np.float32):
+    """
+    numpy → torch 텐서 변환 시, 음수 stride/비연속/읽기전용 등을
+    np.ascontiguousarray + .contiguous().clone()으로 안전화.
+    """
+    arr = np.asarray(arr, dtype=dtype)
+    arr = np.ascontiguousarray(arr)      # 연속 메모리 보장
+    t = torch.from_numpy(arr).contiguous()
+    return t.clone()                     # 새 storage 확보
+
 def get_random_crop_params_with_rng(img, output_size, rng):
     w, h = img.size
     th, tw = output_size, output_size
@@ -121,7 +160,7 @@ def get_tartanair_paths(root_dir, envs, difficulties, cams):
     scene_pose_lists = scene_pose_lists.copy()
 
     max_total_clips = 90
-    clip_len = 16
+    clip_len = 32
     # 3) 전체 클립 수 제한
     if max_total_clips is not None:
         accumulated = 0
@@ -161,41 +200,58 @@ def quaternion_to_rotmat(q):
     ], dtype=np.float32)
     return R
 
-def get_GTA_paths(root_dir,split):
-    all_depths = []
-    all_images = []
-    all_poses  = []
+def _natural_key(s):
+    return [t.zfill(10) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
 
-    for idx,scene in enumerate(os.listdir(root_dir)):
-        if split=="train":
-            if idx == 20:
-                break
-        else :
-            if idx < 20 :
-                continue
-            elif idx > 25 :
-                break
-                
-        scene_dir  = os.path.join(root_dir, scene)
-        depths_dir = os.path.join(scene_dir, "depths")
-        images_dir = os.path.join(scene_dir, "images")
-        poses_dir  = os.path.join(scene_dir, "poses")
+# sliding 방식으로 수정하기
+def get_GTA_paths(root_dir, split):
+    """
+    return:
+      all_images: List[List[str]]
+      all_depths: List[List[str]]
+      all_poses : List[List[str]]
+    각 내부 리스트는 같은 scene 내 프레임 순서.
+    """
+    all_depths, all_images, all_poses = [], [], []
 
-        scene_depths = []
-        scene_images = []
+    # scene 디렉터리들 정렬
+    try:
+        scenes = [d for d in os.listdir(root_dir) if not _is_hidden_or_ckpt(d)]
+        try:
+            scenes.sort(key=_natural_key)
+        except Exception:
+            scenes.sort()
+    except FileNotFoundError:
+        return all_images, all_depths, all_poses
+
+    for scene in scenes:
+        scene_dir   = os.path.join(root_dir, scene)
+        depths_dir  = os.path.join(scene_dir, "depths")
+        images_dir  = os.path.join(scene_dir, "images")
+        poses_dir   = os.path.join(scene_dir, "poses")
+
+        scene_depths = _sorted_files(depths_dir, DEPTH_EXTS)
+        scene_images = _sorted_files(images_dir, IMG_EXTS)
+        # poses는 텍스트/넘파이 등 포맷이 다를 수 있어 확장자 제한 최소화(파일만 & 숨김 제외)
         scene_poses  = []
-
-        if os.path.isdir(depths_dir):
-            for fname in os.listdir(depths_dir):
-                scene_depths.append(os.path.join(depths_dir, fname))
-
-        if os.path.isdir(images_dir):
-            for fname in os.listdir(images_dir):
-                scene_images.append(os.path.join(images_dir, fname))
-
         if os.path.isdir(poses_dir):
-            for fname in os.listdir(poses_dir):
-                scene_poses.append(os.path.join(poses_dir, fname))
+            for e in os.scandir(poses_dir):
+                if e.is_file() and not _is_hidden_or_ckpt(e.path):
+                    scene_poses.append(e.path)
+            try:
+                scene_poses.sort(key=_natural_key)
+            except Exception:
+                scene_poses.sort()
+
+        # 길이 불일치 시 최소 길이에 맞춤
+        m = min(len(scene_images), len(scene_depths))
+        if m == 0:
+            # 한쪽이라도 비어 있으면 해당 scene은 스킵
+            continue
+
+        scene_images = scene_images[:m]
+        scene_depths = scene_depths[:m]
+        scene_poses  = scene_poses[:m] if len(scene_poses) >= m else scene_poses
 
         all_depths.append(scene_depths)
         all_images.append(scene_images)
@@ -237,18 +293,8 @@ def get_google_paths(root_dir):
     return x_paths, y_paths
 
 def get_kitti_individuals(video_info, clip_len, split):
-    """
-    기존  get_kitti_paths 의 문제점 : 클립단위로 넘겨주기 때문에 이걸 몇번째에서 자를 수 없음. 
-    그대신 end index를 저장해두고, clip 단위가 아닌 전체 영상을 넘겨주기
+    x_clips, y_clips, intrin_clips, extrin_clips, cam_ids = [], [], [], [], []
 
-    returns : 전체 영상 데이터 + scene의 끝점
-    """
-    x_clips = []
-    y_clips = []
-    intrin_clips = []
-    extrin_clips = []
-    cam_ids = []
-    
     for info in video_info:
         rgb_dir        = info['rgb_path']
         depth_dir      = info['depth_path']
@@ -261,102 +307,98 @@ def get_kitti_individuals(video_info, clip_len, split):
         if len(rgb_files) != len(depth_files):
             continue
 
-        n = len(rgb_files) // clip_len # 즉 이제 n은 몫이에요
+        # 🔑 변경: sliding window
+        n = len(rgb_files) - clip_len + 1
+        if n <= 0:
+            continue
 
-        x_clips.append([os.path.join(rgb_dir,f) for f in rgb_files[:n*clip_len]])
-        y_clips.append([os.path.join(depth_dir,f) for f in depth_files[:n*clip_len]])
+        x_clips.append([os.path.join(rgb_dir, f) for f in rgb_files])
+        y_clips.append([os.path.join(depth_dir, f) for f in depth_files])
         intrin_clips.append(intrinsic_file)
         extrin_clips.append(extrinsic_file)
         cam_ids.append(camera_id)
 
-    
     if split == "train":
         return x_clips, y_clips
     else:
-        return x_clips, y_clips , cam_ids, intrin_clips, extrin_clips 
+        return x_clips, y_clips, cam_ids, intrin_clips, extrin_clips
     
     
     
 def get_kitti_video_path(root_dir, condition_num, split, binocular):
     """
     condition_num: 각 scene에서 몇 개의 condition을 가져올지
+    split: "train" 또는 "val" (기존 로직 유지)
+    binocular: True면 Camera_0, Camera_1 모두 / False면 Camera_0만
     """
-    
-    # 데이터 개수 ( 단안기준 )
-    # scene 1 : 446 
-    # scene 2 : 232
-    # scene 3 : 269
-    # scene 4 : 338
-    # scene 5 : 836
-    # => 만약 16씩 돌리면 80번 iter 돌아가면 끝남
-
-    rgb_root = os.path.join(root_dir, "vkitti_2.0.3_rgb")
-    depth_root = os.path.join(root_dir, "vkitti_2.0.3_depth")
+    rgb_root    = os.path.join(root_dir, "vkitti_2.0.3_rgb")
+    depth_root  = os.path.join(root_dir, "vkitti_2.0.3_depth")
     textgt_root = os.path.join(root_dir, "vkitti_2.0.3_textgt")
-    
+
     video_infos = []
 
+    # scene 디렉터리 순회
     for scene in sorted(os.listdir(rgb_root)):
-        scene_rgb_path = os.path.join(rgb_root, scene)
-        scene_depth_path = os.path.join(depth_root, scene)
+        if _is_hidden_or_ckpt(scene):
+            continue
+
+        scene_rgb_path    = os.path.join(rgb_root, scene)
+        scene_depth_path  = os.path.join(depth_root, scene)
         scene_textgt_path = os.path.join(textgt_root, scene)
 
-        if not os.path.isdir(scene_rgb_path) or \
-            not os.path.isdir(scene_depth_path) or \
-            not os.path.isdir(scene_textgt_path):
+        if not (os.path.isdir(scene_rgb_path) and os.path.isdir(scene_depth_path) and os.path.isdir(scene_textgt_path)):
             continue
 
-        if (split == "train" and "Scene06" in scene) or \
-            (split == "val" and "Scene06" not in scene):
+        # 기존 split 기준 유지
+        if (split == "train" and "Scene06" in scene) or (split == "val" and "Scene06" not in scene):
             continue
 
-        for idx, condition in enumerate(sorted(os.listdir(scene_rgb_path))):
-            
-            if condition not in {"15-deg-left","30-deg-left","15-deg-right","rain"}:
+        # condition 순회
+        picked = 0
+        for condition in sorted(os.listdir(scene_rgb_path)):
+            if _is_hidden_or_ckpt(condition):
                 continue
-                
-            print(f"Processing scene: {scene}, condition: {condition}")
-            cond_rgb_path = os.path.join(scene_rgb_path, condition)
-            cond_depth_path = os.path.join(scene_depth_path, condition)
-            cond_textgt_path = os.path.join(scene_textgt_path, condition)
 
-            if not os.path.isdir(cond_rgb_path) or \
-                not os.path.isdir(cond_depth_path) or \
-                not os.path.isdir(cond_textgt_path):
+            cond_rgb_path    = os.path.join(scene_rgb_path, condition)
+            cond_depth_path  = os.path.join(scene_depth_path, condition)
+            cond_textgt_path = os.path.join(scene_textgt_path, condition)
+            if not (os.path.isdir(cond_rgb_path) and os.path.isdir(cond_depth_path) and os.path.isdir(cond_textgt_path)):
                 continue
 
             intrinsic_file = os.path.join(cond_textgt_path, "intrinsic.txt")
             extrinsic_file = os.path.join(cond_textgt_path, "extrinsic.txt")
-            if not os.path.isfile(intrinsic_file) or not os.path.isfile(extrinsic_file):
-                print(f"경고: {cond_textgt_path}에 intrinsic.txt 또는 extrinsic.txt 파일이 없습니다.")
+            if not (os.path.isfile(intrinsic_file) and os.path.isfile(extrinsic_file)):
+                # print(f"경고: {cond_textgt_path}에 intrinsic/extrinsic 누락")
                 continue
-            
-            if binocular:
-                cam_paths = ["Camera_0", "Camera_1"] 
-            else:
-                cam_paths = ["Camera_0"]
-                
-            for cam in cam_paths:
-                cam_idx = int(cam[-1])  # "Camera_0" → 0, "Camera_1" → 1
-                rgb_path = os.path.join(cond_rgb_path, "frames", "rgb", cam)
-                depth_path = os.path.join(cond_depth_path, "frames", "depth", cam)
 
-                if os.path.isdir(rgb_path) and os.path.isdir(depth_path):
-                    video_infos.append({
-                        'rgb_path': rgb_path,
-                        'depth_path': depth_path,
-                        'intrinsic_file': intrinsic_file,
-                        'extrinsic_file': extrinsic_file,
-                        'scene': scene,
-                        'condition': condition,
-                        'camera': cam_idx
-                    })
-                    
-            if idx == condition_num-1:
+            cams = ["Camera_0", "Camera_1"] if binocular else ["Camera_0"]
+            for cam in cams:
+                cam_idx   = int(cam[-1])
+                rgb_path  = os.path.join(cond_rgb_path,   "frames", "rgb",   cam)
+                depth_path= os.path.join(cond_depth_path, "frames", "depth", cam)
+
+                # 폴더 존재/파일 존재 최소 확인
+                rgb_files   = _sorted_files(rgb_path,   IMG_EXTS)
+                depth_files = _sorted_files(depth_path, DEPTH_EXTS)
+
+                if (len(rgb_files) == 0) or (len(depth_files) == 0):
+                    # 이미지가 실제로 없으면 스킵 (디렉터리만 존재하는 케이스 방지)
+                    continue
+
+                video_infos.append({
+                    'rgb_path': rgb_path,
+                    'depth_path': depth_path,
+                    'intrinsic_file': intrinsic_file,
+                    'extrinsic_file': extrinsic_file,
+                    'scene': scene,
+                    'condition': condition,
+                    'camera': cam_idx
+                })
+
+            picked += 1
+            if picked >= max(1, int(condition_num)):
                 break
 
-    # 이제 video_infos에는 scene,condition,camera 따라서 경로가 설정됨
-    
     return video_infos
 
 class KITTIVideoDataset(Dataset):
@@ -372,7 +414,7 @@ class KITTIVideoDataset(Dataset):
         rgb_std=(0.229, 0.224, 0.225),
         resize_size=350,
         split="train",
-        clip_len=16,
+        clip_len=32,
     ):
         super().__init__()
         assert split in ["train", "val"]
@@ -392,7 +434,7 @@ class KITTIVideoDataset(Dataset):
 
         # scene별로  effective clip 계산
         scene_clip_counts = [
-            len(scene_rgb)//clip_len - 1  # 마지막 클립은 버리기 -> 오버플로 방지
+            max(0, len(scene_rgb) - self.clip_len + 1)
             for scene_rgb in self.rgb_paths
         ]
 
@@ -425,7 +467,7 @@ class KITTIVideoDataset(Dataset):
         depth_png = Image.open(path)
         depth_cm = np.array(depth_png, dtype=np.uint16).astype(np.float32)
         depth_m = depth_cm / 100.0
-        depth_img = Image.fromarray ((depth_m), mode="F") 
+        depth_img = Image.fromarray ((depth_m), mode="F")
 
         return depth_img
 
@@ -534,9 +576,9 @@ class KITTIVideoDataset(Dataset):
             rng = random.Random(self.seed + self.epoch)
             shift = rng.randint(0, self.clip_len-1)
 
-            base = shift + chunk_idx * self.clip_len
-            rgb_paths  = scene_rgb_paths[base:base+self.clip_len]
-            depth_paths= scene_depth_paths[base:base+self.clip_len]
+            base = chunk_idx + shift
+            rgb_paths  = scene_rgb_paths[base: base+self.clip_len]
+            depth_paths= scene_depth_paths[base: base+self.clip_len]
 
             #rgb_paths = self.rgb_clips[idx]
             #depth_paths = self.depth_clips[idx]
@@ -551,10 +593,10 @@ class KITTIVideoDataset(Dataset):
                 img = TF.resize(img, self.resize_size)
                 img = TF.crop(img, i, j, th, tw)
                 img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
-                rgb_seq.append(img)
+                rgb_seq.append(img.contiguous().clone())
 
                 depth = self.load_depth(dp)
-                depth = TF.resize(depth, self.resize_size)
+                depth = TF.resize(depth, self.resize_size, antialias=True)
                 depth = TF.crop(depth, i, j, th, tw)
                 depth_seq.append(TF.to_tensor(depth))
 
@@ -582,10 +624,10 @@ class KITTIVideoDataset(Dataset):
                 img = TF.resize(img, self.resize_size)
                 img = TF.center_crop(img, self.resize_size)
                 img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
-                rgb_seq.append(img)
+                rgb_seq.append(img.contiguous().clone())
 
                 depth = self.load_depth(dp)
-                depth = TF.resize(depth, self.resize_size)
+                depth = TF.resize(depth, self.resize_size, antialias=True)
                 depth = TF.center_crop(depth, self.resize_size)
                 depth_seq.append(TF.to_tensor(depth))
 
@@ -629,11 +671,13 @@ class GTADataset(Dataset):
         depth_paths,
         pose_paths=None,
         split="train",
-        clip_len=16,
+        clip_len=32,
         resize_size=350,
         rgb_mean=(0.485, 0.456, 0.406),
         rgb_std=(0.229, 0.224, 0.225),
-        seed=42
+        seed=42,
+        stride=1,          # ★ 추가: 슬라이딩 윈도우 스트라이드 (기본 1)
+        jitter=1,        # (선택) 시작점에 ±jitter 랜덤 변동을 주고 싶다면
     ):
         super().__init__()
         assert split in ["train", "val"]
@@ -646,93 +690,98 @@ class GTADataset(Dataset):
         self.rgb_std = rgb_std
         self.seed = seed
         self.split = split
-        self.epoch = 0      
-        scene_clip_counts = [
-            len(scene_rgb)//clip_len - 1  # 마지막 클립은 버리기 -> 오버플로 방지
-            for scene_rgb in self.rgb_paths
-        ]
-        self.total_clips = sum(scene_clip_counts)
+        self.epoch = 0
+        self.stride = stride
+        self.jitter = jitter
+        
+        # --- 슬라이딩 윈도우 시작점 계산 ---
+        self.starts_per_scene = []
+        total = 0
+        for scene_rgb in self.rgb_paths:
+            n = len(scene_rgb)
+            if n < clip_len:
+                self.starts_per_scene.append([])  # 사용할 수 없는 씬
+                continue
+            starts = list(range(0, n - clip_len + 1, self.stride))  # ★ 핵심: 0..(N-L)
+            self.starts_per_scene.append(starts)
+            total += len(starts)
+
+        self.total_clips = total
+
+        # flat index 매핑
         self.flat2scene = []
-        self.flat2chunk = []
-        for scene_idx, n_clips in enumerate(scene_clip_counts):
-            for chunk_idx in range(n_clips):
+        self.flat2start = []
+        for scene_idx, starts in enumerate(self.starts_per_scene):
+            for s in starts:
                 self.flat2scene.append(scene_idx)
-                self.flat2chunk.append(chunk_idx)
+                self.flat2start.append(s)
 
-        if split == "train" :
-            print("train_GTA_total_clips : ",self.total_clips)
-        else :
-            print("val_GTA_total_clips : ",self.total_clips)
+        if split == "train":
+            print("train_GTA_total_clips :", self.total_clips)
+        else:
+            print("val_GTA_total_clips :", self.total_clips)
 
-            
     def __len__(self):
         return self.total_clips
 
     def set_epoch(self, epoch):
         self.epoch = epoch
-        
+
     def load_depth(self, path):
         exr_file = OpenEXR.InputFile(path)
         header   = exr_file.header()
         dw       = header['dataWindow']
         width    = dw.max.x - dw.min.x + 1
         height   = dw.max.y - dw.min.y + 1
-    
+
         pt       = Imath.PixelType(Imath.PixelType.FLOAT)
         raw_str  = exr_file.channel('Y', pt)
-        depth_np = np.frombuffer(raw_str, dtype=np.float32)
-        depth_np = depth_np.reshape((height, width))
-    
-        # Torch Tensor로 변환
-        depth_t  = torch.from_numpy(depth_np)  # (H, W)
-        return depth_t.unsqueeze(0)            # (1, H, W)
+        depth_np = np.frombuffer(raw_str, dtype=np.float32).reshape((height, width))
+        
+        # ✅ inf/nan 값 처리 - 매우 큰 값(1000m)으로 제한
+        depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=1000.0, neginf=0.0)
 
-    
+        # ✅ 연속 메모리 + 새 storage 보장
+        depth_t  = to_tensor_safe_from_numpy(depth_np, dtype=np.float32)  # [H,W], contiguous+clone
+        return depth_t.unsqueeze(0)  # [1,H,W]
+
     def __getitem__(self, idx):
         scene_idx = self.flat2scene[idx]
-        chunk_idx = self.flat2chunk[idx]
+        start     = self.flat2start[idx]    # ★ 고정 시작점 (stride에 의해 결정)
 
         rgb_list   = self.rgb_paths[scene_idx]
         depth_list = self.depth_paths[scene_idx]
-        
+        end = start + self.clip_len
+
+        # (선택) jitter를 주고 싶다면:
+        if self.split == "train" and self.jitter > 0:
+            rng = random.Random(self.seed + self.epoch + idx)
+            delta = rng.randint(-self.jitter, self.jitter)
+            start = max(0, min(start + delta, len(rgb_list) - self.clip_len))
+            end = start + self.clip_len
+
+        rgb_clip   = rgb_list[start:end]
+        depth_clip = depth_list[start:end]
+
+        # 전처리
         rng = random.Random(self.seed + self.epoch)
-
-        if self.split == "train":
-            shift = rng.randint(0, self.clip_len - 1)
-        else:
-            shift = 0
-            pose_list  = self.pose_paths[scene_idx]
-            
-        base = chunk_idx * self.clip_len + shift
-        rgb_clip   = rgb_list[base:base + self.clip_len]
-        depth_clip = depth_list[base:base + self.clip_len]
-
-        if self.split == "val":
-            pose_clip  = pose_list[base:base + self.clip_len]
-
-        rgb_seq, depth_seq = [], []
         first = Image.open(rgb_clip[0]).convert("RGB")
-        first = TF.resize(first, self.resize_size)
+        first = TF.resize(first, self.resize_size, antialias=True)
         if self.split == "train":
             i, j, h, w = get_random_crop_params_with_rng(first, self.resize_size, rng)
 
+        rgb_seq, depth_seq = [], []
         for rp, dp in zip(rgb_clip, depth_clip):
             img = Image.open(rp).convert("RGB")
-            img = TF.resize(img, self.resize_size)
-            if self.split == "train":
-                img = TF.crop(img, i, j, h, w)
-            else:
-                img = TF.center_crop(img, self.resize_size)
+            img = TF.resize(img, self.resize_size, antialias=True)
+            img = TF.crop(img, i, j, h, w) if self.split == "train" else TF.center_crop(img, self.resize_size)
             img = TF.normalize(TF.to_tensor(img), mean=self.rgb_mean, std=self.rgb_std)
-            rgb_seq.append(img)
+            rgb_seq.append(img.contiguous().clone())
 
-            dimg = self.load_depth(dp)
-            dimg = TF.resize(dimg, self.resize_size)
-            if self.split == "train":
-                dimg = TF.crop(dimg, i, j, h, w)
-            else:
-                dimg = TF.center_crop(dimg, self.resize_size)
-            depth_seq.append(dimg)
+            dimg = self.load_depth(dp)                                  # [1,H,W] torch
+            dimg = TF.resize(dimg, self.resize_size, antialias=True)
+            dimg = TF.crop(dimg, i, j, h, w) if self.split == "train" else TF.center_crop(dimg, self.resize_size)
+            depth_seq.append(dimg.contiguous().clone())
 
         rgb_tensor   = torch.stack(rgb_seq)   # [clip_len, 3, H, W]
         depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
@@ -759,6 +808,7 @@ class GTADataset(Dataset):
         extrinsics_tensor = torch.stack(extrinsics_list)   # [clip_len, 4, 4]
 
         return rgb_tensor, depth_tensor, extrinsics_tensor, intrinsics_tensor
+
 
 
 class GoogleDepthDataset(Dataset):

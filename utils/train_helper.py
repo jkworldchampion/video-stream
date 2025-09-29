@@ -907,8 +907,7 @@ def validate_with_infer_eval_subset(
     dataset_eval_tag="scannet_500",  # eval 설정 preset (run.sh에서는 scannet_500)
     device="cuda",
     input_size=518,
-    scenes_to_eval=2,          # 시간관계상 2 scene만
-    scene_indices=[0,44],      # 계산할 씬 index
+    scene_indices=[1, 39, 44, 93],      # 계산할 씬 index
     fp32=True,
 ):
     """
@@ -927,48 +926,56 @@ def validate_with_infer_eval_subset(
     root_path = os.path.dirname(json_file)
 
     # 2) Inference (subset)
-    processed = 0
+    target_indices = set()  # 사용할 인덱스
     seq_registry = []  # 평가 시 동일 순서/동일 subset을 재사용하기 위해 기록
+    all_scenes = path_json[dataset]
+    
 
     # 사용할 인덱스 결정
     if scene_indices is not None:
         target_indices = set(scene_indices)   # lookup 빠르게 하도록 set
     else:
-        target_indices = set(range(min(scenes_to_eval, len(all_scenes))))
-    
-    for i, data in enumerate(tqdm(path_json[dataset], desc=f"[VAL] Streaming {dataset} (subset)")):
-        for key in data.keys():
-            if processed >= scenes_to_eval:
-                break
-            frames = data[key]  # list of dicts: {'image','gt_depth','factor',...}
+        target_indices = set(range(len(all_scenes)))
 
-            # 스트리밍 상태 리셋
-            _reset_streaming_state(model)
+    # tqdm에 전달할 실제 반복 목록을 미리 구성
+    items = list(enumerate(path_json[dataset]))  # [(idx, entry), ...]
+    if scene_indices is not None:
+        items = [(i, d) for i, d in items if i in target_indices]
 
-            # 각 프레임 저장 경로대로 추론 수행
-            for item in frames:
-                img_path = os.path.join(root_path, item['image'])
-                base, _ = os.path.splitext(item['image'])
-                out_path = os.path.join(infer_path, dataset, base + '.npy')
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    for i, entry in tqdm(items, total=len(items), desc=f"[VAL] Streaming {dataset} (subset)"):
+        # entry는 보통 {scene_key: [frames...]} 형태의 dict
+        # 혹은 이미 (scene_key, frames) 튜플일 수 있음 — 양쪽 모두 처리
+        if isinstance(entry, dict):
+            if len(entry) == 0:
+                continue
+            scene_key = next(iter(entry.keys()))
+            frames = entry[scene_key]
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[0], str):
+            scene_key, frames = entry[0], entry[1]
+        else:
+            # 알 수 없는 구조: 스킵
+            continue
 
-                # BGR -> RGB
-                bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
-                if bgr is None:
-                    raise FileNotFoundError(img_path)
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # 스트리밍 상태 리셋
+        _reset_streaming_state(model)
 
-                depth_np = _vdainfer_one(model, rgb, input_size=input_size, device=device, fp32=fp32)
-                np.save(out_path, depth_np)
+        # 각 프레임 저장 경로대로 추론 수행
+        for item in frames:
+            img_path = os.path.join(root_path, item['image'])
+            base, _ = os.path.splitext(item['image'])
+            out_path = os.path.join(infer_path, dataset, base + '.npy')
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-            seq_registry.append((key, frames))
-            processed += 1
-            
-            # scene_indices 모드가 아닐 때만 early stop
-            if scene_indices is None and processed >= scenes_to_eval:
-                break
-        if scene_indices is None and processed >= scenes_to_eval:
-            break
+            # BGR -> RGB
+            bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise FileNotFoundError(img_path)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            depth_np = _vdainfer_one(model, rgb, input_size=input_size, device=device, fp32=fp32)
+            np.save(out_path, depth_np)
+
+        seq_registry.append((scene_key, frames))
 
     torch.cuda.empty_cache(); gc.collect()
 
@@ -1045,21 +1052,28 @@ def validate_with_infer_eval_subset(
             seq_metrics["rmse_linear"] = torch.sqrt((diff ** 2).sum() / denom).item()
         seq_metrics["delta1_acc"] = delta1_acc(pred_ts, gt_ts, mask_ts).item()
 
+        # 씬 식별자도 같이 저장
+        seq_metrics["scene"] = key
         all_metrics.append(seq_metrics)
 
-    # 평균 내기
+    # # 평균(숫자형 키만) 내기
     if len(all_metrics) == 0:
         avg = {"abs_relative_difference": float("nan"),
                "rmse_linear": float("nan"),
                "delta1_acc": float("nan")}
     else:
-        avg = {
-            k: float(np.mean([m[k] for m in all_metrics]))
-            for k in all_metrics[0].keys()
-        }
+        # 숫자형 값만 평균 계산 (예: "scene" 같은 문자열 키는 무시)
+        numeric_keys = []
+        for k in all_metrics[0].keys():
+            try:
+                _ = [float(m[k]) for m in all_metrics]
+                numeric_keys.append(k)
+            except Exception:
+                pass
+        avg = {k: float(np.mean([float(m[k]) for m in all_metrics])) for k in numeric_keys}
 
     # 모델 모드 복구
     if model_was_training:
         model.train()
 
-    return avg
+    return {"avg":avg, "per_scene": all_metrics}
