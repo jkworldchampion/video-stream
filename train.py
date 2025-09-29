@@ -13,7 +13,7 @@ import numpy as np
 import yaml
 import wandb
 
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data._utils.collate import default_collate
@@ -28,7 +28,7 @@ from utils.train_helper import (
 )
 
 from data.dataLoader import (     # 경로/데이터셋 로더
-    KITTIVideoDataset, get_data_list
+    KITTIVideoDataset, GTADataset, get_data_list, get_GTA_paths
 )
 
 # 모델
@@ -393,10 +393,16 @@ def train(args):
     vkitti_rgb, vkitti_depth = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
     vkitti_ds = KITTIVideoDataset(rgb_paths=vkitti_rgb, depth_paths=vkitti_depth, clip_len=CLIP_LEN, resize_size=518, split="train")
 
+    gta_root = "/workspace/Video-Depth-Anything/datasets/GTAV_720/GTAV_720"
+    gta_rgb, gta_depth, _ = get_GTA_paths(gta_root, split="train")
+    gta_ds = GTADataset(rgb_paths=gta_rgb, depth_paths=gta_depth, clip_len=CLIP_LEN, resize_size=518, split="train")
+
     logger.info(f"train_VKITTI_total_clips : {len(vkitti_ds)}")
+    logger.info(f"train_GTA_total_clips    : {len(gta_ds)}")
 
     # 태그
     vkitti_tagged = TagDataset(vkitti_ds, tag_int=0)
+    gta_tagged    = TagDataset(gta_ds,    tag_int=1)
 
     # 모델
     teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
@@ -527,11 +533,14 @@ def train(args):
     log_every = max(1, int(args.log_every))
 
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False, dynamic_ncols=True):
-        if hasattr(vkitti_ds, "set_epoch"):
-            vkitti_ds.set_epoch(epoch)
-
+        if hasattr(vkitti_ds, "set_epoch"): vkitti_ds.set_epoch(epoch)
+        if hasattr(gta_ds, "set_epoch"):    gta_ds.set_epoch(epoch)
+        
         data_size = 3 if args.test else 100
-        train_dataset = make_random_subset(vkitti_tagged, data_size)
+        train_dataset = ConcatDataset([
+            make_random_subset(vkitti_tagged, data_size),
+            make_random_subset(gta_tagged,    data_size)
+        ])
         train_loader  = DataLoader(
             train_dataset,
             batch_size=batch_size,
