@@ -1,46 +1,38 @@
-# This file is originally from AnimateDiff/animatediff/models/motion_module.py at main · guoyww/AnimateDiff
 # SPDX-License-Identifier: Apache-2.0 license
 #
-# This file may have been modified by ByteDance Ltd. and/or its affiliates on [date of modification]
-# Original file was released under [ Apache-2.0 license], with the full license text available at [https://github.com/guoyww/AnimateDiff?tab=Apache-2.0-1-ov-file#readme].
+# Adapted from AnimateDiff (guoyww/AnimateDiff)
+# Modified for RoSA-KV KD caching (history accumulation)
+
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from einops import rearrange
 
-from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute_freqs_cis
+from .attention import CrossAttention, FeedForward
+from .time_pe import TemporalPE
+from .kv_selector import KVSelector, SelectorOutput
+from .kv_refiner import KVRefiner
+from .rw_memory import RWMemory
 
-from einops import rearrange, repeat
-import math
-
-try:
-    import xformers
-    import xformers.ops
-
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    print("xFormers not available")
-    XFORMERS_AVAILABLE = False
-
+XFORMERS_AVAILABLE = False
 
 def zero_module(module):
-    # Zero out the parameters of a module and return it.
     for p in module.parameters():
-        p.detach().zero_()
+        nn.init.zeros_(p)
     return module
-
 
 class TemporalModule(nn.Module):
     def __init__(
         self,
         in_channels,
-        num_attention_heads                = 8,
-        num_transformer_block              = 2,
-        num_attention_blocks               = 2,
-        norm_num_groups                    = 32,
-        temporal_max_len                   = 32,
-        zero_initialize                    = True,
-        pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
+        num_attention_heads=8,
+        num_transformer_block=2,
+        num_attention_blocks=2,
+        norm_num_groups=32,
+        temporal_max_len=32,
+        zero_initialize=True,
+        pos_embedding_type="ape",
     ):
         super().__init__()
 
@@ -53,18 +45,16 @@ class TemporalModule(nn.Module):
             norm_num_groups=norm_num_groups,
             temporal_max_len=temporal_max_len,
             pos_embedding_type=pos_embedding_type,
-            use_causal_mask=use_causal_mask,
         )
 
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
 
-    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None):
-        hidden_states = input_tensor
-        hidden_states, output_hidden_state_list = self.temporal_transformer(hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list)
-
-        output = hidden_states
-        return output, output_hidden_state_list  # list of hidden states
+    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None, **kwargs):
+        hidden_states, output_hidden_state_list = self.temporal_transformer(
+            input_tensor, encoder_hidden_states, attention_mask, cached_hidden_state_list, **kwargs
+        )
+        return hidden_states, output_hidden_state_list
 
 
 class TemporalTransformer3DModel(nn.Module):
@@ -74,17 +64,16 @@ class TemporalTransformer3DModel(nn.Module):
         num_attention_heads,
         attention_head_dim,
         num_layers,
-        num_attention_blocks               = 2,
-        norm_num_groups                    = 32,
-        temporal_max_len                   = 32,
-        pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
+        num_attention_blocks=2,
+        norm_num_groups=32,
+        temporal_max_len=32,
+        pos_embedding_type="ape",
     ):
         super().__init__()
 
         inner_dim = num_attention_heads * attention_head_dim
 
-        self.norm = torch.nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm = nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
         self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
@@ -96,15 +85,14 @@ class TemporalTransformer3DModel(nn.Module):
                     num_attention_blocks=num_attention_blocks,
                     temporal_max_len=temporal_max_len,
                     pos_embedding_type=pos_embedding_type,
-                    use_causal_mask=use_causal_mask,
                 )
-                for d in range(num_layers)
+                for _ in range(num_layers)
             ]
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None):
-        assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None, **kwargs):
+        assert hidden_states.dim() == 5
         output_hidden_state_list = []
 
         video_length = hidden_states.shape[2]
@@ -114,47 +102,28 @@ class TemporalTransformer3DModel(nn.Module):
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
-        inner_dim = hidden_states.shape[1]
-        hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim).contiguous()
+        inner = hidden_states.shape[1]
+        hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner).contiguous()
         hidden_states = self.proj_in(hidden_states)
 
-        # Transformer Blocks
-        if cached_hidden_state_list is not None:
-            n = len(cached_hidden_state_list) // len(self.transformer_blocks)
-        else:
-            n = 0
+        n = (len(cached_hidden_state_list) // len(self.transformer_blocks)) if cached_hidden_state_list is not None else 0
+
         for i, block in enumerate(self.transformer_blocks):
-            hidden_states, hidden_state_list = block(hidden_states, encoder_hidden_states=encoder_hidden_states, video_length=video_length, attention_mask=attention_mask,
-                                                     cached_hidden_state_list=cached_hidden_state_list[i*n:(i+1)*n] if n else None)
+            sub_cache = cached_hidden_state_list[i * n:(i + 1) * n] if n else None
+            hidden_states, hidden_state_list = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                video_length=video_length,
+                attention_mask=attention_mask,
+                cached_hidden_state_list=sub_cache,
+                **kwargs,
+            )
             output_hidden_state_list.extend(hidden_state_list)
 
-        # output
         hidden_states = self.proj_out(hidden_states)
-        
-        # Safe reshape: use the original spatial dimensions
-        try:
-            hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
-        except RuntimeError as e:
-            # If reshape fails, try to infer correct dimensions
-            print(f"Original reshape failed: {e}")
-            total_elements = hidden_states.numel()
-            
-            # Calculate dimensions based on residual tensor
-            target_batch, _, target_height, target_width = residual.shape
-            expected_elements = target_batch * target_height * target_width * inner_dim
-            
-            if total_elements == expected_elements:
-                hidden_states = hidden_states.reshape(target_batch, target_height, target_width, inner_dim).permute(0, 3, 1, 2).contiguous()
-                print(f"Successfully reshaped using residual dimensions: {hidden_states.shape}")
-            else:
-                # Last resort: create zero tensor with correct shape
-                print(f"Creating zero tensor. Total elements: {total_elements}, Expected: {expected_elements}")
-                hidden_states = torch.zeros(target_batch, inner_dim, target_height, target_width, 
-                                           device=hidden_states.device, dtype=hidden_states.dtype)
-
+        hidden_states = hidden_states.reshape(batch, height, width, inner).permute(0, 3, 1, 2).contiguous()
         output = hidden_states + residual
         output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
-
         return output, output_hidden_state_list
 
 
@@ -164,38 +133,30 @@ class TemporalTransformerBlock(nn.Module):
         dim,
         num_attention_heads,
         attention_head_dim,
-        num_attention_blocks               = 2,
-        temporal_max_len                   = 32,
-        pos_embedding_type                 = "ape",
-        use_causal_mask                    = True,
+        num_attention_blocks=2,
+        temporal_max_len=32,
+        pos_embedding_type="ape",
     ):
         super().__init__()
 
         self.attention_blocks = nn.ModuleList(
             [
                 TemporalAttention(
-                        query_dim=dim,
-                        heads=num_attention_heads,
-                        dim_head=attention_head_dim,
-                        temporal_max_len=temporal_max_len,
-                        pos_embedding_type=pos_embedding_type,
-                        use_causal_mask=use_causal_mask,
+                    query_dim=dim,
+                    heads=num_attention_heads,
+                    dim_head=attention_head_dim,
+                    temporal_max_len=temporal_max_len,
+                    pos_embedding_type=pos_embedding_type,
                 )
-                for i in range(num_attention_blocks)
+                for _ in range(num_attention_blocks)
             ]
         )
-        self.norms = nn.ModuleList(
-            [
-                nn.LayerNorm(dim)
-                for i in range(num_attention_blocks)
-            ]
-        )
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_attention_blocks)])
 
         self.ff = FeedForward(dim, dropout=0.0, activation_fn="geglu")
         self.ff_norm = nn.LayerNorm(dim)
 
-
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None, **kwargs):
         output_hidden_state_list = []
         for i, (attention_block, norm) in enumerate(zip(self.attention_blocks, self.norms)):
             norm_hidden_states = norm(hidden_states)
@@ -205,23 +166,17 @@ class TemporalTransformerBlock(nn.Module):
                 video_length=video_length,
                 attention_mask=attention_mask,
                 cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
+                **kwargs,
             )
             hidden_states = residual_hidden_states + hidden_states
             output_hidden_state_list.append(output_hidden_states)
 
         hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
-
-        output = hidden_states
-        return output, output_hidden_state_list
+        return hidden_states, output_hidden_state_list
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        dropout = 0.,
-        max_len = 32
-    ):
+    def __init__(self, d_model, dropout=0., max_len=32):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
         position = torch.arange(max_len).unsqueeze(1)
@@ -235,272 +190,247 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)].to(x.dtype)
         return self.dropout(x)
 
+
 class TemporalAttention(CrossAttention):
-    def __init__(
-            self,
-            temporal_max_len                   = 32,
-            pos_embedding_type                 = "ape",
-            use_causal_mask                    = True,
-            *args, **kwargs
-        ):
-        super().__init__(*args, **kwargs)
+    """
+    오케스트레이터:
+      - Q/K/V 추출 (pre-PE)
+      - RW-Memory READ로 q 강화
+      - Selector로 read/write 인덱스 산출 (없으면 full-pass)
+      - RoPE(+Δt)/ALiBi 적용
+      - 수동 SDPA
+      - Refiner로 선택 토큰 ΔK/ΔV 갱신(옵션)
+      - RW-Memory WRITE (Top-U 있으면 저랭크, 없으면 전역평균)
+      - KD 캐시(K_all/V_all/attn_hist/Δreg) 저장
+      - 캐시로 사용할 now(pre-PE)를 반환
+    """
+    def __init__(self, temporal_max_len=32, pos_embedding_type="ape", dim_head=64, mem_slots=16, *args, **kwargs):
+        # CrossAttention은 heads/ to_q/to_k/to_v/to_out 등을 초기화함
+        super().__init__(dim_head=dim_head, *args, **kwargs)
 
+        self.temporal_max_len   = int(temporal_max_len)
         self.pos_embedding_type = pos_embedding_type
-        self._use_memory_efficient_attention_xformers = True
-        self.use_causal_mask = use_causal_mask
+        self.dim_head           = int(dim_head)
 
-        self.pos_encoder = None
-        self.freqs_cis = None
-        if self.pos_embedding_type == "ape":
-            self.pos_encoder = PositionalEncoding(
-                kwargs["query_dim"],
-                dropout=0.,
-                max_len=temporal_max_len
-            )
+        qdim = int(kwargs["query_dim"])  # 기존 코드 호환 (CrossAttention 생성 시 넘겨줌)
 
-        elif self.pos_embedding_type == "rope":
-            self.freqs_cis = precompute_freqs_cis(
-                kwargs["query_dim"],
-                temporal_max_len
-            )
+        # --- 하위 컴포넌트 ---
+        self.time_pe  = TemporalPE(
+            query_dim=qdim,
+            temporal_max_len=self.temporal_max_len,
+            pos_embedding_type=("rope" if pos_embedding_type == "rope" else "ape"),
+            alibi_slope=0.0,
+        )
+        self.selector = KVSelector()
+        self.refiner  = KVRefiner(Cfull=qdim, dim_head=self.dim_head, tau=3.0)
+        self.memory   = RWMemory(slots=mem_slots, Dh=self.dim_head,
+                                 alpha_init=0.5, gamma_init=0.1, use_slot_slot_decorr=True)
 
-        else:
-            raise NotImplementedError
+        # q에 메모리 읽기를 주입하는 게이트
+        self.mem_read_alpha = nn.Parameter(torch.tensor(0.5))
 
-    def _create_causal_mask(self, seq_len, current_frame_idx=None, device='cuda'):
-        """
-        Create causal mask for temporal attention.
-        For streaming mode, mask out future frames beyond current_frame_idx.
-        For training mode, create lower triangular mask.
-        
-        Args:
-            seq_len: Sequence length (number of frames)
-            current_frame_idx: Index of current frame in streaming mode (None for training)
-            device: Device to create mask on
-            
-        Returns:
-            Causal mask of shape (seq_len, seq_len)
-        """
-        if current_frame_idx is not None:
-            # Streaming mode: only allow attention to past and current frames
-            mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
-            mask[:, :current_frame_idx + 1] = True
-        else:
-            # Training mode: standard causal mask (lower triangular)
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
-        
-        # Convert to attention bias (large negative values for masked positions)
-        causal_mask = torch.where(mask, 0.0, float('-inf'))
-        return causal_mask
+        # KD(옵션) 캐시
+        self._kd_cache_enabled = False
+        self._kd_cache_role = "off"   # "off" | "teacher" | "student"
+        self._hist = None
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None):
-        # TODO: support cache for these
-        assert encoder_hidden_states is None
-        assert attention_mask is None
+    # --- KD hooks ---
+    def enable_kd_caching(self, flag: bool = True, role: str = "teacher"):
+        self._kd_cache_enabled = bool(flag)
+        self._kd_cache_role = role
+        self._hist = {} if flag else None
 
-        d = hidden_states.shape[1]
-        d_in = 0
-        is_streaming_mode = cached_hidden_states is not None
-        
+    def get_cached_attention_output(self):
+        # collect_kd_caches()가 이 메서드를 호출
+        if not self._kd_cache_enabled:
+            return None
+        return self._hist
+
+    def clear_attention_cache(self):
+        self._hist = None
+
+    # --- 본연의 forward ---
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        video_length=None,
+        cached_hidden_states=None,
+        *,
+        stream_mode: bool = False,
+        rope_dt=None,
+        select_top_r: int = None,
+        update_top_u: int = None,
+        return_attn: bool = False,
+        return_qkv: bool = False,
+        teacher_sig=None,
+    ):
+        assert encoder_hidden_states is None and attention_mask is None
+
+        d = hidden_states.shape[1]  # tokens per frame (=P)
+        # (b*f, d, c) → (b*d, f, c)
         if cached_hidden_states is None:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
-            input_hidden_states = hidden_states  # (bxd) f c
+            now  = hidden_states                 # [(B*P), f_now(=T_offline or 1), C]
+            past = None
         else:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)
-            input_hidden_states = hidden_states
-            
-            # Handle cached states properly - ensure correct dimensions
-            
-            if cached_hidden_states.dim() == 2:
-                # If cached tensor is 2D [seq_len, dim], convert to 3D format
-                cached_hidden_states = cached_hidden_states.unsqueeze(1)  # [seq_len, 1, dim]
-                # Repeat for batch dimension to match current input
-                cached_hidden_states = cached_hidden_states.repeat(hidden_states.shape[0], 1, 1)  # [batch*seq_len, 1, dim]
-                cached_hidden_states = cached_hidden_states.view(hidden_states.shape[0], -1, cached_hidden_states.shape[2])  # [batch, seq_len, dim]
-            # elif cached_hidden_states.dim() == 3 and cached_hidden_states.shape[1] == 1:
-                # If cached tensor is [spatial_patches, 1, dim], we need to expand temporal dimension
-                # print(f"Expanding single temporal step cache from {cached_hidden_states.shape}")
-                # This means we have a single frame cache, just use it as is for concatenation
-            
-            # Check if cached states are compatible - only feature dimension needs to match
-            # Batch dimension should already match since we're processing the same image resolution
-            if cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print("Creating new compatible cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            elif cached_hidden_states.shape[0] != hidden_states.shape[0]:
-                # This should NOT happen for same resolution frames - indicates a bug
-                print(f"ERROR: Batch dimension mismatch for same resolution: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("This indicates a cache storage/loading bug. Resetting cache...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-            else:
-                d_in = cached_hidden_states.shape[1]
-            
-            # Ensure both tensors have the same dimensions before concatenation
-            
-            # Fix dimension mismatch if it occurs
-            if cached_hidden_states.dim() != hidden_states.dim():
-                if cached_hidden_states.dim() == 2 and hidden_states.dim() == 3:
-                    cached_hidden_states = cached_hidden_states.unsqueeze(1)
-                elif cached_hidden_states.dim() == 3 and hidden_states.dim() == 2:
-                    hidden_states = hidden_states.unsqueeze(1)
-                    print(f"Fixed current shape: {hidden_states.shape}")
-            
-            # Verify shapes are compatible for concatenation
-            if cached_hidden_states.shape[0] != hidden_states.shape[0] or cached_hidden_states.shape[2] != hidden_states.shape[2]:
-                print(f"ERROR: Shape incompatible for concat: cached {cached_hidden_states.shape} vs current {hidden_states.shape}")
-                print("Resetting cache to avoid error...")
-                cached_hidden_states = torch.zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[2],
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-                d_in = 0
-                
-            hidden_states = torch.cat([cached_hidden_states, hidden_states], dim=1)
-            
-            # Ensure total temporal length doesn't exceed maximum
-            max_total_length = 32
-            if hidden_states.shape[1] > max_total_length:
-                hidden_states = hidden_states[:, -max_total_length:, :]
+            now  = hidden_states                 # [(B*P), 1, C]
+            past = cached_hidden_states          # [(B*P), T_past, C] (pre-PE로 저장된 것)
 
-        if self.pos_encoder is not None:
-            hidden_states = self.pos_encoder(hidden_states)
+        # ---- Q/K/V (pre-PE) ----
+        q_now = self.to_q(now)  # [(B*P), f_now, C]
+        k_now = self.to_k(now)
+        v_now = self.to_v(now)
 
-        encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d) if encoder_hidden_states is not None else encoder_hidden_states
+        # ---- RW-Memory READ → q 주입 ----
+        BxP, f_now, Cfull = q_now.shape
+        P = d
+        assert BxP % P == 0, f"invalid batch*pos split: BxP={BxP}, P={P}"
+        B0 = BxP // P
+        H  = self.heads
+        Dh = Cfull // H
+        # 머리 분해 일치성 보증
+        assert Cfull == H * Dh, f"head split mismatch: C={Cfull}, H={H}, Dh={Dh}, heads*Dh={H*Dh}"
 
-        if self.group_norm is not None:
-            hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        # 전역 q (마지막 프레임, 위치 평균)
+        q_bpfc   = q_now.view(B0, P, f_now, Cfull)
+        q_global = q_bpfc[:, :, -1].mean(dim=1)          # [B0,C]
+        qg       = q_global.view(B0, H, Dh).mean(dim=1)  # [B0,Dh]
+        r_t      = self.memory.read(qg)                  # [B0,Dh]
 
-        query = self.to_q(hidden_states[:, d_in:, ...])
-        dim = query.shape[-1]
+        # q에 주입: (B0,Dh) → (B0,P,f_now,C)
+        r_full = r_t.unsqueeze(1).repeat(1, H, 1)              # [B0,H,Dh]
+        r_full = r_full.reshape(B0, H * Dh)                    # [B0,C]
+        alpha  = torch.tanh(self.mem_read_alpha).clamp(-1, 1)  # 스칼라
+        r_add  = r_full[:, None, None, :].expand(B0, P, f_now, Cfull).reshape(B0 * P, f_now, Cfull)
+        q_now  = q_now + alpha * r_add
 
-        if self.added_kv_proj_dim is not None:
-            raise NotImplementedError
-
-        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
-
-        if self.freqs_cis is not None:
-            seq_len = query.shape[1]
-            freqs_cis = self.freqs_cis[:seq_len].to(query.device)
-            query, key = apply_rotary_emb(query, key, freqs_cis)
-
-        # Apply causal masking if enabled
-        causal_attention_mask = None
-        if self.use_causal_mask:
-            seq_len = hidden_states.shape[1]
-            if is_streaming_mode:
-                # In streaming mode, current frame can only attend to past frames
-                current_frame_idx = seq_len - 1  # Last frame is the current frame
-                causal_attention_mask = self._create_causal_mask(seq_len, current_frame_idx, hidden_states.device)
-            else:
-                # In training mode, apply standard causal mask
-                causal_attention_mask = self._create_causal_mask(seq_len, None, hidden_states.device)
-            
-            # Expand mask for multiple heads and batch dimensions
-            batch_size = key.shape[0]
-            if causal_attention_mask is not None:
-                # Only apply mask to the query frames (not full sequence)
-                query_seq_len = query.shape[1]  # This is 1 for streaming mode
-                if query_seq_len < seq_len:
-                    # Extract the relevant part of the mask for query
-                    causal_attention_mask = causal_attention_mask[-query_seq_len:, :]
-                
-                causal_attention_mask = causal_attention_mask.unsqueeze(0).repeat(batch_size, 1, 1)
-                causal_attention_mask = causal_attention_mask.repeat_interleave(self.heads, dim=0)
-
-        # Combine with existing attention mask if provided
-        final_attention_mask = causal_attention_mask
-        if attention_mask is not None:
-            if attention_mask.shape[-1] != query.shape[1]:
-                target_length = query.shape[1]
-                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
-                attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
-            
-            if final_attention_mask is not None:
-                final_attention_mask = final_attention_mask + attention_mask
-            else:
-                final_attention_mask = attention_mask
-
-        use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
-        if use_memory_efficient and (dim // self.heads) % 8 != 0:
-            # print('Warning: the dim {} cannot be divided by 8. Fall into normal attention'.format(dim // self.heads))
-            use_memory_efficient = False
-
-        # attention, what we cannot get enough of
-        if use_memory_efficient:
-            query = self.reshape_heads_to_4d(query)
-            key = self.reshape_heads_to_4d(key)
-            value = self.reshape_heads_to_4d(value)
-
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, final_attention_mask)
-            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-            hidden_states = hidden_states.to(query.dtype)
+        # ---- 과거 토큰 준비 ----
+        if stream_mode and (past is not None):
+            # past는 pre-PE hidden_states로 들어온다고 가정 (우리 설계)
+            k_past = self.to_k(past)  # [(B*P), T_past, C]
+            v_past = self.to_v(past)
+            K_hist = k_past.view(B0, P, -1, Cfull)       # [B0,P,Tp,C]
         else:
-            query = self.reshape_heads_to_batch_dim(query)
-            key = self.reshape_heads_to_batch_dim(key)
-            value = self.reshape_heads_to_batch_dim(value)
+            k_past = None
+            v_past = None
+            K_hist = None
 
-            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value, final_attention_mask)
+        # ---- Selector (Top-R/U) ----
+        q_t_flat    = q_now[:, -1:].squeeze(1).view(B0, P, Cfull)  # [B0,P,C]
+        time_lag    = getattr(teacher_sig, "time_lag", None) if teacher_sig is not None else None
+        motion_score= getattr(teacher_sig, "motion_score", None)   if teacher_sig is not None else None
+
+        sel: SelectorOutput = self.selector(
+            q_t=q_t_flat, K_hist=K_hist,
+            top_r=select_top_r, top_u=update_top_u,
+            time_lag=time_lag, motion_score=motion_score
+        )
+
+        # ---- Read 세트 구성 (과거 + 현재) ----
+        if (k_past is not None):
+            if (sel.read_idx is not None):                 # Top-R
+                k_read = self.selector.gather_time(k_past, sel.read_idx, B0, P, Cfull)  # [(B*P), R, C]
+                v_read = self.selector.gather_time(v_past, sel.read_idx, B0, P, Cfull)
+                key    = torch.cat([k_read, k_now], dim=1)
+                value  = torch.cat([v_read, v_now], dim=1)
             else:
-                raise NotImplementedError
-
-        # linear proj
-        hidden_states = self.to_out[0](hidden_states)
-
-        # dropout
-        hidden_states = self.to_out[1](hidden_states)
-
-        # Reshape back to original format
-        # For streaming mode, we want [spatial_patches, temporal_len, dim]
-        # For non-streaming, we want [batch*temporal, spatial_patches, dim]
-        if is_streaming_mode and d_in > 0:
-            # In streaming mode, we already have the right shape after attention
-            # hidden_states is already [spatial_patches*temporal, dim] from attention
-            # We need to reshape it to [spatial_patches, temporal_len, dim]
-            spatial_patches = d
-            temporal_len = hidden_states.shape[0] // spatial_patches
-            hidden_states = hidden_states.view(spatial_patches, temporal_len, -1)
+                # full past 사용
+                key    = torch.cat([k_past, k_now], dim=1)
+                value  = torch.cat([v_past, v_now], dim=1)
         else:
-            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+            key, value = k_now, v_now
+
+        # ---- RoPE(+ALiBi) ----
+        q_rope, k_rope, alibi_bias = self.time_pe.apply(q_now, key, rope_dt)
+
+        # ---- 수동 SDPA ----
+        def _to_bh(x):
+            B_, L_, C_ = x.shape
+            H = self.heads
+            Dh = C_ // H
+            x = x.view(B_, L_, H, Dh).permute(0, 2, 1, 3).reshape(B_ * H, L_, Dh).contiguous()
+            return x, Dh
+
+        q_bh, _ = _to_bh(q_rope)
+        k_bh, _ = _to_bh(k_rope)
+        v_bh, _ = _to_bh(value)
+
+        scores = torch.bmm(q_bh, k_bh.transpose(1, 2)) * (self.dim_head ** -0.5)
+        if alibi_bias is not None:
+            # alibi_bias: [BxH, q_len, k_len]
+            scores = scores + alibi_bias.to(scores.dtype)
+        attn   = torch.softmax(scores, dim=-1)  # [BxH,q,k]
+        ctx_bh = torch.bmm(attn, v_bh)          # [BxH,q,Dh]
+
+        BxH, q_len, Dh_chk = ctx_bh.shape
+        assert Dh_chk == Dh, "context head-dim mismatch"
+        H   = self.heads
+        B0b = BxH // H
+        out = ctx_bh.view(B0b, H, q_len, Dh).permute(0, 2, 1, 3).reshape(B0b, q_len, H * Dh).contiguous()
+        hidden_states = self.to_out[1](self.to_out[0](out))                      # proj→dropout
+        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)  # [(B*P), f, C] → [(B*f), d, C]
+
+        # ---- Refiner: write 후보 Δ 갱신 (옵션) ----
+        aux      = {}
+        V_u_ref  = None  # ← 미리 초기화(에러 방지)
+        if (k_past is not None) and (sel.write_idx is not None):
+            K_u, V_u, sc = self.selector.gather_kv_for_update(k_past, v_past, sel.write_idx, B0, P, Cfull)
+            K_u_ref, V_u_ref, aux = self.refiner(q_t=q_t_flat, K_u=K_u, V_u=V_u, r_t=r_t, teacher_sig=teacher_sig)
+            # in-place 업데이트
+            self.selector.scatter_kv_updated(k_past, v_past, sel.write_idx, K_u_ref, V_u_ref, B0, P, Cfull)
+
+        # ---- RW-Memory WRITE ----
+        if V_u_ref is not None:
+            # Top-U 기반 저랭크 업데이트
+            self.memory.write_topu_lowrank(V_u_ref, H=self.heads, Dh=Dh, write_idx=sel.write_idx, teacher_sig=teacher_sig)
+        else:
+            # MVP 경로: 현재 프레임 전역 평균
+            self.memory.write_from_frame(v_now=v_now, B0=B0, P=P, Cfull=Cfull, H=self.heads, Dh=Dh, teacher_sig=teacher_sig)
+
+        # ---- KD 캐시 저장 ----
+        if self._kd_cache_enabled:
+            attn_b = attn.view(B0b, H, attn.shape[1], attn.shape[2])
         
-        # In streaming mode with cached states, we need to ensure output matches input
-        if is_streaming_mode and d_in > 0:
-            # For streaming, we only want the output for the new frame
-            # hidden_states is now [spatial_patches, total_temporal_len, dim] after concat
-            
-            # Get only the new frame's output (last temporal step)
-            # Keep the spatial dimension intact for proper output
-            new_frame_output = hidden_states[:, -1, :]  # [spatial_patches, dim] - remove temporal dim for output
-            
-            # Reshape to expected output format if needed
-            output_tensor = new_frame_output  # Keep as [spatial_patches, dim]
-            
-            # For cache output, we need to save the current frame in the right format
-            # Cache should match the spatial dimension [spatial_patches, 1, dim]
-            # Extract the new frame from the last temporal position
-            new_frame_cache = hidden_states[:, -1:, :]  # [spatial_patches, 1, dim]
-            cache_output = new_frame_cache  # Keep in [spatial_patches, 1, dim] format
-            
-            return output_tensor, cache_output
-        else:
-            # Standard mode (first frame) - return cache in streaming-compatible format
-            # We need to return cache that matches the streaming mode format
-            
-            # For first frame, hidden_states is [1, spatial_patches, dim] 
-            # We need to convert it to [spatial_patches, 1, dim] format for streaming compatibility
-            # Remove the batch dimension and add temporal dimension at the right place
-            
-            cache_output = hidden_states.squeeze(0)      # [1, spatial_patches, dim] -> [spatial_patches, dim]
-            cache_output = cache_output.unsqueeze(1)     # [spatial_patches, dim] -> [spatial_patches, 1, dim]
-            
-            return hidden_states, cache_output
+            if self._kd_cache_role == "student":
+                # 학생: 그래프 유지 (detach 금지)
+                if (k_past is not None) and (v_past is not None):
+                    K_all = torch.cat([k_past, k_now], dim=1)  # [(B*P), T_total, C]
+                    V_all = torch.cat([v_past, v_now], dim=1)
+                else:
+                    K_all, V_all = k_now, v_now
+        
+                K_all = K_all.view(B0, P, -1, Cfull)    # no detach
+                V_all = V_all.view(B0, P, -1, Cfull)
+                attn_b = attn_b.detach()                # 분포 로깅만
+                delta_reg = aux.get("delta_reg", None)
+                if torch.is_tensor(delta_reg):
+                    delta_reg = delta_reg.detach()
+        
+            else:  # role == "teacher" (또는 기타)
+                # 교사: detach로 고정
+                if (k_past is not None) and (v_past is not None):
+                    K_all = torch.cat([k_past, k_now], dim=1)
+                    V_all = torch.cat([v_past, v_now], dim=1)
+                else:
+                    K_all, V_all = k_now, v_now
+        
+                K_all = K_all.view(B0, P, -1, Cfull).detach()
+                V_all = V_all.view(B0, P, -1, Cfull).detach()
+                attn_b = attn_b.detach()
+                delta_reg = aux.get("delta_reg", None)
+                if torch.is_tensor(delta_reg):
+                    delta_reg = delta_reg.detach()
+        
+            self._hist = {
+                "K_all_pre": K_all,      # [B0, P, T, C]
+                "V_all_pre": V_all,      # [B0, P, T, C]
+                "attn_hist": attn_b,     # [B0, H, q_len, k_len]
+            }
+            if delta_reg is not None:
+                self._hist["delta_reg"] = delta_reg
+
+        # 캐시로 pre-PE now 반환 ([(B*P), f_now, C]) — 상위에서 past로 재사용
+        return hidden_states, now

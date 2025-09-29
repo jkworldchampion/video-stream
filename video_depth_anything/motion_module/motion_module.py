@@ -17,12 +17,10 @@ from .rw_memory import RWMemory
 
 XFORMERS_AVAILABLE = False
 
-
 def zero_module(module):
     for p in module.parameters():
-        p.detach().zero_()
+        nn.init.zeros_(p)
     return module
-
 
 class TemporalModule(nn.Module):
     def __init__(
@@ -233,15 +231,14 @@ class TemporalAttention(CrossAttention):
 
         # KD(옵션) 캐시
         self._kd_cache_enabled = False
+        self._kd_cache_role = "off"   # "off" | "teacher" | "student"
         self._hist = None
 
     # --- KD hooks ---
-    def enable_kd_caching(self, flag: bool = True):
+    def enable_kd_caching(self, flag: bool = True, role: str = "teacher"):
         self._kd_cache_enabled = bool(flag)
-        if flag and (self._hist is None):
-            self._hist = {}
-        if not flag:
-            self._hist = None
+        self._kd_cache_role = role
+        self._hist = {} if flag else None
 
     def get_cached_attention_output(self):
         # collect_kd_caches()가 이 메서드를 호출
@@ -395,29 +392,42 @@ class TemporalAttention(CrossAttention):
 
         # ---- KD 캐시 저장 ----
         if self._kd_cache_enabled:
-            # 어텐션: [B0,H,q_len,k_len]
-            attn_b = attn.view(B0b, H, attn.shape[1], attn.shape[2]).detach()
-
-            # 전체 K/V (pre-PE 기준)
-            if (k_past is not None) and (v_past is not None):
-                K_all = torch.cat([k_past, k_now], dim=1)  # [(B*P), T_total, C]
-                V_all = torch.cat([v_past, v_now], dim=1)
-            else:
-                K_all = k_now
-                V_all = v_now
-
-            T_total = K_all.shape[1]
-            K_all   = K_all.view(B0, P, T_total, Cfull).detach()
-            V_all   = V_all.view(B0, P, T_total, Cfull).detach()
-
-            delta_reg = aux.get("delta_reg", None)
-            if torch.is_tensor(delta_reg):
-                delta_reg = delta_reg.detach()
-
+            attn_b = attn.view(B0b, H, attn.shape[1], attn.shape[2])
+        
+            if self._kd_cache_role == "student":
+                # 학생: 그래프 유지 (detach 금지)
+                if (k_past is not None) and (v_past is not None):
+                    K_all = torch.cat([k_past, k_now], dim=1)  # [(B*P), T_total, C]
+                    V_all = torch.cat([v_past, v_now], dim=1)
+                else:
+                    K_all, V_all = k_now, v_now
+        
+                K_all = K_all.view(B0, P, -1, Cfull)    # no detach
+                V_all = V_all.view(B0, P, -1, Cfull)
+                attn_b = attn_b.detach()                # 분포 로깅만
+                delta_reg = aux.get("delta_reg", None)
+                if torch.is_tensor(delta_reg):
+                    delta_reg = delta_reg.detach()
+        
+            else:  # role == "teacher" (또는 기타)
+                # 교사: detach로 고정
+                if (k_past is not None) and (v_past is not None):
+                    K_all = torch.cat([k_past, k_now], dim=1)
+                    V_all = torch.cat([v_past, v_now], dim=1)
+                else:
+                    K_all, V_all = k_now, v_now
+        
+                K_all = K_all.view(B0, P, -1, Cfull).detach()
+                V_all = V_all.view(B0, P, -1, Cfull).detach()
+                attn_b = attn_b.detach()
+                delta_reg = aux.get("delta_reg", None)
+                if torch.is_tensor(delta_reg):
+                    delta_reg = delta_reg.detach()
+        
             self._hist = {
-                "K_all_pre": K_all,     # [B0, P, T, C]
-                "V_all_pre": V_all,     # [B0, P, T, C]
-                "attn_hist": attn_b,    # [B0, H, q_len, k_len]
+                "K_all_pre": K_all,      # [B0, P, T, C]
+                "V_all_pre": V_all,      # [B0, P, T, C]
+                "attn_hist": attn_b,     # [B0, H, q_len, k_len]
             }
             if delta_reg is not None:
                 self._hist["delta_reg"] = delta_reg

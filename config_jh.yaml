@@ -1,10 +1,10 @@
 hyper_parameter:
-  learning_rate: 0.0001  # 1e-4 -> 1.0e-4 for float representation
+  learning_rate: 0.0001  # 1e-4
   clip_len: 32
   ratio_ssi: 1
-  ratio_tgm: 10
+  ratio_tgm: 1
   epochs: 40
-  batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
+  batch_size: 1  # 4 -> 2로 줄여서 메모리 사용량 감소
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
   
   # Teacher-Student parameters
