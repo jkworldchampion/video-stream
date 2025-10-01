@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 39
+experiment = 40
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -674,6 +674,7 @@ def train(args):
         epoch_ssi = epoch_tgm = epoch_kd = 0.0
         accum_loss = 0.0
         step_in_window = 0
+        prev_pred_grad_state = None  # TGM용 (Δpred_{t-1})
         update_frequency = hyper_params.get("update_frequency", 6)
 
         # Stage-2 스케줄
@@ -823,25 +824,32 @@ def train(args):
                     #    - stable_loss가 시간차분을 보려면 최소 2프레임 필요
                     #    - 메모리로 이전 프레임을 보관
                     if t == 0:
-                        # 첫 프레임은 spatial만 의미 있게 학습(시간항 없음)
                         P = pred_depth_t.unsqueeze(1)    # [B,1,H,W]
-                        G = gt_depth_t.unsqueeze(1)      # [B,1,H,W]  ← 이제 target도 채널=1만 있는 4D, flatten(0,1) 후 (B,H,W)로 일치
+                        G = gt_depth_t.unsqueeze(1)
                         M = mask_t_float                 # [B,1,H,W]
-                        loss_dict = video_loss(
-                            prediction=P, target=G, mask=M
-                        )
+                        loss_dict = video_loss(prediction=P, target=G, mask=M)
                         spatial = loss_dict["spatial_loss"]
                         stable  = pred_depth_t.sum()*0.0
                     else:
-                        # 두 프레임 윈도우 [t-1, t]
                         P = torch.stack([prev_pred_depth_t, pred_depth_t], dim=1)   # [B,2,H,W]
-                        G = torch.stack([prev_gt_depth_t,   gt_depth_t],   dim=1)   # [B,2,H,W]
+                        G = torch.stack([prev_gt_depth_t,   gt_depth_t],   dim=1)
                         M = torch.stack([prev_mask_float,   mask_t_float.squeeze(1)], dim=1)  # [B,2,H,W]
-                        loss_dict = video_loss(
-                            prediction=P, target=G, mask=M
-                        )
+
+                        # spatial은 기존 VideoDepthLoss로 유지(정렬/정규화 포함)
+                        loss_dict = video_loss(prediction=P, target=G, mask=M.float())
                         spatial = loss_dict["spatial_loss"]
-                        stable  = loss_dict["stable_loss"]
+
+                        # stable은 새 스트리밍 전용 TGM으로 계산
+                        stable_loss, tgm_aux, prev_pred_grad_state = stream_tgm(
+                            pred_pair=P, gt_pair=G, mask_pair=M, prev_pred_grad=prev_pred_grad_state
+                        )
+                        stable = stable_loss
+                        # (원하면) 디버그 로깅
+                        wandb.log({
+                            "debug/tgm_data": float(tgm_aux["data"].cpu()),
+                            "debug/tgm_accel": float(tgm_aux["accel"].cpu()),
+                            "debug/tgm_rr_mean": float(tgm_aux["rr_mean"].cpu())
+                        }, commit=False)
 
                     # 4) 총합 손실 조립: KD + (ratio_ssi * spatial) + (ratio_tgm * stable)
                     loss = kd_loss + ratio_ssi * spatial + ratio_tgm * stable
@@ -871,6 +879,7 @@ def train(args):
                 prev_pred_depth_t = pred_depth_t.detach()                         # [B,H,W]
                 prev_gt_depth_t   = gt_depth_t.detach()                           # [B,H,W]
                 prev_mask_float   = mask_t_float.squeeze(1).detach()              # [B,H,W]
+                prev_pred_grad_state = prev_pred_grad_state  # 위에서 갱신된 것 그대로 유지
 
                 # KD용 상태(기존 유지)
                 prev_pred_raw     = pred_t_raw.detach()
