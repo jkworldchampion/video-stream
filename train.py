@@ -17,7 +17,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
-from utils.loss_MiDas import *
+# from utils.loss_MiDas import *
+from loss.loss import *               # Loss_ssi_basic, LossTGMVector
 from utils.train_helper import *  # validate_with_infer_eval_subset, model_stream_step, batch_ls_scale_shift, norm_ssi, get_mask, to_BHW_pred
 from data.dataLoader import *                 # KITTIVideoDataset, get_data_list
 
@@ -29,7 +30,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 37
+experiment = 39
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -98,6 +99,68 @@ def _gather_last_dim(x, idx):
         R = idx.shape[-1]
         gidx = idx
     return torch.gather(x, dim=2, index=gidx)
+
+class ExponentialMovingAverage:
+    """
+    Simple EMA for model parameters (Mean-Teacher style).
+    - Tracks a shadow copy of parameters and updates as: ema = decay * ema + (1-decay) * param
+    - Can temporarily apply EMA weights to a model and restore the original weights.
+    """
+    def __init__(self, model: torch.nn.Module, decay: float = 0.99):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = None
+        self._build_shadow(model)
+
+    def _iter_named_params(self, model: torch.nn.Module):
+        for name, p in model.named_parameters():
+            if p is not None and p.data is not None:
+                yield name, p
+
+    def _build_shadow(self, model: torch.nn.Module):
+        self.shadow.clear()
+        for name, p in self._iter_named_params(model):
+            # clone to ensure independent storage; keep device/dtype
+            self.shadow[name] = p.data.detach().clone()
+
+    def reset(self, model: torch.nn.Module):
+        self._build_shadow(model)
+
+    def set_state(self, state: dict):
+        # load saved shadow state (keys must match current model params)
+        self.shadow = {k: v.clone() for k, v in state.items()}
+
+    def state_dict(self):
+        return {k: v.detach().clone() for k, v in self.shadow.items()}
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        d = self.decay
+        for name, p in self._iter_named_params(model):
+            if name in self.shadow:
+                self.shadow[name].mul_(d).add_(p.data, alpha=(1.0 - d))
+            else:
+                # new param appeared (unlikely) -> initialize directly
+                self.shadow[name] = p.data.detach().clone()
+
+    def apply_to(self, model: torch.nn.Module) -> bool:
+        """Swap model params with EMA shadow (and backup originals). Returns True if applied."""
+        if self.backup is not None:
+            return False  # already applied
+        self.backup = {}
+        for name, p in self._iter_named_params(model):
+            self.backup[name] = p.data.detach().clone()
+            if name in self.shadow:
+                p.data.copy_(self.shadow[name])
+        return True
+
+    def restore(self, model: torch.nn.Module):
+        if self.backup is None:
+            return
+        for name, p in self._iter_named_params(model):
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = None
 
 def load_state_dict_with_log(module: torch.nn.Module, sd: dict, model_name: str, strict: bool = False):
     """
@@ -400,11 +463,11 @@ def train(args):
     run = wandb.init(project="stream_teacher_student", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
     vkitti_rgb, vkitti_depth = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
     vkitti_ds = KITTIVideoDataset(rgb_paths=vkitti_rgb, depth_paths=vkitti_depth, clip_len=CLIP_LEN, resize_size=518, split="train")
 
-    gta_root = "/workspace/Video-Depth-Anything/datasets/GTAV_720/GTAV_720"
+    gta_root = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/GTAV_720/GTAV_720"
     gta_rgb, gta_depth, _ = get_GTA_paths(gta_root, split="train")
     gta_ds = GTADataset(rgb_paths=gta_rgb, depth_paths=gta_depth, clip_len=CLIP_LEN, resize_size=518, split="train")
 
@@ -452,9 +515,28 @@ def train(args):
     optimizer = torch.optim.AdamW(student_params, lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
-    # Loss
-    loss_tgm = LossTGMVector(diff_depth_th=0.05)
-    loss_ssi = Loss_ssi_basic()
+    # EMA for student parameters (stabilize eval/inference)
+    ema_decay = hyper_params.get("ema_decay", 0.99)
+    ema = ExponentialMovingAverage(model.student, decay=ema_decay)
+
+    # Loss (저자 구현)
+    #   - spatial: TrimmedProcrustesLoss (SSI 성질 + GradientLoss)
+    #   - stable : TemporalGradientMatchingLoss (TGM 성질)
+    # ratio_ssi / ratio_tgm은 각각 spatial / stable 가중치로 사용
+    video_loss = VideoDepthLoss(
+        alpha=0.5,         # spatial 내부의 spatial+grad tradeoff(저자 기본)
+        scales=4,          # spatial의 다중스케일 gradient
+        trim=0.4,          # trimmed-MAE 비율
+        stable_scale=0.05,  # 여기선 1.0 고정 후 ratio_tgm로 외부 가중
+        reduction="batch-based"
+    )
+    stream_tgm = StreamingTemporalConsistencyLoss(
+        diff_ratio=0.01,   # 정적 판정 엄격(0.01~0.02 권장)
+        trim=0.4,          # outlier 억제(스트리밍 추천값)
+        huber_delta=0.03,  # 허버 델타(단위: 정규화 후)
+        lambda_accel=0.2,  # 가속도 항 가중(0~0.3 사이)
+        range_norm=True
+    )
     scaler = GradScaler()
 
     # ----- Resume (optional) -----
@@ -487,6 +569,14 @@ def train(args):
         if "scheduler_state_dict" in ckpt:
             try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             except Exception as e: logger.warning(f"Scheduler state load skipped: {e}")
+
+        # EMA state (optional)
+        if "ema_state_dict" in ckpt:
+            try:
+                ema.set_state(ckpt["ema_state_dict"])
+                logger.info("[resume] EMA state restored.")
+            except Exception as e:
+                logger.warning(f"[resume] EMA state restore skipped: {e}")
 
         # 3) 베스트 스코어 & 스타트 에폭
         if "best_val_delta1" in ckpt:
@@ -642,40 +732,6 @@ def train(args):
                 mask_float_4d = mask_bool_4d.float()                 # [B,1,H,W]   float
                 mask_t = mask_bool_5d.float()                        # [B,1,1,H,W] float (OLS용)
 
-                # --- 프레임별 디버깅 ---
-                # raw depth 통계
-                y_min = float(y_t.min().item())
-                y_max = float(y_t.max().item())
-
-                # masked depth 통계
-                valid_pix = int(mask_bool_5d.sum().item())
-                total_pix = mask_bool_5d.numel()
-                valid_pct = 100.0 * valid_pix / max(1, total_pix)
-
-                if valid_pix > 0:
-                    y_masked = y_t[mask_bool_5d]                     # 1D 텐서
-                    y_mask_min = float(y_masked.min().item())
-                    y_mask_max = float(y_masked.max().item())
-                else:
-                    y_mask_min = float('nan')
-                    y_mask_max = float('nan')
-
-                # 데이터 도메인별 커버리지
-                vk_total_pix = int(tag_vkit.expand_as(mask_bool_5d).to(torch.int).sum().item())
-                gta_total_pix = total_pix - vk_total_pix
-                vk_valid_pix  = int((mask_bool_5d & tag_vkit).to(torch.int).sum().item())
-                gta_valid_pix = valid_pix - vk_valid_pix
-                vk_valid_pct  = 100.0 * vk_valid_pix  / max(1, vk_total_pix)
-                gta_valid_pct = 100.0 * gta_valid_pix / max(1, gta_total_pix)
-
-                logger.info(
-                    f"[DEBUG] t={t} raw=({y_min:.3g},{y_max:.3g}) "
-                    f"masked=({y_mask_min:.3g},{y_mask_max:.3g}) "
-                    f"valid={valid_pix}/{total_pix} ({valid_pct:.2f}%) | "
-                    f"VK valid={vk_valid_pix}/{vk_total_pix} ({vk_valid_pct:.2f}%), "
-                    f"GTA valid={gta_valid_pix}/{gta_total_pix} ({gta_valid_pct:.2f}%)"
-                )
-
                 # --- Teacher window 준비 ---
                 if teacher_frame_buffer is None:
                     teacher_frame_buffer = x_t.detach().clone().repeat(1, CLIP_LEN, 1, 1, 1)  # buffer가 없으면, 현재 프레임으로 채우기
@@ -754,39 +810,41 @@ def train(args):
                         else:
                             kd_loss = pred_t_raw.new_tensor(0.0)
 
-                    # ----- Depth Loss -----
-                    disp_normed_t = norm_ssi(y[:, t:t+1], mask_bool_5d).squeeze(2)  # [B,1,H,W], normed disparity
-                    gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W], align용
+                    # ----- Depth (저자 Loss) -----
+                    # 1) 예측 depth 양수화(외부 정렬/정규화 금지)
+                    eps = 1e-6
+                    pred_depth_t = F.softplus(pred_t_raw.nan_to_num(0.0)) + eps   # [B,H,W]
 
-                    with torch.no_grad():
-                        a_star, b_star = batch_ls_scale_shift(pred_t_raw, gt_disp_t, mask_t)  # mask_t: [B,1,1,H,W] float
+                    # 2) GT depth/마스크 정리 (bool→float는 손실 호출 직전에만)
+                    gt_depth_t   = torch.nan_to_num(y_t.squeeze(1).squeeze(1), nan=0.0, posinf=1000.0, neginf=0.0)  # [B,1,H,W] -> [B,H,W]
+                    mask_t_float = mask_bool_4d.float()                          # [B,1,H,W] float
 
-                    pred_t_aligned_disp   = (a_star.detach() * pred_t_raw.unsqueeze(1) + b_star.detach()).squeeze(1)  # [B,1,H,W] -> [B,H,W]
-                    pred_t_aligned_depth  = 1.0 / (pred_t_aligned_disp.clamp(min=1e-6))
-
-                    # SSI 손실 (4D float 마스크)
-                    ssi_loss_t = loss_ssi(
-                        pred_t_aligned_disp.unsqueeze(1),  # [B,1,H,W]
-                        disp_normed_t,                     # [B,1,H,W]
-                        mask_float_4d                      # [B,1,H,W]
-                    )
-
-                    # TGM 손실 (t>0일 때만, bool 4D 마스크)
-                    if t > 0:
-                        # 이전 프레임 정렬값 계산은 여기서!
-                        prev_aligned_disp  = (a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()).squeeze(1)
-                        prev_aligned_depth = 1.0 / (prev_aligned_disp.clamp(min=1e-6))
-                        curr_aligned_depth = pred_t_aligned_depth
-
-                        pred_pair = torch.stack([prev_aligned_depth, curr_aligned_depth], dim=1)  # [B,2,H,W]
-                        y_pair    = torch.cat([prev_y, y[:, t:t+1]], dim=1)                       # [B,2,1,H,W]
-
-                        m_pair_bool4 = torch.cat([prev_mask_bool4, mask_bool_4d], dim=1)          # [B,2,H,W]
-                        tgm_loss  = loss_tgm(pred_pair, y_pair, m_pair_bool4)
+                    # 3) 2-프레임 윈도우 구성
+                    #    - stable_loss가 시간차분을 보려면 최소 2프레임 필요
+                    #    - 메모리로 이전 프레임을 보관
+                    if t == 0:
+                        # 첫 프레임은 spatial만 의미 있게 학습(시간항 없음)
+                        P = pred_depth_t.unsqueeze(1)    # [B,1,H,W]
+                        G = gt_depth_t.unsqueeze(1)      # [B,1,H,W]  ← 이제 target도 채널=1만 있는 4D, flatten(0,1) 후 (B,H,W)로 일치
+                        M = mask_t_float                 # [B,1,H,W]
+                        loss_dict = video_loss(
+                            prediction=P, target=G, mask=M
+                        )
+                        spatial = loss_dict["spatial_loss"]
+                        stable  = pred_depth_t.sum()*0.0
                     else:
-                        tgm_loss  = pred_t_raw.new_tensor(0.0)
+                        # 두 프레임 윈도우 [t-1, t]
+                        P = torch.stack([prev_pred_depth_t, pred_depth_t], dim=1)   # [B,2,H,W]
+                        G = torch.stack([prev_gt_depth_t,   gt_depth_t],   dim=1)   # [B,2,H,W]
+                        M = torch.stack([prev_mask_float,   mask_t_float.squeeze(1)], dim=1)  # [B,2,H,W]
+                        loss_dict = video_loss(
+                            prediction=P, target=G, mask=M
+                        )
+                        spatial = loss_dict["spatial_loss"]
+                        stable  = loss_dict["stable_loss"]
 
-                    loss = kd_loss + ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                    # 4) 총합 손실 조립: KD + (ratio_ssi * spatial) + (ratio_tgm * stable)
+                    loss = kd_loss + ratio_ssi * spatial + ratio_tgm * stable
 
                 # --- 누적/업데이트 ---
                 accum_loss += loss / update_frequency
@@ -797,25 +855,36 @@ def train(args):
                     scaler.scale(accum_loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
+                    # EMA update after successful optimizer step
+                    try:
+                        ema.update(model.student)
+                    except Exception as e:
+                        logger.warning(f"EMA update skipped: {e}")
                     epoch_loss += accum_loss.item()
                     accum_loss = 0.0
                     step_in_window = 0
 
                 # --- 상태 업데이트 ---
                 cache = _detach_cache(cache)
-                prev_pred_raw   = pred_t_raw.detach()
-                prev_mask_bool4 = mask_bool_4d
-                prev_y          = y[:, t:t+1]
-                # 보조 distill용 캐시 보관(teacher 사용 시에만)
-                prev_t_cache = t_cache_last if use_teacher else prev_t_cache
-                prev_s_cache = s_cache_last
+
+                # 저자 loss용 상태(다음 프레임 윈도우)
+                prev_pred_depth_t = pred_depth_t.detach()                         # [B,H,W]
+                prev_gt_depth_t   = gt_depth_t.detach()                           # [B,H,W]
+                prev_mask_float   = mask_t_float.squeeze(1).detach()              # [B,H,W]
+
+                # KD용 상태(기존 유지)
+                prev_pred_raw     = pred_t_raw.detach()
+                prev_mask_bool4   = mask_bool_4d
+                prev_y            = y[:, t:t+1]
+                prev_t_cache      = t_cache_last if use_teacher else prev_t_cache
+                prev_s_cache      = s_cache_last
 
                 # --- 통계 ---
                 B_eff = pred_t_raw.shape[0]
                 epoch_frames += B_eff
-                epoch_ssi    += ssi_loss_t.item() * B_eff
-                epoch_tgm    += tgm_loss.item()  * B_eff
-                epoch_kd     += kd_loss.item()   * B_eff
+                epoch_ssi    += (ratio_ssi * spatial.detach().item()) * B_eff
+                epoch_tgm    += (ratio_tgm * stable.detach().item())  * B_eff
+                epoch_kd     += kd_loss.detach().item()               * B_eff
 
                 frame_pbar.set_postfix({
                     'SSI': f'{epoch_ssi/ max(1, epoch_frames):.4f}',
@@ -823,11 +892,28 @@ def train(args):
                     'KD':  f'{epoch_kd / max(1, epoch_frames):.4f}'
                 })
             frame_pbar.close()
+            # --- (배치 끝) 남은 누적 스텝 처리 ---
+            if step_in_window > 0:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(accum_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                try:
+                    ema.update(model.student)
+                except Exception as e:
+                    logger.warning(f"EMA update skipped: {e}")
+                epoch_loss += accum_loss.item()
+                accum_loss = 0.0
+                step_in_window = 0
+
         batch_pbar.close()
 
         # --- Mini Real-pipeline Validation ---
         # (학생만 평가, infer_stream+eval과 동일 경로 축소판)
-        val_metrics = validate_with_infer_eval_subset(
+        # Use EMA weights for validation for stable eval
+        _ema_applied = ema.apply_to(model.student)
+        try:
+            val_metrics = validate_with_infer_eval_subset(
             model=model.student,
             json_file=args.val_json_file,
             infer_path=args.val_infer_dir,
@@ -837,7 +923,10 @@ def train(args):
             input_size=518,
             scene_indices=[1, 39, 44, 93],
             fp32=True
-        )
+            )
+        finally:
+            if _ema_applied:
+                ema.restore(model.student)
         val_avg = val_metrics.get("avg", {})
         per_val_scene = val_metrics.get("per_scene", [])
         val_absrel = float(val_avg.get("abs_relative_difference", float('nan')))
@@ -872,17 +961,25 @@ def train(args):
         if val_delta1 > best_delta1:
             best_delta1 = val_delta1
             best_epoch  = epoch
-            torch.save({
+            # Save best with EMA weights
+            _ema_applied = ema.apply_to(model.student)
+            try:
+                torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.student.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_delta1": best_delta1,
                 "config": hyper_params,
-            }, best_model_path)
+                "ema_state_dict": ema.state_dict(),
+                }, best_model_path)
+            finally:
+                if _ema_applied:
+                    ema.restore(model.student)
             logger.info(f"🏆 Best model saved! Epoch {epoch}, Val delta1: {best_delta1:.4f}")
 
         # latest 저장
+        # Save latest with EMA state (weights saved are raw model weights; EMA state stored separately)
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.student.state_dict(),
@@ -892,6 +989,7 @@ def train(args):
             "val_delta1": val_delta1,
             "val_rmse":   val_rmse,
             "config": hyper_params,
+            "ema_state_dict": ema.state_dict(),
         }, latest_model_path)
         logger.info(f"📁 Latest model saved to {latest_model_path}")
 
@@ -913,7 +1011,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
     # real-pipeline mini-validation 설정
-    parser.add_argument("--val_json_file",    type=str, default="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
+    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
