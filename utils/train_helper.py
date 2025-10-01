@@ -863,19 +863,70 @@ def _depth2disp_np(depth):
     disp[m] = 1.0 / depth[m]
     return disp
 
-def _ls_align_disparity(infs, gts, valid_mask):
+def _ls_align_disparity(pred_disp, gt_depth, valid_mask, eps=1e-6):
     """
-    disparity 선형 정렬: (scale, shift)로 infs를 gts에 맞추되
-    eval.py의 방식 그대로 numpy lstsq 사용.
-    """
-    gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
-    infs = np.clip(infs, a_min=1e-3, a_max=None)
-    pred_disp_masked = infs[valid_mask].reshape((-1, 1)).astype(np.float64)
+    pred_disp: np.ndarray [H,W] 또는 torch.Tensor → disparity(예측)
+    gt_depth : np.ndarray [H,W] 또는 torch.Tensor → depth(GT)
+    valid_mask: np.ndarray[bool] [H,W] 또는 torch.Tensor(bool/float) → 유효 마스크
 
-    A = np.concatenate([pred_disp_masked, np.ones_like(pred_disp_masked)], axis=-1)  # [P,2]
-    X = np.linalg.lstsq(A, gt_disp_masked, rcond=None)[0]  # [2,1]
-    scale, shift = X[0, 0], X[1, 0]
-    aligned = np.clip(scale * infs + shift, a_min=1e-3, a_max=None)
+    반환: aligned_disp (pred_disp를 GT에 정렬한 disparity)
+    """
+    # ---- 텐서/넘파이 정규화 ----
+    if 'torch' in str(type(pred_disp)):
+        pred_disp = pred_disp.detach().cpu().numpy()
+    if 'torch' in str(type(gt_depth)):
+        gt_depth = gt_depth.detach().cpu().numpy()
+    if 'torch' in str(type(valid_mask)):
+        valid_mask = valid_mask.detach().cpu().numpy()
+
+    pred_disp = np.asarray(pred_disp, dtype=np.float64)
+    gt_depth  = np.asarray(gt_depth,  dtype=np.float64)
+    # mask를 bool로
+    m = np.asarray(valid_mask > 0.5 if valid_mask.dtype != np.bool_ else valid_mask, dtype=np.bool_)
+
+    # ---- 사전 정리: NaN/Inf 제거 & 분모 보호 ----
+    # GT disparity
+    gt_disp = 1.0 / np.clip(gt_depth, eps, np.inf)
+    # 예측/GT의 NaN/Inf 정리
+    pred_disp = np.nan_to_num(pred_disp, nan=0.0, posinf=0.0, neginf=0.0)
+    gt_disp   = np.nan_to_num(gt_disp,   nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 최종 유효 마스크: m & finite
+    finite_m = np.isfinite(pred_disp) & np.isfinite(gt_disp)
+    m = m & finite_m
+
+    n_valid = int(m.sum())
+    if n_valid < 2:
+        # 유효 픽셀 너무 적으면 항등 정렬(s=1,t=0)
+        return pred_disp.copy()
+
+    # ---- 폐형식 해(분산/공분산) ----
+    # s = cov(x,y) / var(x),  t = mean(y) - s * mean(x)
+    x = pred_disp[m]
+    y = gt_disp[m]
+
+    mean_x = x.mean()
+    mean_y = y.mean()
+    dx = x - mean_x
+    dy = y - mean_y
+
+    var_x = (dx * dx).sum()
+    if var_x <= eps or not np.isfinite(var_x):
+        # 분산이 0에 가깝거나 비정상 → 항등 정렬
+        return pred_disp.copy()
+
+    cov_xy = (dx * dy).sum()
+    s = cov_xy / (var_x + eps)
+    t = mean_y - s * mean_x
+
+    # 수치적 이상치 방어
+    if not np.isfinite(s):
+        s = 1.0
+    if not np.isfinite(t):
+        t = 0.0
+
+    aligned = s * pred_disp + t
+    aligned = np.nan_to_num(aligned, nan=0.0, posinf=0.0, neginf=0.0)
     return aligned
 
 def _dataset_eval_defaults(dataset_tag):
