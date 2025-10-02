@@ -12,7 +12,7 @@ import math
 import warnings
 from dotenv import load_dotenv
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset  # Subset 추가
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -29,7 +29,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 31
+experiment = 312
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +194,12 @@ def _detach_cache(cache):
         return cache.detach()
     return cache
 
+def make_random_subset(dataset, n_samples):
+    total = len(dataset)
+    n_samples = min(n_samples, total)
+    indices = random.sample(range(total), n_samples)
+    return Subset(dataset, indices)
+
 # ================ 학습 루프 ================
 def train(args):
     OUTPUT_DIR = f"outputs/experiment_{experiment}"
@@ -234,10 +240,10 @@ def train(args):
     run = wandb.init(project="stream_teacher_student", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
     rgb_clips, depth_clips = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
     kitti_train = KITTIVideoDataset(rgb_paths=rgb_clips, depth_paths=depth_clips, resize_size=518, split="train")
-    kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     # 모델 (단일 GPU)
     teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
@@ -327,52 +333,73 @@ def train(args):
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
     
-    # ---- Init real-pipeline validation (epoch = -1) ----
-    # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
-    init_infer_dir = os.path.join(args.val_infer_dir, "init")
-    os.makedirs(init_infer_dir, exist_ok=True)
+    if not args.test:
+        # ---- Init real-pipeline validation (epoch = -1) ----
+        # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
+        init_infer_dir = os.path.join(args.val_infer_dir, "init")
+        os.makedirs(init_infer_dir, exist_ok=True)
 
-    # 일시적으로 eval 모드
-    _prev_train_state = model.student.training
-    model.student.eval()
-    try:
-        init_metrics = validate_with_infer_eval_subset(
-            model=model.student,                          # 학생만 사용
-            json_file=args.val_json_file,                 # e.g., scannet_video_500.json
-            infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
-            dataset=args.val_dataset_key,                 # 'scannet'
-            dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            input_size=518,
-            scenes_to_eval=args.val_scenes,               # 2 scenes subset
-            fp32=True
-        )
-    finally:
-        # 원래 학습 모드 복귀
-        if _prev_train_state:
-            model.student.train()
+        # 일시적으로 eval 모드
+        _prev_train_state = model.student.training
+        model.student.eval()
+        try:
+            init_metrics = validate_with_infer_eval_subset(
+                model=model.student,                          # 학생만 사용
+                json_file=args.val_json_file,                 # e.g., scannet_video_500.json
+                infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
+                dataset=args.val_dataset_key,                 # 'scannet'
+                dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                input_size=518,
+                scenes_to_eval=args.val_scenes,               # 2 scenes subset
+                fp32=True
+            )
+        finally:
+            # 원래 학습 모드 복귀
+            if _prev_train_state:
+                model.student.train()
 
-    init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-    init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-    init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+        init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
+        init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
+        init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
 
-    # 콘솔/파일 로그
-    logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
+        # 콘솔/파일 로그
+        logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
 
-    # W&B 로깅 (epoch=-1로 표기)
-    wandb.log({
-        "init/absrel": init_absrel,
-        "init/rmse":   init_rmse,
-        "init/delta1": init_delta1,
-        "epoch": -1,
-    })
+        # W&B 로깅 (epoch=-1로 표기)
+        wandb.log({
+            "init/absrel": init_absrel,
+            "init/rmse":   init_rmse,
+            "init/delta1": init_delta1,
+            "epoch": -1,
+        })
 
-    # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
-    best_delta1 = init_delta1
+        # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
+        best_delta1 = init_delta1
 
 
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
+        epoch_sample_size = 3 if args.test else 100
+        random.seed(12345 + epoch)
+        subset = make_random_subset(kitti_train, epoch_sample_size)
+
+        # 이 에폭에서만 사용할 DataLoader
+        train_loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        batch_pbar = tqdm(
+            enumerate(train_loader),
+            desc=f"Epoch {epoch+1}/{num_epochs} - Batches",
+            total=len(train_loader),
+            leave=False
+        )
+        
         model.train()
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = epoch_kd = 0.0
@@ -384,10 +411,6 @@ def train(args):
         in_stage2 = (epoch >= num_epochs - stage2_epochs)
         use_teacher_prob = (0.0 if not in_stage2 else (1.0 - teacher_drop_p_stage2))
 
-        batch_pbar = tqdm(enumerate(kitti_train_loader),
-                          desc=f"Epoch {epoch+1}/{num_epochs} - Batches",
-                          total=len(kitti_train_loader),
-                          leave=False)
         for batch_idx, (x, y) in batch_pbar:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -536,7 +559,7 @@ def train(args):
 
         # 로깅
         wandb.log({
-            "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
+            "train/loss": epoch_loss / max(1, len(train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
             "train/kd":   epoch_kd   / max(1, epoch_frames),
@@ -593,12 +616,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
     # real-pipeline mini-validation 설정
-    parser.add_argument("--val_json_file",    type=str, default="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
+    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
     parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
+    parser.add_argument("--test", action='store_true', help="If set, only run validation without training")
     args = parser.parse_args()
     train(args)
