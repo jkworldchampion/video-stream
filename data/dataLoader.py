@@ -21,8 +21,7 @@ def get_random_crop_params_with_rng(img, output_size, rng):
     j = rng.randint(0, w - tw)
     return i, j, th, tw
 
-
-def get_data_list(root_dir, data_name, split, clip_len=16, condition_num=10, difficulties=None):
+def get_data_list(root_dir, data_name, split, clip_len=32, condition_num=10, difficulties=None):
     """
     data path랑 clip_len, 원하는 데이터 개수 or idx 개수만큼 리스트로 쌓아주는 함수
     """
@@ -150,7 +149,6 @@ def get_tartanair_paths(root_dir, envs, difficulties, cams):
             
     return scene_img_lists, scene_dep_lists, scene_pose_lists
 
-
 def quaternion_to_rotmat(q):
     q = q / np.linalg.norm(q)
     qx, qy, qz, qw = q
@@ -261,22 +259,18 @@ def get_kitti_individuals(video_info, clip_len, split):
         if len(rgb_files) != len(depth_files):
             continue
 
-        n = len(rgb_files) // clip_len # 즉 이제 n은 몫이에요
-
-        x_clips.append([os.path.join(rgb_dir,f) for f in rgb_files[:n*clip_len]])
-        y_clips.append([os.path.join(depth_dir,f) for f in depth_files[:n*clip_len]])
+        # 전체 프레임을 그대로 보존, sliding 방식으로 잘라서 사용하려고
+        x_clips.append([os.path.join(rgb_dir, f) for f in rgb_files])
+        y_clips.append([os.path.join(depth_dir, f) for f in depth_files])
         intrin_clips.append(intrinsic_file)
         extrin_clips.append(extrinsic_file)
         cam_ids.append(camera_id)
 
-    
     if split == "train":
         return x_clips, y_clips
     else:
-        return x_clips, y_clips , cam_ids, intrin_clips, extrin_clips 
-    
-    
-    
+        return x_clips, y_clips, cam_ids, intrin_clips, extrin_clips
+
 def get_kitti_video_path(root_dir, condition_num, split, binocular):
     """
     condition_num: 각 scene에서 몇 개의 condition을 가져올지
@@ -311,10 +305,6 @@ def get_kitti_video_path(root_dir, condition_num, split, binocular):
             continue
 
         for idx, condition in enumerate(sorted(os.listdir(scene_rgb_path))):
-            
-            if condition not in {"15-deg-left","30-deg-left","15-deg-right","rain"}:
-                continue
-                
             print(f"Processing scene: {scene}, condition: {condition}")
             cond_rgb_path = os.path.join(scene_rgb_path, condition)
             cond_depth_path = os.path.join(scene_depth_path, condition)
@@ -359,6 +349,7 @@ def get_kitti_video_path(root_dir, condition_num, split, binocular):
     
     return video_infos
 
+
 class KITTIVideoDataset(Dataset):
     def __init__(
         self,
@@ -372,16 +363,23 @@ class KITTIVideoDataset(Dataset):
         rgb_std=(0.229, 0.224, 0.225),
         resize_size=350,
         split="train",
-        clip_len=16,
+        clip_len=32,
+        per_epoch_samples=407,  # 기존과 동일하게 뽑을라고 407로 함
+        min_stride=4,          # 같은 씬에서 뽑을 때 최소 간격, 적어도 반은 다르게
+        balance_mode="proportional",  # "proportional" or "uniform"
+        use_shift=False,        # sliding이면 보통 False로 권장
+        sampling_mode="global_weighted",
     ):
         super().__init__()
-        assert split in ["train", "val"]
+        assert split in ["train", "val"]   # 지금은 val 다르게해서 안쓰는데, 그냥 남김
         assert len(rgb_paths) == len(depth_paths)
+        
         self.rgb_paths = rgb_paths
         self.depth_paths = depth_paths
         self.intrin_clips  = intrin_clips
         self.extrin_clips  = extrin_clips
         self.cam_ids = cam_ids
+
         self.rgb_mean = rgb_mean
         self.rgb_std = rgb_std
         self.resize_size = resize_size
@@ -390,36 +388,164 @@ class KITTIVideoDataset(Dataset):
         self.epoch = 0
         self.clip_len = clip_len
 
-        # scene별로  effective clip 계산
-        scene_clip_counts = [
-            len(scene_rgb)//clip_len - 1  # 마지막 클립은 버리기 -> 오버플로 방지
-            for scene_rgb in self.rgb_paths
-        ]
+        self.per_epoch_samples = per_epoch_samples
+        self.min_stride = max(1, int(min_stride))
+        self.balance_mode = balance_mode
+        self.use_shift = use_shift
+        self.sampling_mode = sampling_mode
 
-        # 총 클립 개수
-        self.total_clips = sum(scene_clip_counts)
+        if split == "train":
+            # 각 scene별로 모든 시작 index후보 추출
+            self.starts_per_scene = []
+            total_candidates = 0
+            for scene_rgb in self.rgb_paths:
+                T = len(scene_rgb)
+                starts = list(range(0, max(0, T - self.clip_len + 1)))
+                self.starts_per_scene.append(starts)
+                total_candidates += len(starts)
 
-        # flat idx -> scene_idx, chunk_idx
-        self.flat2scene = [0] * self.total_clips
-        self.flat2chunk = [0] * self.total_clips
+            # per-epoch 샘플 수가 None이면 전체 사용, 아니면 지정값으로
+            self.samples_per_epoch = self.per_epoch_samples or total_candidates
 
-        ptr = 0
-        for scene_idx, n_eff in enumerate(scene_clip_counts):
-            for chunk_idx in range(n_eff):
-                self.flat2scene[ptr] = scene_idx
-                self.flat2chunk[ptr] = chunk_idx
-                ptr += 1
-        
-        if split == "train" :
-            print("train_VKITTI_total_clips : ",self.total_clips)
-        else :
-            print("val_VKITTI_total_clips : ",self.total_clips)
-        
+            # # 활성 인덱스 컨테이너 (매 epoch 갱신)
+            self.active_scene_idx = []
+            self.active_start_idx = []
+
+            # 첫 epoch 구성
+            self.set_epoch(0)
+
+            print(f"train_VKITTI_total_candidates : {total_candidates}")
+            print(f"train_VKITTI_active_clips(per-epoch) : {self.__len__()}")
+
+        else:
+            # val은 기존 비슬라이딩(몫-1) 로직 유지, 그냥 남긴거임
+            scene_clip_counts = [
+                len(scene_rgb) // self.clip_len - 1
+                for scene_rgb in self.rgb_paths
+            ]
+            self.flat2scene, self.flat2chunk = [], []
+            for si, n_eff in enumerate(scene_clip_counts):
+                for ci in range(n_eff):
+                    self.flat2scene.append(si)
+                    self.flat2chunk.append(ci)
+            print("val_VKITTI_total_clips : ", len(self.flat2scene))
+
+    # ---------- 내부 유틸 ----------
+    @staticmethod
+    def _sample_with_min_gap(starts, k, gap, rng):
+        """
+            같은 씬에서 시작 인덱스를 최소 간격 gap 이상 띄워서 k개 샘플링.
+            간단한 greedy 랜덤 선택. (407 기준 충분히 빠름)
+        """
+        if k <= 0 or len(starts) == 0:
+            return []
+        pool = list(starts)
+        rng.shuffle(pool)
+        sel = []
+        while pool and len(sel) < k:
+            s = pool.pop()
+            if all(abs(s - t) >= gap for t in sel):
+                sel.append(s)
+                # 근접 후보들 제거
+                pool = [p for p in pool if abs(p - s) >= gap]
+        return sel
+
+    def _build_epoch_active_list(self):
+        rng = random.Random(self.seed + self.epoch * 1000003)
+
+        cand_counts = [len(st) for st in self.starts_per_scene]
+        total_cands = sum(cand_counts)
+        K = min(self.samples_per_epoch, total_cands)
+
+        # --- 새 전역 가중치 샘플링 ---
+        if self.sampling_mode == "global_weighted":
+            flat = []
+            weights = []
+            S = len(self.starts_per_scene)
+
+            if self.balance_mode == "uniform":
+                # 씬별 총확률 = 1/S, 씬 내부는 균등 → 후보 하나당 1/(S*len(scene))
+                for si, starts in enumerate(self.starts_per_scene):
+                    if not starts: 
+                        continue
+                    w_per = 1.0 / max(1, S) / max(1, len(starts))
+                    for s in starts:
+                        flat.append((si, s))
+                        weights.append(w_per)
+            else:  # "proportional": 모든 후보 동일 확률
+                for si, starts in enumerate(self.starts_per_scene):
+                    for s in starts:
+                        flat.append((si, s))
+                weights = [1.0 / max(1, len(flat))] * len(flat)
+
+            # 가중치로 전역에서 중복 없이 K개 추출
+            import numpy as np
+            W = np.array(weights, dtype=np.float64)
+            W /= W.sum()
+            rng_np = np.random.default_rng(self.seed + self.epoch * 100003)
+            sel = rng_np.choice(len(flat), size=K, replace=False, p=W)
+
+            pairs = [flat[i] for i in sel]
+            self.active_scene_idx = [p[0] for p in pairs]
+            self.active_start_idx = [p[1] for p in pairs]
+            return
+
+        # --- 기존 층화+간격 방식(원래 네 코드) ---
+        # (아래는 네 코드 그대로 유지)
+        S = len(self.starts_per_scene)
+        if total_cands == 0:
+            self.active_scene_idx, self.active_start_idx = [], []
+            return
+
+        if self.balance_mode == "uniform":
+            base = K // S
+            quota = [min(base, c) for c in cand_counts]
+            rem = K - sum(quota)
+            idxs = list(range(S))
+            rng.shuffle(idxs)
+            for i in idxs:
+                if rem <= 0: break
+                if quota[i] < cand_counts[i]:
+                    quota[i] += 1
+                    rem -= 1
+        else:  # proportional
+            quota = [int(round(K * c / max(1, total_cands))) for c in cand_counts]
+            diff = K - sum(quota)
+            order = sorted(range(S), key=lambda i: cand_counts[i] - quota[i], reverse=True)
+            for i in order:
+                if diff == 0: break
+                can_add = max(0, cand_counts[i] - quota[i])
+                add = min(diff, can_add)
+                quota[i] += add
+                diff -= add
+
+        active_pairs = []
+        for si, (starts, q) in enumerate(zip(self.starts_per_scene, quota)):
+            if q <= 0: continue
+            picked = self._sample_with_min_gap(starts, q, self.min_stride, rng)
+            if len(picked) < q:
+                remain = [s for s in starts if s not in picked]
+                rng.shuffle(remain)
+                picked += remain[:(q - len(picked))]
+            active_pairs.extend([(si, s) for s in picked])
+
+        rng.shuffle(active_pairs)
+        active_pairs = active_pairs[:K]
+        self.active_scene_idx = [p[0] for p in active_pairs]
+        self.active_start_idx = [p[1] for p in active_pairs]
+
+
+    # ---------- 공개 API ----------
     def set_epoch(self, epoch):
-        self.epoch = epoch
+        self.epoch = int(epoch)
+        if self.split == "train":
+            self._build_epoch_active_list()
 
     def __len__(self):
-        return self.total_clips
+        if self.split == "train":
+            return len(self.active_scene_idx)
+        else:
+            return len(self.flat2scene)
 
     def load_depth(self, path):
         depth_png = Image.open(path)
@@ -496,55 +622,34 @@ class KITTIVideoDataset(Dataset):
     
     
     def __getitem__(self, idx):
-        """
-        지금 여기에 들어온 rgb_paths들은 그냥 전체 데이터를 가지고 있음  -> 이중리스트로 가지고있음 scene별로
-        end_idx로 이걸 적절히 핸들링 해야함
-        현재 받아오는 idx는 전체 영상길이 / clip_len으로 할거임 -> 아 이러면 안되는게, scene별로 나눠지는 몫 기준으로 해야함 ㅇㅇ 그치
-        무튼 일단 idx는 각 clip의 개수라고 생각해보자.
-
-        정리해보자면, idx는 clip idx를 넣어야함. 즉 
-        """
-
-        ## algorithm : 결국 start index만 잘 뽑으면 해결되는 문제임
-        ## 주의해야할 점은, 위에서 넘겨줄때 16으로 나눠 떨어지는거만 준게 아님.-> 이러면 문제가, 나머지가 각각 다르니까 그냥 clip len만큼으로 자르자. 수정했음
-        ## shift는 0부터 15까지 가능.
-        ## 64개 였다면, -> 이걸 나누기 16 하면 4개가 나오는데
-        """
-        remaining = idx ## 예를 들어 idx가 5이다. 즉 5번째 클립을 받는 타이밍이라고 해보자
-        for scene_idx, scene_rgb in enumerate(self.rgb_paths):
-            n_clips = len(scene_rgb)// self.clip_len    # 만약 1번째 씬이 64개라고 해보면, nclip = 4
-            effective = n_clips - 1 # 마지막꺼 버림 이슈 for overflow 방지
-            if remaining < effective:
-                break
-            remaining -= effective    # remaining = 2
-        chunk_idx = remaining   # for문을 나오고 나면, chunk idx는 scene_idx에 해당하는 씬의 몇번째 클립인지가 됨
-
-        -> 이거 오버헤드 너무큼 생각해보면. 위로 올리기
-        """
-
-                # 2) train split이면 여기서 바로 반환
+        # train
         if self.split == "train":
+            si = self.active_scene_idx[idx]
+            st = self.active_start_idx[idx]
 
-            scene_idx = self.flat2scene[idx]
-            chunk_idx = self.flat2chunk[idx]
+            scene_rgb_paths   = self.rgb_paths[si]
+            scene_depth_paths = self.depth_paths[si]
 
-            scene_rgb_paths   = self.rgb_paths[scene_idx]
-            scene_depth_paths = self.depth_paths[scene_idx]
+            # 슬라이딩 시작점 사용 (shift 불필요)
+            base = st
+            rgb_paths   = scene_rgb_paths  [base:base + self.clip_len]
+            depth_paths = scene_depth_paths[base:base + self.clip_len]
 
-            rng = random.Random(self.seed + self.epoch)
-            shift = rng.randint(0, self.clip_len-1)
+            # (선택) shift를 쓰고 싶다면, 아이템별 다른 시드로
+            if self.use_shift:
+                rng = random.Random(self.seed + self.epoch * 1000003 + idx)
+                shift = rng.randint(0, self.clip_len - 1)
+                base = max(0, min(base + shift, len(scene_rgb_paths) - self.clip_len))
+                rgb_paths   = scene_rgb_paths  [base:base + self.clip_len]
+                depth_paths = scene_depth_paths[base:base + self.clip_len]
 
-            base = shift + chunk_idx * self.clip_len
-            rgb_paths  = scene_rgb_paths[base:base+self.clip_len]
-            depth_paths= scene_depth_paths[base:base+self.clip_len]
-
-            #rgb_paths = self.rgb_clips[idx]
-            #depth_paths = self.depth_clips[idx]
+            # 공통 crop 시드(아이템별로 다르게)
+            rng = random.Random(self.seed + self.epoch * 9176 + idx)
 
             first = Image.open(rgb_paths[0]).convert("RGB")
             first = TF.resize(first, self.resize_size)
             i, j, th, tw = get_random_crop_params_with_rng(first, self.resize_size, rng)
-            
+
             rgb_seq, depth_seq = [], []
             for rp, dp in zip(rgb_paths, depth_paths):
                 img = Image.open(rp).convert("RGB")
@@ -560,15 +665,13 @@ class KITTIVideoDataset(Dataset):
 
             rgb_tensor = torch.stack(rgb_seq)     # [clip_len, 3, H, W]
             depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
-
             return rgb_tensor, depth_tensor
 
-
-        else :
-
+        # ====== VAL (기존 로직 유지) ======
+        else:
             scene_idx = self.flat2scene[idx]
             chunk_idx = self.flat2chunk[idx]
-            
+
             scene_rgb_paths   = self.rgb_paths[scene_idx]
             scene_depth_paths = self.depth_paths[scene_idx]
 
@@ -589,11 +692,10 @@ class KITTIVideoDataset(Dataset):
                 depth = TF.center_crop(depth, self.resize_size)
                 depth_seq.append(TF.to_tensor(depth))
 
-            rgb_tensor = torch.stack(rgb_seq)     # [clip_len, 3, H, W]
-            depth_tensor = torch.stack(depth_seq) # [clip_len, 1, H, W]
+            rgb_tensor = torch.stack(rgb_seq)
+            depth_tensor = torch.stack(depth_seq)
 
-            
-            # 3) val split일 때만 카메라 파라미터 로딩
+            # (필요 시) 카메라 파라미터는 기존 코드 그대로
             camera_id = self.cam_ids[scene_idx]
             intrinsic_file = self.intrin_clips[scene_idx]
             extrinsic_file = self.extrin_clips[scene_idx]
@@ -613,12 +715,12 @@ class KITTIVideoDataset(Dataset):
                 else:
                     fx, fy, cx, cy = intr_p
                 K = torch.tensor([[fx, 0.0, cx],
-                                [0.0, fy, cy],
-                                [0.0, 0.0, 1.0]], dtype=torch.float32)
+                                  [0.0, fy, cy],
+                                  [0.0, 0.0, 1.0]], dtype=torch.float32)
                 intrinsics_list.append(K)
 
-            extrinsics_tensor = torch.stack(extrinsics_list)   # [clip_len, 4, 4]
-            intrinsics_tensor = torch.stack(intrinsics_list)   # [clip_len, 3, 3]
+            extrinsics_tensor = torch.stack(extrinsics_list)
+            intrinsics_tensor = torch.stack(intrinsics_list)
             return rgb_tensor, depth_tensor, extrinsics_tensor, intrinsics_tensor
 
 
@@ -810,6 +912,7 @@ class GoogleDepthDataset(Dataset):
         disp = torch.from_numpy(np.array(disp_img, np.float32)).unsqueeze(0)
 
         return img,disp
+
 
 class CombinedDataset(Dataset):
     def __init__(self, kitti_dataset, google_dataset,ratio=4):

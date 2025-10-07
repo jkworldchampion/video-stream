@@ -5,6 +5,7 @@ import random
 
 import torch
 import torch.nn.functional as F
+from torch import amp
 import numpy as np
 import yaml
 import wandb
@@ -29,7 +30,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 31
+experiment = 313
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -89,87 +90,150 @@ def _gather_last_dim(x, idx):
         gidx = idx
     return torch.gather(x, dim=2, index=gidx)
 
+def _alias_cache_keys(c):
+    # 캐시에 'k_bh','v_bh','ctx_bh'만 있는 경우를 'K','V','context'로 별칭 매핑
+    out = dict(c)
+    if 'K' not in out and 'k_bh' in out: out['K'] = out['k_bh']
+    if 'V' not in out and 'v_bh' in out: out['V'] = out['v_bh']
+    if 'context' not in out and 'ctx_bh' in out: out['context'] = out['ctx_bh']
+    return out
+
+def _ensure_BPKC(x, ref_attn):
+    # x가 [B,P,K,C]가 아니면 가능한 한 [B,P,K,C]로 맞춤.
+    # 현재 캐시가 [B,P,K,C] 또는 [BP,K,C] 또는 [B,P,C] 등으로 올 수 있어 약식 normalize.
+    if x is None: return None
+    if x.dim() == 4:
+        return x
+    if x.dim() == 3:
+        # [B,P,C] 또는 [BP,K,C] 케이스를 ref_attn의 B,P,K로 리쉐이프 시도
+        B,P,K = ref_attn.shape
+        C = x.shape[-1]
+        num = x.numel() // C
+        if num == B*P*K:
+            return x.view(B,P,K,C)
+        if num == B*P:
+            # 키 길이가 1인 경우
+            return x.view(B,P,1,C)
+        if num == P*K:
+            # B가 1인 특수 케이스
+            return x.view(1,P,K,C)
+    return x  # 모양을 확신할 수 없으면 원본 유지
+
+def _safe_gather_last_dim(x, idx):
+    # gather index가 범위를 넘어가 device assert 나는 걸 방지
+    K = x.shape[2]
+    idx = idx.clamp(min=0, max=K-1)
+    if x.dim() == 4:
+        B,P,_,C = x.shape
+        R = idx.shape[-1]
+        gidx = idx.unsqueeze(-1).expand(B,P,R,C)
+        return torch.gather(x, dim=2, index=gidx)
+    else:
+        return torch.gather(x, dim=2, index=idx)
+
 def compute_kd_losses_from_caches(
     t_cache: dict, s_cache: dict,
     top_r: int = 64, top_u: int = 32,
     w_attn_kl: float = 1.0, w_kv_cos: float = 1.0, w_ctx_cos: float = 0.0,
     eps: float = 1e-8
 ):
-    """
-    정확한 KD: Attn-KL + KV-Cosine + (선택) Context Cosine
-    """
-    t_attn = t_cache.get("attn", None)    # [B,P,Kt]
-    s_attn = s_cache.get("attn", None)    # [B,P,Ks]
-    Kt     = t_cache.get("K", None)       # [B,P,Kt,C]
-    Vt     = t_cache.get("V", None)       # [B,P,Kt,C]
-    Ks     = s_cache.get("K", None)       # [B,P,Ks,C]
-    Vs     = s_cache.get("V", None)       # [B,P,Ks,C]
-    t_ctx  = t_cache.get("context", None) # [B,P,C]
-    s_ctx  = s_cache.get("context", None) # [B,P,C]
+    # 0) 먼저 별칭 정리
+    t_cache = _alias_cache_keys(t_cache)
+    s_cache = _alias_cache_keys(s_cache)
 
-    # 안전한 device 선택
+    t_attn = t_cache.get("attn", None)
+    s_attn = s_cache.get("attn", None)
+    Kt     = t_cache.get("K", None)
+    Vt     = t_cache.get("V", None)
+    Ks     = s_cache.get("K", None)
+    Vs     = s_cache.get("V", None)
+    t_ctx  = t_cache.get("context", None)
+    s_ctx  = s_cache.get("context", None)
+
+    # 1) (로깅 편의를 위한) P 맞추기 — 연산엔 영향 없음
+    def _match_P(a, b):
+        if (a is None) or (b is None): return a, b
+        Pa, Pb = a.shape[1], b.shape[1]
+        if Pa == Pb: return a, b
+        if Pa > Pb: a = a[:, -Pb:, ...]
+        else:       b = b[:, -Pa:, ...]
+        return a, b
+    t_attn, s_attn = _match_P(t_attn, s_attn)
+    if Kt is not None: Kt, _ = _match_P(Kt, t_attn if t_attn is not None else s_attn)
+    if Vt is not None: Vt, _ = _match_P(Vt, t_attn if t_attn is not None else s_attn)
+    if Ks is not None: Ks, _ = _match_P(Ks, s_attn)
+    if Vs is not None: Vs, _ = _match_P(Vs, s_attn)
+
+    # 2) K/V를 [B,P,K,C]로 표준화
+    if (t_attn is not None): 
+        Kt = _ensure_BPKC(Kt, t_attn); Vt = _ensure_BPKC(Vt, t_attn)
+    if (s_attn is not None):
+        Ks = _ensure_BPKC(Ks, s_attn); Vs = _ensure_BPKC(Vs, s_attn)
+
+    # 3) 한 번만 상태 로깅
+    if not hasattr(compute_kd_losses_from_caches, "_logged_once"):
+        compute_kd_losses_from_caches._logged_once = True
+        def _sh(x): return None if x is None else tuple(x.shape)
+        logging.getLogger(__name__).info(
+            f"[KD-ready] t_attn={_sh(t_attn)} s_attn={_sh(s_attn)} Kt={_sh(Kt)} Vt={_sh(Vt)} Ks={_sh(Ks)} Vs={_sh(Vs)}"
+        )
+
+    # 4) 손실 계산 (원래 수식 그대로)
     base_dev = (t_ctx if t_ctx is not None else (t_attn if t_attn is not None else s_attn)).device
     total = torch.zeros((), device=base_dev)
     losses = {}
 
-    # --- Attn-KL (교사 top-R ↔ 학생 NN 매칭) ---
+    # --- Attn-KL ---
     if (t_attn is not None) and (s_attn is not None) and (Kt is not None) and (Ks is not None):
         B, P, Kt_len = t_attn.shape
-        R = min(top_r, Kt_len)
+        if Kt_len > 0:
+            R = min(top_r, Kt_len)
+            t_top_vals, t_top_idx = torch.topk(t_attn, k=R, dim=-1, largest=True, sorted=True)
+            Kt_sel = _safe_gather_last_dim(Kt, t_top_idx)
+            Kt_sel_n = _safe_norm(Kt_sel, dim=-1)
+            Ks_n     = _safe_norm(Ks,     dim=-1)
+            bd = B * P
+            Rf, Cf = Kt_sel_n.shape[2], Kt_sel_n.shape[-1]
+            Kt_f = Kt_sel_n.reshape(bd, Rf, Cf)
+            Ks_f = Ks_n.reshape(bd, Ks.shape[2], Cf)
+            sims = torch.matmul(Kt_f, Ks_f.transpose(1, 2))     # [bd, R, Ks]
+            s_match_idx = sims.argmax(dim=-1).view(B, P, Rf)
+            ps_sel = _safe_gather_last_dim(s_attn, s_match_idx) # [B,P,R]
+            pt_sel = t_top_vals
+            pt = pt_sel / (pt_sel.sum(dim=-1, keepdim=True) + eps)
+            ps = ps_sel / (ps_sel.sum(dim=-1, keepdim=True) + eps)
+            attn_kl = (pt * (pt.add(eps).log() - ps.add(eps).log())).sum(dim=-1).mean()
+            total += w_attn_kl * attn_kl
+            losses['attn_kl'] = attn_kl
 
-        t_top_vals, t_top_idx = torch.topk(t_attn, k=R, dim=-1, largest=True, sorted=True)  # [B,P,R], [B,P,R]
-        Kt_sel = _gather_last_dim(Kt, t_top_idx)  # [B,P,R,C]
-
-        Kt_sel_n = _safe_norm(Kt_sel, dim=-1)           # [B,P,R,C]
-        Ks_n     = _safe_norm(Ks,     dim=-1)           # [B,P,Ks,C]
-        bd = B * P
-        Rf = Kt_sel_n.shape[2]
-        Cf = Kt_sel_n.shape[-1]
-        Kt_f = Kt_sel_n.reshape(bd, Rf, Cf)
-        Ks_f = Ks_n.reshape(bd, Ks.shape[2], Cf)
-        sims = torch.matmul(Kt_f, Ks_f.transpose(1, 2))  # [bd, R, Ks]
-        s_match_idx = sims.argmax(dim=-1).view(B, P, Rf) # [B,P,R]
-
-        ps_sel = _gather_last_dim(s_attn, s_match_idx)   # [B,P,R]
-        pt_sel = t_top_vals                              # [B,P,R]
-
-        pt = pt_sel / (pt_sel.sum(dim=-1, keepdim=True) + eps)
-        ps = ps_sel / (ps_sel.sum(dim=-1, keepdim=True) + eps)
-        attn_kl = (pt * (pt.add(eps).log() - ps.add(eps).log())).sum(dim=-1).mean()
-        total += w_attn_kl * attn_kl
-        losses['attn_kl'] = attn_kl
-
-    # --- KV Cosine (교사 top-U ↔ 학생 NN 매칭) ---
+    # --- KV Cosine ---
     if (Kt is not None) and (Ks is not None) and (Vt is not None) and (Vs is not None):
         B, P, Kt_len, C = Kt.shape
-        U = min(top_u, Kt_len)
-        if t_attn is not None:
-            t_top_vals, t_top_idx = torch.topk(t_attn, k=min(max(top_r, U), Kt_len), dim=-1, largest=True, sorted=True)
-            t_idx_u = t_top_idx[..., :U]  # [B,P,U]
-        else:
-            t_idx_u = torch.arange(U, device=Kt.device).view(1,1,U).expand(B,P,U)
+        if Kt_len > 0:
+            U = min(top_u, Kt_len)
+            if t_attn is not None and t_attn.shape[2] > 0:
+                t_top_vals, t_top_idx = torch.topk(t_attn, k=min(max(top_r, U), t_attn.shape[2]), dim=-1, largest=True, sorted=True)
+                t_idx_u = t_top_idx[..., :U]
+            else:
+                t_idx_u = torch.arange(U, device=Kt.device).view(1,1,U).expand(B,P,U)
+            Kt_u = _safe_gather_last_dim(Kt, t_idx_u)
+            Vt_u = _safe_gather_last_dim(Vt, t_idx_u)
+            Kt_u_n = _safe_norm(Kt_u, dim=-1)
+            Ks_n   = _safe_norm(Ks, dim=-1)
+            bd = B * P
+            Kt_f = Kt_u_n.reshape(bd, U, C)
+            Ks_f = Ks_n.reshape(bd, Ks.shape[2], C)
+            sims = torch.matmul(Kt_f, Ks_f.transpose(1,2))
+            idx_s = sims.argmax(dim=-1).view(B, P, U)
+            Ks_u = _safe_gather_last_dim(Ks, idx_s)
+            Vs_u = _safe_gather_last_dim(Vs, idx_s)
+            k_loss = F.mse_loss(_safe_norm(Kt_u, dim=-1), _safe_norm(Ks_u, dim=-1))
+            v_loss = F.mse_loss(_safe_norm(Vt_u, dim=-1), _safe_norm(Vs_u, dim=-1))
+            kv_cos = k_loss + v_loss
+            total += w_kv_cos * kv_cos
+            losses['kv_cos'] = kv_cos
 
-        Kt_u = _gather_last_dim(Kt, t_idx_u)  # [B,P,U,C]
-        Vt_u = _gather_last_dim(Vt, t_idx_u)  # [B,P,U,C]
-
-        Kt_u_n = _safe_norm(Kt_u, dim=-1)
-        Ks_n   = _safe_norm(Ks, dim=-1)
-        bd = B * P
-        Kt_f = Kt_u_n.reshape(bd, U, C)
-        Ks_f = Ks_n.reshape(bd, Ks.shape[2], C)
-        sims = torch.matmul(Kt_f, Ks_f.transpose(1,2))   # [bd,U,Ks]
-        idx_s = sims.argmax(dim=-1).view(B, P, U)
-
-        Ks_u = _gather_last_dim(Ks, idx_s)   # [B,P,U,C]
-        Vs_u = _gather_last_dim(Vs, idx_s)   # [B,P,U,C]
-
-        k_loss = F.mse_loss(_safe_norm(Kt_u, dim=-1), _safe_norm(Ks_u, dim=-1))
-        v_loss = F.mse_loss(_safe_norm(Vt_u, dim=-1), _safe_norm(Vs_u, dim=-1))
-        kv_cos = k_loss + v_loss
-        total += w_kv_cos * kv_cos
-        losses['kv_cos'] = kv_cos
-
-    # --- (옵션) Context L2 / Cosine ---
+    # --- Context ---
     if (t_ctx is not None) and (s_ctx is not None) and (w_ctx_cos > 0.0):
         ctx_cos = 1.0 - F.cosine_similarity(t_ctx.flatten(0,1), s_ctx.flatten(0,1), dim=-1).mean()
         total += w_ctx_cos * ctx_cos
@@ -234,10 +298,27 @@ def train(args):
     run = wandb.init(project="stream_teacher_student", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
     rgb_clips, depth_clips = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
-    kitti_train = KITTIVideoDataset(rgb_paths=rgb_clips, depth_paths=depth_clips, resize_size=518, split="train")
-    kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    kitti_train = KITTIVideoDataset(
+        rgb_paths=rgb_clips,
+        depth_paths=depth_clips,
+        resize_size=518,
+        split="train",
+        clip_len=CLIP_LEN,                 # ← 반드시 명시 (예: 32)
+        per_epoch_samples=407,             # ← 1:1 비교 위해 고정
+        sampling_mode="global_weighted",   # ← 전역 가중 샘플링
+        balance_mode="proportional",       # ← 후보 수 비례
+        min_stride=16,                      # ← 같은 폴더에서 중복 방지 간격(원하면)
+        use_shift=False                    # ← 슬라이딩이면 보통 False 권장
+    )
+    kitti_train_loader = DataLoader(
+        kitti_train,
+        batch_size=batch_size,
+        shuffle=True,          # 배치 내부 섞기만
+        num_workers=4,
+        pin_memory=True
+    )
 
     # 모델 (단일 GPU)
     teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
@@ -279,7 +360,7 @@ def train(args):
     # Loss
     loss_tgm = LossTGMVector(diff_depth_th=0.05)
     loss_ssi = Loss_ssi_basic()
-    scaler = GradScaler()
+    scaler = amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ----- Resume (optional) -----
     start_epoch = 0
@@ -327,52 +408,53 @@ def train(args):
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
     
-    # ---- Init real-pipeline validation (epoch = -1) ----
-    # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
-    init_infer_dir = os.path.join(args.val_infer_dir, "init")
-    os.makedirs(init_infer_dir, exist_ok=True)
+    # # ---- Init real-pipeline validation (epoch = -1) ----
+    # # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
+    # init_infer_dir = os.path.join(args.val_infer_dir, "init")
+    # os.makedirs(init_infer_dir, exist_ok=True)
 
-    # 일시적으로 eval 모드
-    _prev_train_state = model.student.training
-    model.student.eval()
-    try:
-        init_metrics = validate_with_infer_eval_subset(
-            model=model.student,                          # 학생만 사용
-            json_file=args.val_json_file,                 # e.g., scannet_video_500.json
-            infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
-            dataset=args.val_dataset_key,                 # 'scannet'
-            dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            input_size=518,
-            scenes_to_eval=args.val_scenes,               # 2 scenes subset
-            fp32=True
-        )
-    finally:
-        # 원래 학습 모드 복귀
-        if _prev_train_state:
-            model.student.train()
+    # # 일시적으로 eval 모드
+    # _prev_train_state = model.student.training
+    # model.student.eval()
+    # try:
+    #     init_metrics = validate_with_infer_eval_subset(
+    #         model=model.student,                          # 학생만 사용
+    #         json_file=args.val_json_file,                 # e.g., scannet_video_500.json
+    #         infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
+    #         dataset=args.val_dataset_key,                 # 'scannet'
+    #         dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
+    #         device='cuda' if torch.cuda.is_available() else 'cpu',
+    #         input_size=518,
+    #         scenes_to_eval=args.val_scenes,               # 2 scenes subset
+    #         fp32=True
+    #     )
+    # finally:
+    #     # 원래 학습 모드 복귀
+    #     if _prev_train_state:
+    #         model.student.train()
 
-    init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-    init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-    init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+    # init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
+    # init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
+    # init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
 
-    # 콘솔/파일 로그
-    logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
+    # # 콘솔/파일 로그
+    # logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
 
-    # W&B 로깅 (epoch=-1로 표기)
-    wandb.log({
-        "init/absrel": init_absrel,
-        "init/rmse":   init_rmse,
-        "init/delta1": init_delta1,
-        "epoch": -1,
-    })
+    # # W&B 로깅 (epoch=-1로 표기)
+    # wandb.log({
+    #     "init/absrel": init_absrel,
+    #     "init/rmse":   init_rmse,
+    #     "init/delta1": init_delta1,
+    #     "epoch": -1,
+    # })
 
-    # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
-    best_delta1 = init_delta1
+    # # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
+    # best_delta1 = init_delta1
 
 
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
+        kitti_train.set_epoch(epoch)
         model.train()
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = epoch_kd = 0.0
@@ -407,8 +489,7 @@ def train(args):
                     teacher_frame_buffer = x_t.detach().clone().repeat(1, CLIP_LEN, 1, 1, 1)
                 else:
                     teacher_frame_buffer = torch.cat([
-                        teacher_frame_buffer[:, :1],   # anchor 유지
-                        teacher_frame_buffer[:, 2:],   # 앞에서 한 칸 밀기
+                        teacher_frame_buffer[:, 1:],   # 앞에서 한 칸 밀기
                         x_t.detach().clone()
                     ], dim=1)
 
@@ -417,7 +498,7 @@ def train(args):
                 if use_teacher:
                     with torch.no_grad():
                         enable_attention_caching(model.teacher)
-                        with autocast(enabled=torch.cuda.is_available()):
+                        with amp.autocast('cuda', enabled=torch.cuda.is_available()):
                             _ = model.teacher(teacher_frame_buffer)
                         t_caches = collect_kd_caches(model.teacher, clear=True)
                         disable_attention_caching(model.teacher)
@@ -428,7 +509,7 @@ def train(args):
                     t_cache_last = None
 
                 # === Student (정확 KD 캐시 수집 + 스트리밍 1-step) ===
-                with autocast(enabled=torch.cuda.is_available()):
+                with amp.autocast('cuda', enabled=torch.cuda.is_available()):
                     enable_attention_caching(model.student)
                     pred_t_raw, cache = model_stream_step(model.student, x_t, cache)
                     pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
@@ -438,22 +519,50 @@ def train(args):
                         raise RuntimeError("No student KD caches collected.")
                     s_cache_last = s_caches[-1]
 
+                    # Alias cache keys
+                    if use_teacher:
+                        t_cache_last = _alias_cache_keys(t_cache_last)
+                    s_cache_last = _alias_cache_keys(s_cache_last)
+
                     # ----- KD 손실 -----
                     if use_teacher:
-                        kd_total, kd_parts = compute_kd_losses_from_caches(
-                            t_cache_last, s_cache_last,
-                            top_r=kd_top_r, top_u=kd_top_u,
-                            w_attn_kl=w_attn_kl, w_kv_cos=w_kv_cos, w_ctx_cos=w_ctx_cos
-                        )
-                        kd_loss = kd_weight * kd_total
+                        # KD는 FP32 (수치안정)
+                        with amp.autocast('cuda', enabled=False):
+                            kd_total, kd_parts = compute_kd_losses_from_caches(
+                                t_cache_last, s_cache_last,
+                                top_r=kd_top_r, top_u=kd_top_u,
+                                w_attn_kl=w_attn_kl, w_kv_cos=w_kv_cos, w_ctx_cos=w_ctx_cos
+                            )
+                        # 다른 손실과 합칠 때 dtype 맞춤(안전)
+                        kd_loss = (kd_weight * kd_total).to(pred_t_raw.dtype)
                     else:
-                        # Stage-2: Teacher 없어도 entropy 정규화로 collapse 방지
                         s_attn = s_cache_last.get("attn", None)
                         if (s_attn is not None) and (attn_ent_w > 0):
                             ent = attention_entropy(s_attn)
-                            kd_loss = (-attn_ent_w) * ent   # entropy ↑ => loss ↓ (최대화)
+                            kd_loss = (-attn_ent_w) * ent
                         else:
                             kd_loss = pred_t_raw.new_tensor(0.0)
+
+                    # --- probe: 처음 한 번만 "왜 0인지" 원인 로깅 (학습 영향 없음)
+                    if (epoch == start_epoch) and (batch_idx == 0) and (t == 0):
+                        tA = t_cache_last.get('attn'); sA = s_cache_last.get('attn')
+                        tK = t_cache_last.get('K');    sK = s_cache_last.get('K')
+                        tV = t_cache_last.get('V');    sV = s_cache_last.get('V')
+                        def SH(x): return None if (x is None) else tuple(x.shape)
+                        logger.info(f"[KD-probe] shapes(after alias/ensure): tA={SH(tA)} sA={SH(sA)} tK={SH(tK)} sK={SH(sK)} tV={SH(tV)} sV={SH(sV)}")
+                        logger.info(f"[KD-probe] parts_keys={list(kd_parts.keys())}  kd_val={float(kd_loss)}  requires_grad={kd_loss.requires_grad}")
+
+                        try:
+                            optimizer.zero_grad(set_to_none=True)
+                            kd_loss.backward(retain_graph=True)
+                            g_temporal = grad_norm(model.student, name_filter="temporal_transformer")
+                            g_toq = grad_norm(model.student, name_filter=".attention_blocks.0.to_q")
+                            logger.info(f"[KD-probe] grad | temporal={g_temporal:.3e} to_q={g_toq:.3e}")
+                        except Exception as e:
+                            logger.warning(f"[KD-probe] backward fail: {e}")
+                        finally:
+                            optimizer.zero_grad(set_to_none=True)
+
 
                     # ----- Depth Loss -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
@@ -511,7 +620,7 @@ def train(args):
                 frame_pbar.set_postfix({
                     'SSI': f'{epoch_ssi/ max(1, epoch_frames):.4f}',
                     'TGM': f'{epoch_tgm/ max(1, epoch_frames):.4f}',
-                    'KD':  f'{epoch_kd / max(1, epoch_frames):.4f}'
+                    'KD':  f'{epoch_kd / max(1, epoch_frames):.2e}',
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -593,7 +702,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
     # real-pipeline mini-validation 설정
-    parser.add_argument("--val_json_file",    type=str, default="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
+    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")

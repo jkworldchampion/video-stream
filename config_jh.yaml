@@ -3,7 +3,7 @@ hyper_parameter:
   clip_len: 32
   ratio_ssi: 1
   ratio_tgm: 10
-  epochs: 25
+  epochs: 45
   batch_size: 1  # 4 -> 2로 줄여서 메모리 사용량 감소
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
   
