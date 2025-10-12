@@ -17,12 +17,11 @@ import torch.nn as nn
 from torchvision.transforms import Compose
 import cv2
 import numpy as np
+import copy
 
 from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
 from .util.transform import Resize, NormalizeImage, PrepareForNet
-
-from utils.util import compute_scale_and_shift, get_interpolate_frames
 
 # infer settings, do not change
 INFER_LEN = 32
@@ -39,12 +38,6 @@ class VideoDepthAnything(nn.Module):
         use_clstoken=False,
         num_frames=32,
         pe='ape',
-        # ▼ 스트리밍 옵션 (필요 없으면 기본값으로 두면 됨)
-        stream_mode=True,
-        select_top_r=None,     # None이면 비활성, 정수면 과거 토큰 Top-R만 사용
-        rope_dt=None,          # None이면 비활성, float이면 RoPE에 시간스케일 전달
-        return_attn=False,     # True면 어텐션 가중치 반환(디버깅/디스틸용)
-        return_qkv=False,      # True면 Q/K/V 반환(디버깅/디스틸용)
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -70,13 +63,6 @@ class VideoDepthAnything(nn.Module):
         assert self.gap == 41
         self.id = -1
 
-        # --- 스트리밍 하이퍼파라미터 저장 ---
-        self.stream_mode   = stream_mode
-        self.select_top_r  = select_top_r
-        self.rope_dt       = rope_dt
-        self.return_attn   = return_attn
-        self.return_qkv    = return_qkv
-
     # ----------- public / core -----------
     def forward(self, x):
         return self.forward_depth(self.forward_features(x), x.shape)[0]
@@ -96,24 +82,8 @@ class VideoDepthAnything(nn.Module):
         B, T, C, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
 
-        # 스트리밍 옵션을 하위 모듈로 전달 (**kwargs)
-        stream_kwargs = {}
-        if self.stream_mode is not None:
-            stream_kwargs["stream_mode"] = bool(self.stream_mode)
-        if self.select_top_r is not None:
-            stream_kwargs["select_top_r"] = int(self.select_top_r)
-        if self.rope_dt is not None:
-            # float → torch.scalar 로 캐스팅하여 디바이스/dtype 맞추기
-            stream_kwargs["rope_dt"] = float(self.rope_dt)
-        if self.return_attn:
-            stream_kwargs["return_attn"] = True
-        if self.return_qkv:
-            stream_kwargs["return_qkv"] = True
-
         depth, cur_cached_hidden_state_list = self.head(
-            features, patch_h, patch_w, T,
-            cached_hidden_state_list=cached_hidden_state_list,
-            **stream_kwargs
+            features, patch_h, patch_w, T, cached_hidden_state_list=cached_hidden_state_list
         )
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
@@ -165,7 +135,7 @@ class VideoDepthAnything(nn.Module):
             depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
 
             # 초기 캐시 복제(윈도우 시뮬레이션)
-            self.frame_cache_list = [cached_hidden_state_list] * INFER_LEN
+            self.frame_cache_list = [copy.deepcopy(cached_hidden_state_list) for _ in range(INFER_LEN)]
             self.frame_id_list.extend([0] * (INFER_LEN - 1))
 
             new_depth = depth[0][0].cpu().numpy()

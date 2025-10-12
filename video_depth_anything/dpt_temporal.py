@@ -56,26 +56,8 @@ class DPTHeadTemporal(DPTHead):
         frame_length,
         micro_batch_size=4,
         cached_hidden_state_list=None,
-        **kwargs,  # ← 스트리밍 옵션(rope_dt, select_top_r, stream_mode, return_attn/return_qkv …)을 하위로 패스
     ):
-        """
-        Args
-        ----
-        out_features: list of (tokens[, cls]) from encoder
-        patch_h, patch_w: ViT patch grid height/width
-        frame_length: 현재 배치의 time 길이 (오프라인=클립 길이, 스트리밍=1)
-        micro_batch_size: 메모리 세이빙용 마이크로 배치
-        cached_hidden_state_list: (옵션) 과거 hidden state 리스트(구 구현 호환)
-            - 스트리밍을 새 구현으로 쓸 땐, 상위에서 attention 레벨의 past 토큰을
-              전달하도록 구성할 수 있음(우리 motion_module이 **kwargs로 처리).
-        kwargs: (전부 선택, 없으면 기존과 동일)
-            - stream_mode: bool
-            - rope_dt: float or Tensor(Δt)
-            - select_top_r: int (과거 토큰 Top-R 선택; 평균 금지)
-            - update_top_u: int (Refiner 인덱스 자리)
-            - return_attn: bool
-            - return_qkv: bool
-        """
+        """Temporal aggregation + DPT refine. `cached_hidden_state_list`만 사용."""
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -110,7 +92,6 @@ class DPTHeadTemporal(DPTHead):
             layer_3_in,
             None, None,
             cached_hidden_state_list[0:N] if N else None,
-            **kwargs,
         )
         layer_3 = layer_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -119,7 +100,6 @@ class DPTHeadTemporal(DPTHead):
             layer_4_in,
             None, None,
             cached_hidden_state_list[N:2*N] if N else None,
-            **kwargs,
         )
         layer_4 = layer_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -136,7 +116,6 @@ class DPTHeadTemporal(DPTHead):
             path_4_in,
             None, None,
             cached_hidden_state_list[2*N:3*N] if N else None,
-            **kwargs,
         )
         path_4 = path_4.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -147,7 +126,6 @@ class DPTHeadTemporal(DPTHead):
             path_3_in,
             None, None,
             cached_hidden_state_list[3*N:] if N else None,
-            **kwargs,
         )
         path_3 = path_3.permute(0, 2, 1, 3, 4).flatten(0, 1)
 

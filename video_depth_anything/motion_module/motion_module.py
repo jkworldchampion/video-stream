@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from einops import rearrange, repeat
 
-from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute_freqs_cis
+from .attention import CrossAttention, FeedForward
 
 # --- xFormers는 버전별 텐서 규격 차이가 있어 shape 오류를 유발할 수 있음.
 # 본 구현에서는 수동 SDPA(softmax(QK^T)V)만 사용해서 차원 정합을 보장한다.
@@ -49,19 +49,10 @@ class TemporalModule(nn.Module):
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
 
-    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None, **kwargs):
-        """
-        kwargs (선택):
-          stream_mode: bool
-          rope_dt: float or Tensor
-          select_top_r: int
-          update_top_u: int (자리만)
-          return_attn: bool
-          return_qkv: bool
-        """
+    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None):
         hidden_states = input_tensor
         hidden_states, output_hidden_state_list = self.temporal_transformer(
-            hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list, **kwargs
+            hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list
         )
         return hidden_states, output_hidden_state_list
 
@@ -100,7 +91,7 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None, **kwargs):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, got {hidden_states.dim()}."
         output_hidden_state_list = []
 
@@ -126,7 +117,6 @@ class TemporalTransformer3DModel(nn.Module):
                 video_length=video_length,
                 attention_mask=attention_mask,
                 cached_hidden_state_list=sub_cache,
-                **kwargs,
             )
             output_hidden_state_list.extend(hidden_state_list)
 
@@ -167,7 +157,7 @@ class TemporalTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=0.0, activation_fn="geglu")
         self.ff_norm = nn.LayerNorm(dim)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None, **kwargs):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None):
         output_hidden_state_list = []
         for i, (attention_block, norm) in enumerate(zip(self.attention_blocks, self.norms)):
             norm_hidden_states = norm(hidden_states)
@@ -177,10 +167,11 @@ class TemporalTransformerBlock(nn.Module):
                 video_length=video_length,
                 attention_mask=attention_mask,
                 cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
-                **kwargs,
             )
             hidden_states = residual_hidden_states + hidden_states
-            output_hidden_state_list.append(output_hidden_states)
+            # 캐시 비활성 베이스라인: 빈 값은 모으지 않음
+            if output_hidden_states:
+                output_hidden_state_list.append(output_hidden_states)
 
         hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
         return hidden_states, output_hidden_state_list
@@ -206,7 +197,6 @@ class TemporalAttention(CrossAttention):
     """
     수동 SDPA만 사용.
     - 항상: [B*H, q, dh] → (merge heads) → [B, q, H*dh] → to_out
-    - KD 훅: enable_kd_caching(True)일 때 정확한 attn/q/k/v/context를 self._kd_cache에 저장
     """
     def __init__(self, temporal_max_len=32, pos_embedding_type="ape", *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -215,58 +205,12 @@ class TemporalAttention(CrossAttention):
         self.temporal_max_len = temporal_max_len
 
         self.pos_encoder = None
-        self.freqs_cis = None
-        if self.pos_embedding_type == "ape":
-            self.pos_encoder = PositionalEncoding(kwargs["query_dim"], dropout=0., max_len=temporal_max_len)
-        elif self.pos_embedding_type == "rope":
-            self.freqs_cis = precompute_freqs_cis(kwargs["query_dim"], temporal_max_len)
-        else:
-            raise NotImplementedError
+        assert self.pos_embedding_type == "ape", "Baseline removes RoPE; use APE only."
+        self.pos_encoder = PositionalEncoding(kwargs["query_dim"], dropout=0., max_len=temporal_max_len)
+ 
 
         # xformers는 사용하지 않음 (shape 안전성)
         self._use_memory_efficient_attention_xformers = False
-
-        # KD 훅 상태
-        self._kd_cache_enabled = False
-        self._kd_cache = None
-
-    # ===== KD hook API =====
-    def enable_kd_caching(self, flag: bool = True):
-        self._kd_cache_enabled = bool(flag)
-        if not flag:
-            self._kd_cache = None
-
-    def clear_attention_cache(self):
-        self._kd_cache = None
-
-    def get_cached_attention_output(self):
-        return self._kd_cache
-
-    # ===== Rope scaling =====
-    def _scaled_rope(self, seq_len, device, rope_dt=None):
-        assert self.freqs_cis is not None, "RoPE not initialized"
-        base = self.freqs_cis.to(device)
-        if rope_dt is None:
-            return base[:seq_len]
-        if isinstance(rope_dt, (float, int)):
-            idx = torch.clamp(
-                (torch.arange(seq_len, device=device).float() * float(rope_dt)).round().long(),
-                0, self.temporal_max_len - 1
-            )
-            return base.index_select(0, idx)
-        elif torch.is_tensor(rope_dt):
-            if rope_dt.numel() == 1:
-                s = float(rope_dt.item())
-                idx = torch.clamp(
-                    (torch.arange(seq_len, device=device).float() * s).round().long(),
-                    0, self.temporal_max_len - 1
-                )
-                return base.index_select(0, idx)
-            else:
-                idx = torch.clamp(rope_dt.round().long(), 0, self.temporal_max_len - 1)
-                return base.index_select(0, idx)
-        else:
-            return base[:seq_len]
 
     def forward(
         self,
@@ -275,13 +219,6 @@ class TemporalAttention(CrossAttention):
         attention_mask=None,
         video_length=None,
         cached_hidden_states=None,
-        *,
-        stream_mode: bool = False,
-        rope_dt=None,
-        select_top_r: int = None,
-        update_top_u: int = None,
-        return_attn: bool = False,
-        return_qkv: bool = False,
     ):
         assert encoder_hidden_states is None
         assert attention_mask is None
@@ -310,32 +247,15 @@ class TemporalAttention(CrossAttention):
         k_now = self.to_k(now_pos)
         v_now = self.to_v(now_pos)
 
-        if stream_mode and (past_pos is not None):
+        # 스트리밍: 과거가 있으면 전부 concat, 없으면 현재만 사용
+        if past_pos is not None:
             k_past_all = self.to_k(past_pos)
             v_past_all = self.to_v(past_pos)
-
-            if (select_top_r is not None) and (select_top_r > 0) and (k_past_all.shape[1] > select_top_r):
-                score = torch.matmul(q_now, k_past_all.transpose(-1, -2))  # (b*d, f_now, Tpast)
-                idx = torch.topk(score.squeeze(1), k=select_top_r, dim=-1, largest=True, sorted=False).indices
-                gidx = idx.unsqueeze(-1).expand(-1, -1, k_past_all.shape[-1])
-                k_sel = torch.gather(k_past_all, dim=1, index=gidx)
-                v_sel = torch.gather(v_past_all, dim=1, index=gidx)
-            else:
-                k_sel, v_sel = k_past_all, v_past_all
-
-            key   = torch.cat([k_sel, k_now], dim=1)  # (b*d, K, C)
-            value = torch.cat([v_sel, v_now], dim=1)
-            query = q_now                                # (b*d, q, C)
+            key   = torch.cat([k_past_all, k_now], dim=1)  # (b*d, K, C)
+            value = torch.cat([v_past_all, v_now], dim=1)
+            query = q_now
         else:
             key, value, query = k_now, v_now, q_now
-
-        # RoPE
-        if self.freqs_cis is not None:
-            k_len = key.shape[1]
-            q_len = query.shape[1]
-            freqs_k = self._scaled_rope(k_len, device=key.device, rope_dt=rope_dt)
-            freqs_q = self._scaled_rope(q_len, device=query.device, rope_dt=rope_dt)
-            query, key = apply_rotary_emb(query, key, (freqs_q, freqs_k))
 
         # ==== Manual SDPA (always) ====
         # reshape to [B*H, L, Dh]
@@ -370,20 +290,4 @@ class TemporalAttention(CrossAttention):
         # back to (b*f, d, c)
         hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d).contiguous()
 
-        # KD cache (정확 로깅)
-        if self._kd_cache_enabled:
-            self._kd_cache = {
-                "attn": attn,     # [B*H, q, k]
-                "q_bh": q_bh,     # [B*H, q, Dh]
-                "k_bh": k_bh,     # [B*H, k, Dh]
-                "v_bh": v_bh,     # [B*H, k, Dh]
-                "ctx_bh": ctx_bh, # [B*H, q, Dh] = A·V
-            }
-
-        # return
-        if return_attn or return_qkv:
-            extra = {"attn": attn}
-        else:
-            extra = None
-
-        return hidden_states, extra
+        return hidden_states, []
