@@ -234,7 +234,7 @@ def train(args):
     run = wandb.init(project="stream_teacher_student", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
-    kitti_path = "/workspace/Video-Depth-Anything/datasets/KITTI"
+    kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
     rgb_clips, depth_clips = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
     kitti_train = KITTIVideoDataset(rgb_paths=rgb_clips, depth_paths=depth_clips, resize_size=518, split="train")
     kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
@@ -593,7 +593,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
     # real-pipeline mini-validation 설정
-    parser.add_argument("--val_json_file",    type=str, default="/workspace/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
+    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth//stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
