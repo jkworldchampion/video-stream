@@ -1,30 +1,21 @@
 import inspect
 import os
-import argparse
-import logging
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-import yaml
-import wandb
-import math
-import warnings
-from dotenv import load_dotenv
 
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import wandb
+
+import warnings
+
+
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from PIL import Image
 
 from utils.loss_MiDas import *
 from data.dataLoader import *                 # KITTIVideoDataset, get_data_list
-from data.val_dataLoader import *            # ValDataset, get_list
-
-# 기존 offline model을 teacher로, real-time model을 student로 설계
-from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthStudent
-from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTeacher
 
 from benchmark.eval.metric import *          # abs_relative_difference, delta1_acc
 from benchmark.eval.eval_tae import tae_torch
@@ -32,7 +23,6 @@ from benchmark.eval.eval_tae import tae_torch
 # ImageNet normalization constants
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-from video_depth_anything.motion_module.motion_module import TemporalAttention
 
 
 # ────────────────────────────── 유틸/평가 함수 ──────────────────────────────
@@ -537,6 +527,19 @@ def batch_ls_scale_shift(pred_disp, gt_disp, mask):
     a_star = a_star.clamp(min=1e-4, max=1e4)
     b_star = b_star.clamp(min=-1e4, max=1e4)
     return a_star, b_star
+
+def window_ls_scale_shift(pred_disp_seq, gt_disp_seq, mask_seq):
+    # pred/gt/mask: [B, L, H, W] (disparity)
+    B, L, H, W = pred_disp_seq.shape
+    with autocast(enabled=False):
+        p = pred_disp_seq.float().view(B, -1)
+        g = gt_disp_seq.float().view(B, -1)
+        m = mask_seq.view(B, -1).float()
+        A = torch.stack([p, torch.ones_like(p)], dim=-1) * m.unsqueeze(-1)  # [B, P, 2]
+        b = g.unsqueeze(-1) * m.unsqueeze(-1)                               # [B, P, 1]
+        X = torch.linalg.lstsq(A, b).solution                               # [B,2,1]
+        a_hat = X[:,0,0].view(B,1,1,1); b_hat = X[:,1,0].view(B,1,1,1)
+    return a_hat.clamp(1e-4,1e4), b_hat.clamp(-1e4,1e4)
 
 # ────────────────────────────── NEW: 학습용 Teacher/Student 보조 루틴 ──────────────────────────────
 def _gather_extras(ret):

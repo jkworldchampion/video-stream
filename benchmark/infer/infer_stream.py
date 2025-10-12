@@ -32,9 +32,17 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
 
-    vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
+    # vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
+    vda = VideoDepthAnything(
+        **model_configs[args.encoder],
+        pe=args.pe,
+        # ---- 학습 시 설정과 동일하게 ----
+        use_aux=True,
+        aux_layers=[0, -1],       # 체크포인트 키와 일치
+        aux_rnn_type="mamba",     # seq_model.* 파라미터와 일치
+    )
     # checkpoint load
-    ckpt = torch.load('./outputs/experiment_31/best_model.pth', map_location='cpu', weights_only=True)
+    ckpt = torch.load('./outputs/experiment_314/best_model.pth', map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거

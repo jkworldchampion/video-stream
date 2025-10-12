@@ -85,6 +85,10 @@ class DPTHeadTemporal(DPTHead):
             else:
                 x = x[0]
 
+            # x는 [N,P,C]여야 함
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+
             # tokens -> [B*T, C, H', W']
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w)).contiguous()
 
