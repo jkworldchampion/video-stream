@@ -42,7 +42,7 @@ if __name__ == '__main__':
         aux_rnn_type="mamba",     # seq_model.* 파라미터와 일치
     )
     # checkpoint load
-    ckpt = torch.load('./outputs/experiment_314/best_model.pth', map_location='cpu', weights_only=True)
+    ckpt = torch.load('./outputs/experiment_110/latest_model.pth', map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거

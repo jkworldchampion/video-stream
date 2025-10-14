@@ -11,7 +11,7 @@ export PYTHONUNBUFFERED=1
 
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/scannet_stream_314"
+INFER_PATH="${ROOT}/benchmark/output/scannet_stream_110"
 
 # 2) JSON 메타데이터
 JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
@@ -36,7 +36,7 @@ python "${ROOT}/benchmark/eval/eval.py" \
   --datasets scannet_500 \
   --wandb \
   --wandb_project evaluation \
-  --wandb_run_name "experiment_31_epoch_65_$(date +%Y%m%d_%H%M)" \
+  --wandb_run_name "experiment_110_$(date +%Y%m%d_%H%M)" \
   --wandb_group "streaming" \
   --wandb_mode online
 

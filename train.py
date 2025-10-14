@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 315
+experiment = 110
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -260,25 +260,8 @@ def train(args):
     # 데이터
     kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
     rgb_clips, depth_clips = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
-    kitti_train = KITTIVideoDataset(
-        rgb_paths=rgb_clips,
-        depth_paths=depth_clips,
-        resize_size=518,
-        split="train",
-        clip_len=TRAIN_SEQ,                 # ← 반드시 명시 (예: 32)
-        per_epoch_samples=200,             # ← 1:1 비교 위해 고정
-        sampling_mode="global_weighted",   # ← 전역 가중 샘플링
-        balance_mode="proportional",       # ← 후보 수 비례
-        min_stride=16,                      # ← 같은 폴더에서 중복 방지 간격(원하면)
-        use_shift=False                    # ← 슬라이딩이면 보통 False 권장
-    )
-    kitti_train_loader = DataLoader(
-        kitti_train,
-        batch_size=batch_size,
-        shuffle=True,          # 배치 내부 섞기만
-        num_workers=4,
-        pin_memory=True
-    )
+    kitti_train = KITTIVideoDataset(rgb_paths=rgb_clips, depth_paths=depth_clips, resize_size=518, split="train")
+    kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     # 모델 (단일 GPU)
     teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
@@ -327,7 +310,7 @@ def train(args):
     # Optim/Sch
     student_params = [p for p in model.student.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(student_params, lr=lr, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
     # Loss
     loss_tgm = LossTGMVector(diff_depth_th=0.05)
@@ -378,53 +361,52 @@ def train(args):
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
-    
-    # ---- Init real-pipeline validation (epoch = -1) ----
-    # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
-    init_infer_dir = os.path.join(args.val_infer_dir, "init")
-    os.makedirs(init_infer_dir, exist_ok=True)
 
-    # 일시적으로 eval 모드
-    _prev_train_state = model.student.training
-    model.student.eval()
-    try:
-        init_metrics = validate_with_infer_eval_subset(
-            model=model.student,                          # 학생만 사용
-            json_file=args.val_json_file,                 # e.g., scannet_video_500.json
-            infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
-            dataset=args.val_dataset_key,                 # 'scannet'
-            dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            input_size=518,
-            scenes_to_eval=args.val_scenes,               # 2 scenes subset
-            fp32=True
-        )
-    finally:
-        # 원래 학습 모드 복귀
-        if _prev_train_state:
-            model.student.train()
+    # # ---- Init real-pipeline validation (epoch = -1) ----
+    # # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
+    # init_infer_dir = os.path.join(args.val_infer_dir, "init")
+    # os.makedirs(init_infer_dir, exist_ok=True)
 
-    init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-    init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-    init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+    # # 일시적으로 eval 모드
+    # _prev_train_state = model.student.training
+    # model.student.eval()
+    # try:
+    #     init_metrics = validate_with_infer_eval_subset(
+    #         model=model.student,                          # 학생만 사용
+    #         json_file=args.val_json_file,                 # e.g., scannet_video_500.json
+    #         infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
+    #         dataset=args.val_dataset_key,                 # 'scannet'
+    #         dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
+    #         device='cuda' if torch.cuda.is_available() else 'cpu',
+    #         input_size=518,
+    #         scenes_to_eval=args.val_scenes,               # 2 scenes subset
+    #         fp32=True
+    #     )
+    # finally:
+    #     # 원래 학습 모드 복귀
+    #     if _prev_train_state:
+    #         model.student.train()
 
-    # 콘솔/파일 로그
-    logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
+    # init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
+    # init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
+    # init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
 
-    # W&B 로깅 (epoch=-1로 표기)
-    wandb.log({
-        "init/absrel": init_absrel,
-        "init/rmse":   init_rmse,
-        "init/delta1": init_delta1,
-        "epoch": -1,
-    })
+    # # 콘솔/파일 로그
+    # logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
 
-    # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
-    best_delta1 = init_delta1
+    # # W&B 로깅 (epoch=-1로 표기)
+    # wandb.log({
+    #     "init/absrel": init_absrel,
+    #     "init/rmse":   init_rmse,
+    #     "init/delta1": init_delta1,
+    #     "epoch": -1,
+    # })
+
+    # # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
+    # best_delta1 = init_delta1
 
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
-        kitti_train.set_epoch(epoch)
         model.train()
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = epoch_kd = 0.0
@@ -593,10 +575,21 @@ def train(args):
                 epoch_tgm    += tgm_loss.item()  * B_eff
                 epoch_kd     += kd_loss.item()   * B_eff
 
+                # 평균 손실 (unweighted)
+                avg_ssi = epoch_ssi / max(1, epoch_frames)
+                avg_tgm = epoch_tgm / max(1, epoch_frames)
+                avg_kd  = epoch_kd  / max(1, epoch_frames)
+
+                # 가중치 반영: config_jh.yaml에 정의된 ratio_ssi, ratio_tgm을 곱한 값
+                # KD는 kd_loss에 이미 kd_weight가 곱해져 누적되므로 그대로 wKD로 사용
+                wSSI = ratio_ssi * avg_ssi
+                wTGM = ratio_tgm * avg_tgm
+                wKD  = avg_kd
+
                 frame_pbar.set_postfix({
-                    'SSI': f'{epoch_ssi/ max(1, epoch_frames):.4f}',
-                    'TGM': f'{epoch_tgm/ max(1, epoch_frames):.4f}',
-                    'KD':  f'{epoch_kd / max(1, epoch_frames):.2e}',
+                    'wSSI': f'{wSSI:.4f}',
+                    'wTGM': f'{wTGM:.4f}',
+                    'wKD':  f'{wKD:.4f}',
                 })
             frame_pbar.close()
         batch_pbar.close()
