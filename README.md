@@ -1,153 +1,254 @@
-<div align="center">
-<h1>Video Depth Anything</h1>
-  
-[**Sili Chen**](https://github.com/SiliChen321) · [**Hengkai Guo**](https://guohengkai.github.io/)<sup>&dagger;</sup> · [**Shengnan Zhu**](https://github.com/Shengnan-Zhu)  · [**Feihu Zhang**](https://github.com/zhizunhu)
-<br>
-[**Zilong Huang**](http://speedinghzl.github.io/)   ·  [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)   ·  [**Bingyi Kang**](https://bingykang.github.io/)<sup>&dagger;</sup> 
-<br>
-ByteDance
-<br>
-&dagger;Corresponding author
+# Knowledge Distillation for Video-Depth (Non-Streaming → Streaming) with Auxiliary Non-Streaming Layer
 
-<a href="https://arxiv.org/abs/2501.12375"><img src='https://img.shields.io/badge/arXiv-Video Depth Anything-red' alt='Paper PDF'></a>
-<a href='https://videodepthanything.github.io'><img src='https://img.shields.io/badge/Project_Page-Video Depth Anything-green' alt='Project Page'></a>
-<a href='https://huggingface.co/spaces/depth-anything/Video-Depth-Anything'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
-</div>
+본 문서는 비-스트리밍 Teacher에서 스트리밍 Student로의 KD를 **Auxiliary Non-streaming Layer(=Aux)**로 정합하여,
+(1) Feature similarity, (2) Self-Attention(Q/K/V) KL, (3) APC(Future) loss를 적용하는 구현 가이드를 제공합니다.
 
-</div>
+## TL;DR
 
-This work presents **Video Depth Anything** based on [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2), which can be applied to arbitrarily long videos without compromising quality, consistency, or generalization ability. Compared with other diffusion-based models, it enjoys faster inference speed, fewer parameters, and higher consistent depth accuracy.
+Student의 특정 레이어 ℓ 출력 `s_ℓ` → AuxBlock(Proj → 1L Transformer(비-스트리밍) → Uni-LSTM) → `(z_ℓ, r_ℓ, QKV_aux)`
 
-![teaser](assets/teaser_video_v2.png)
+Teacher의 동일 레이어 ℓ 출력 `h_ℓ`, `QKV_teacher`와 KD:
 
-## News
-- **2025-07-03:** 🚀🚀🚀 Release an experimental version of training-free **streaming video depth estimation**.
-- **2025-07-03:** Release our implementation of [training loss](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/loss).
-- **2025-04-25:** 🌟🌟🌟 Release [metric depth model](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/metric_depth) based on Video-Depth-Anything-Large.
-- **2025-04-05:** Our paper has been accepted for a **highlight** presentation at [CVPR 2025](https://cvpr.thecvf.com/) (13.5% of the accepted papers).
-- **2025-03-11:** Add full dataset inference and evaluation [scripts](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/benchmark).
-- **2025-02-08:** Enable autocast inference. Support grayscale video, NPZ and EXR output formats.
-- **2025-01-21:** Paper, project page, code, models, and demo are all released.
+- **Feature**: `h_ℓ ↔ z_ℓ` (L1 + −logσ(cos))
+- **Self-Attention**: MiniLM-v2 방식으로 Q/Q + K/K + V/V 관계 KL
+- **APC**: `r_ℓ,t`가 `h_ℓ,t+N` 예측 (미래 N 프레임). Aux-Transformer에는 홀-마스크(t가 [t+1..t+N]을 못 보게) 적용
 
+학습 시 Teacher는 고정, Student+Aux만 업데이트. 추론 시 Aux는 사용하지 않음(학습 전용).
 
-## Release Notes
-- **2025-02-08:** 🚀🚀🚀 Inference speed and memory usage improvement
-  <table>
-    <thead>
-      <tr>
-        <th rowspan="2" style="text-align: center;">Model</th>
-        <th colspan="2">Latency (ms)</th>
-        <th colspan="2">GPU VRAM (GB)</th>
-      </tr>
-      <tr>
-        <th>FP32</th>
-        <th>FP16</th>
-        <th>FP32</th>
-        <th>FP16</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Video-Depth-Anything-V2-Small</td>
-        <td>9.1</td>
-        <td><strong>7.5</strong></td>
-        <td>7.3</td>
-        <td><strong>6.8</strong></td>
-      </tr>
-      <tr>
-        <td>Video-Depth-Anything-V2-Large</td>
-        <td>67</td>
-        <td><strong>14</strong></td>
-        <td>26.7</td>
-        <td><strong>23.6</strong></td>
-    </tbody>
-  </table>
+---
 
-  The Latency and GPU VRAM results are obtained on a single A100 GPU with input of shape 1 x 32 x 518 × 518.
+## 1. 디렉토리 구조 (수정 포인트만)
 
-## Pre-trained Models
-We provide **two models** of varying scales for robust and consistent video depth estimation:
-
-| Model | Params | Checkpoint |
-|:-|-:|:-:|
-| Video-Depth-Anything-V2-Small | 28.4M | [Download](https://huggingface.co/depth-anything/Video-Depth-Anything-Small/resolve/main/video_depth_anything_vits.pth?download=true) |
-| Video-Depth-Anything-V2-Large | 381.8M | [Download](https://huggingface.co/depth-anything/Video-Depth-Anything-Large/resolve/main/video_depth_anything_vitl.pth?download=true) |
-| Video-Depth-Anything-V2-Large-Metric | 381.8M | [Download](https://huggingface.co/depth-anything/Metric-Video-Depth-Anything-Large/resolve/main/metric_video_depth_anything_vitl.pth) |
-
-
-## Usage
-
-### Preparation
-
-```bash
-git clone https://github.com/DepthAnything/Video-Depth-Anything
-cd Video-Depth-Anything
-pip install -r requirements.txt
+```
+video-stream/
+├─ train.py                     # ← KD 손실 결합/로깅
+├─ video_depth_anything/
+│  ├─ video_depth.py            # ← Teacher: intermediates/QKV 반환
+│  ├─ video_depth_stream.py     # ← Student: Aux 연결 + intermediates/QKV 반환
+│  ├─ dpt_temporal.py           # ← ★ Temporal block에서 [B,T,C] feat + [B,A,T,d] QKV 노출
+│  └─ motion_module/
+│     └─ motion_module.py       # ← (해당 시) temporal attn QKV 생성부 훅
+└─ utils/
+   ├─ loss_kd_aux.py            # ← ★ 새로 추가: DIS/KLD/APC 손실
+   └─ ...
 ```
 
-Download the checkpoints listed [here](#pre-trained-models) and put them under the `checkpoints` directory.
-```bash
-bash get_weights.sh
-```
+---
 
-### Inference a video
-```bash
-python3 run.py --input_video ./assets/example_videos/davis_rollercoaster.mp4 --output_dir ./outputs --encoder vitl
-```
+## 2. 구현 개요
 
-Options:
-- `--input_video`: path of input video
-- `--output_dir`: path to save the output results
-- `--input_size` (optional): By default, we use input size `518` for model inference.
-- `--max_res` (optional): By default, we use maximum resolution `1280` for model inference.
-- `--encoder` (optional): `vits` for Video-Depth-Anything-V2-Small, `vitl` for Video-Depth-Anything-V2-Large.
-- `--max_len` (optional): maximum length of the input video, `-1` means no limit
-- `--target_fps` (optional): target fps of the input video, `-1` means the original fps
-- `--fp32` (optional): Use `fp32` precision for inference. By default, we use `fp16`.
-- `--grayscale` (optional): Save the grayscale depth map, without applying color palette.
-- `--save_npz` (optional): Save the depth map in `npz` format.
-- `--save_exr` (optional): Save the depth map in `exr` format.
+### 2.1 중간 표현 & Q/K/V 노출 (공통 인터페이스)
 
-### Inference a video using streaming mode (Experimental features)
-We implement an experimental streaming mode **without training**. In details, we save the hidden states of temporal attentions for each frames in the caches, and only send a single frame into our video depth model during inference by reusing these past hidden states in temporal attentions. We hack our pipeline to align the original inference setting in the offline mode. Due to the inevitable gap between training and testing, we observe a **performance drop** between the streaming model and the offline model (e.g. the `d1` of ScanNet drops from `0.926` to `0.836`). Finetuning the model in the streaming mode will greatly improve the performance. We leave it for future work.
+각 Temporal block(또는 그 직후)에서:
 
-To run the streaming model:
-```bash
-python3 run_streaming.py --input_video ./assets/example_videos/davis_rollercoaster.mp4 --output_dir ./outputs_streaming --encoder vitl
-```
-Options:
-- `--input_video`: path of input video
-- `--output_dir`: path to save the output results
-- `--input_size` (optional): By default, we use input size `518` for model inference.
-- `--max_res` (optional): By default, we use maximum resolution `1280` for model inference.
-- `--encoder` (optional): `vits` for Video-Depth-Anything-V2-Small, `vitl` for Video-Depth-Anything-V2-Large.
-- `--max_len` (optional): maximum length of the input video, `-1` means no limit
-- `--target_fps` (optional): target fps of the input video, `-1` means the original fps
-- `--fp32` (optional): Use `fp32` precision for inference. By default, we use `fp16`.
-- `--grayscale` (optional): Save the grayscale depth map, without applying color palette.
+- **`feat_ℓ_pooled`**: `[B, T, C_T]` (공간 평균 or CLS로 pooling. Teacher/Student 통일)
+- **`qkv_ℓ`**: dict `{Q,K,V}` 각 `[B, A, T, d]`
 
-## Training Loss
-Our training loss is in `loss/` directory. Please see the `loss/test_loss.py` for usage.
+모델 `forward(..., return_intermediates=True)` 시 레이어별 dict를 반환:
 
-## Fine-tuning to a metric-depth video model
-Please refer to [Metric Depth](./metric_depth/README.md).
-
-## Benchmark
-Please refer to [Benchmark](./benchmark/README.md).
-
-## Citation
-
-If you find this project useful, please consider citing:
-
-```bibtex
-@article{video_depth_anything,
-  title={Video Depth Anything: Consistent Depth Estimation for Super-Long Videos},
-  author={Chen, Sili and Guo, Hengkai and Zhu, Shengnan and Zhang, Feihu and Huang, Zilong and Feng, Jiashi and Kang, Bingyi}
-  journal={arXiv:2501.12375},
-  year={2025}
+```python
+intermediates = {
+  ℓ: {
+    "feat": feat_ℓ_pooled,   # [B,T,C_T] or [B,T,C_S] (Aux에서 proj로 C_T에 정합)
+    "qkv": {"Q": Q, "K": K, "V": V}  # [B,A,T,d]
+  },
+  ...
 }
 ```
 
+### 2.2 Auxiliary Non-streaming Layer (Student 전용, 학습 중에만 사용)
 
-## LICENSE
-Video-Depth-Anything-Small model is under the Apache-2.0 license. Video-Depth-Anything-Large model is under the CC-BY-NC-4.0 license. For business cooperation, please send an email to Hengkai Guo at guohengkaighk@gmail.com.
+**Proj(C_S→C_T) → 1L Transformer(비-스트리밍, 홀-마스크 지원) → Uni-LSTM**
+
+반환: `(z_ℓ, r_ℓ, qkv_aux_ℓ)`
+
+- **`z_ℓ`**: Transformer 출력의 `[B,T,C_T]`
+- **`r_ℓ`**: Uni-LSTM 출력의 `[B,T,C_T]`
+- **`qkv_aux_ℓ`**: Aux-Transformer의 Q/K/V `[B,A,T,d]`
+
+**홀-마스크**: APC 타깃 프레임 `t+N`을 직접 못 보게 `M[t,k] = -inf` (`k∈(t+1..t+N]`)
+
+---
+
+## 3. 손실 정의
+
+### 3.1 Feature similarity (DistilHuBERT 스타일)
+
+$$L_{DIS} = \sum_t \left[ \frac{1}{D} \|h_t - z_t\|_1 - \log\sigma(\cos(h_t, z_t)) \right]$$
+
+- `h_t`, `z_t`는 `[B,T,C]` 프레임별 비교, padding/valid 마스크 적용
+
+### 3.2 Self-Attention 관계 KL (MiniLM-v2)
+
+예: Query-Query 관계
+
+$$R^Q_{(a,t)} = \text{Softmax}_k\!\left(\frac{q_{a,t}q_{a,k}^\top}{\sqrt{d}}\right), \quad L^Q_{KLD} = \frac{1}{A}\sum_{a,t} \text{KL}(R^Q_T \| R^Q_S)$$
+
+K/K, V/V도 동일하게 계산하여 합산:
+
+$$L_{KLD} = L^Q_{KLD} + L^K_{KLD} + L^V_{KLD}$$
+
+- 수치안정: `clamp(1e-8)` 또는 `log_softmax` 기반 KL
+
+### 3.3 APC(Future) loss
+
+$$L_{APC} = \sum_{t=1}^{T-N} \left[ \frac{1}{D} \|h_{t+N} - r_t\|_1 - \log\sigma(\cos(h_{t+N}, r_t)) \right]$$
+
+- Aux-Transformer는 t가 `[t+1..t+N]`을 못 보도록 마스크 적용
+
+### 3.4 레이어 통합 & 총손실
+
+$$L_{KD} = \sum_{\ell \in L} \left( \alpha L^{(\ell)}_{DIS} + \beta L^{(\ell)}_{KLD} + \gamma L^{(\ell)}_{APC} \right)$$
+
+$$L_{total} = L_{depth} + \lambda_{KD} \cdot L_{KD}$$
+
+---
+
+## 4. 하이퍼파라미터(초기값)
+
+```yaml
+kd_aux:
+  enabled: true
+  layers: [2, 5, 8]        # temporal block index
+  feature_pool: "mean"     # or "cls"
+  N: 2                     # APC 미래 예측 스텝
+  alpha: 0.01
+  beta: 0.0005
+  gamma: 0.005
+  lambda_kd: 1.0
+  attn_eps: 1.0e-8
+```
+
+---
+
+## 5. 수정 순서 (권장)
+
+### ① `dpt_temporal.py`
+
+- Temporal block 출구에서 **공간 풀링된 feat `[B,T,C]`**와 **Q/K/V `[B,A,T,d]`**를 쉽게 꺼낼 수 있도록 리팩토링.
+- `forward(..., return_intermediates=True)` 인자 추가 및 `intermediates` dict 구성.
+
+### ② (필요 시) `motion_module/motion_module.py`
+
+- 실제 Q/K/V 계산이 이 모듈에 있다면, 마스크/shape 일관성 유지 및 훅 지점 노출.
+
+### ③ `video_depth.py` (Teacher)
+
+- `return_intermediates=True` 경로를 연결해 레이어별 feat/QKV를 반환.
+- 양방향 마스크 보장. `requires_grad=False`(학습 시).
+
+### ④ `video_depth_stream.py` (Student)
+
+- 동일한 반환 인터페이스(ℓ별 feat/QKV). causal 마스크 사용.
+- AuxBlock(레이어별) 주입: `self.aux_blocks[ℓ]`
+- 학습 모드에서만 Aux forward를 수행하고 추론 모드에서는 skip.
+
+### ⑤ `utils/loss_kd_aux.py` (신규)
+
+- `distilhubert_feature_loss`, `attention_relation_kl`, `apc_loss` 구현.
+- 마스크, 경계(`t≤T−N`), 수치안정 처리.
+
+### ⑥ `train.py`
+
+- Teacher/Student 동시 forward (학습 시 T-frame clip 단위).
+- 레이어별 Aux forward → 세 손실 계산 → 기존 depth loss와 합산 → 역전파.
+- W&B 로깅: 레이어별 `{DIS, KLD, APC}`, 합계, depth 메트릭.
+
+---
+
+## 6. 최소 인터페이스(예시 코드 스니펫)
+
+### 6.1 모델 출력 포맷(공통)
+
+```python
+# in video_depth.py / video_depth_stream.py
+def forward(self, x, return_intermediates=False, **kwargs):
+    # ...
+    if return_intermediates:
+        return {
+           "pred": pred_depth,            # [B,T,1,H,W] or similar
+           "intermediates": {
+              ℓ: {
+                  "feat": feat_ℓ_pooled,  # [B,T,C_T or C_S]
+                  "qkv": {"Q": Q, "K": K, "V": V}  # [B,A,T,d]
+              } for ℓ in layer_indices
+           }
+        }
+    return pred_depth
+```
+
+### 6.2 AuxBlock 시그니처
+
+```python
+class AuxBlock(nn.Module):
+    def __init__(self, c_in, c_teacher, nhead=8, ...):
+        super().__init__()
+        # Proj(C_S→C_T), 1L Transformer(bi, hole-mask), Uni-LSTM
+        
+    def forward(self, s_feat, hole_mask_N=0):
+        """
+        s_feat: [B,T,C_S]
+        return: z_feat[B,T,C_T], r_feat[B,T,C_T], qkv_aux{Q,K,V}[B,A,T,d]
+        """
+```
+
+### 6.3 Train 루프(핵심)
+
+```python
+with torch.no_grad():
+    t = teacher(x, return_intermediates=True)
+    
+s = student(x, return_intermediates=True)
+
+L_kd_all = []
+for ℓ in cfg.kd_aux.layers:
+    h = t["intermediates"][ℓ]["feat"]          # [B,T,C_T]
+    qkv_t = t["intermediates"][ℓ]["qkv"]
+    s_feat = s["intermediates"][ℓ]["feat"]     # [B,T,C_S]
+
+    z, r, qkv_aux = aux_blocks[ℓ](s_feat, hole_mask_N=cfg.kd_aux.N)
+
+    l_dis = distilhubert_feature_loss(h, z, mask=valid_mask)
+    l_kld = attention_relation_kl(qkv_t, qkv_aux, mask=valid_mask, eps=cfg.kd_aux.attn_eps)
+    l_apc = apc_loss(h, r, N=cfg.kd_aux.N, mask=valid_mask)
+
+    L_kd_all.append(cfg.kd_aux.alpha*l_dis + cfg.kd_aux.beta*l_kld + cfg.kd_aux.gamma*l_apc)
+
+L_kd = torch.stack(L_kd_all).mean()
+L_total = L_depth + cfg.kd_aux.lambda_kd * L_kd
+L_total.backward()
+optimizer.step()
+```
+
+---
+
+## 7. 마스크 & 수치 안정
+
+- **Padding/짧은 클립**: `valid_mask ∈ {0,1}^[B,T]`
+- **Feature/APC**는 프레임별 마스킹, **Attn KL**은 softmax에서 `-inf` 마스킹
+- **KL 안정화**: `p,q = clamp(1e-8)` 후 `kl = (p * (log p - log q)).sum(-1)`
+- **APC 경계**: `t ≤ T−N`만 유효
+
+---
+
+## 8. 로깅 권장(W&B)
+
+- `kd/ℓ2/dis`, `kd/ℓ5/kld_q`, `kd/ℓ5/kld_k`, `kd/ℓ5/kld_v`, `kd/ℓ8/apc`
+- `kd/total`, `loss/total`, `depth/ssi`, `depth/tgm`, `metrics/delta1`, `metrics/absrel`
+
+학습 안정화를 위해 `beta`(KLD)부터 낮게 시작해 점진 증가 가능
+
+---
+
+## 9. 체크리스트
+
+- [ ] Teacher/Student 동일 전처리/크롭/정규화
+- [ ] Temporal block에서 `[B,T,C]` feat + `[B,A,T,d]` Q/K/V 노출
+- [ ] AuxBlock이 `z`, `r`, `qkv` 반환 & 홀-마스크 지원
+- [ ] Teacher 고정, Student+Aux만 업데이트
+- [ ] 추론 시 Aux 미사용
+- [ ] W&B 로깅 및 각 loss 스케일 모니터링
+
+---
+
+**끝**

@@ -22,12 +22,19 @@ from data.dataLoader import *                 # KITTIVideoDataset, get_data_list
 
 # 모델
 from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthStudent
+from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTeacher
+from video_depth_anything.aux.aux_block import AuxBlock          # Proj -> 1L Transformer(bi, hole-mask) -> Uni-LSTM
+from utils.loss_kd_aux import (
+    distilhubert_feature_loss,   # L_DIS
+    attention_relation_kl,       # L_KLD (Q/Q + K/K + V/V)
+    apc_loss                     # L_APC
+)
 
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 100
+experiment = 1
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -69,13 +76,25 @@ def train(args):
     batch_size = hyper_params["batch_size"]
     CLIP_LEN   = hyper_params["clip_len"]           # W=32
 
+    # KD Aux 기본값 주입 (config_jh.yaml에 없을 때 대비)
+    kd_cfg = config.get("kd_aux", {})
+    kd_enabled   = bool(kd_cfg.get("enabled", True))
+    kd_layers    = kd_cfg.get("layers", [0, 1, 2, 3])   # dpt_temporal에서 우리가 잡은 4개 temporal 지점
+    kd_N         = int(kd_cfg.get("N", 2))              # APC 미래 스텝
+    kd_alpha     = float(kd_cfg.get("alpha", 1e-2))
+    kd_beta      = float(kd_cfg.get("beta", 5e-4))
+    kd_gamma     = float(kd_cfg.get("gamma", 5e-3))
+    kd_lambda    = float(kd_cfg.get("lambda_kd", 1.0))
+    kd_attn_eps  = float(kd_cfg.get("attn_eps", 1e-8))
+    kd_pool      = kd_cfg.get("feature_pool", "mean")
+
     if args.epochs is not None:
         num_epochs = int(args.epochs)
 
     # W&B
     load_dotenv(dotenv_path=".env")
     wandb.login(key=os.getenv("WANDB_API_KEY", ""), relogin=True)
-    run = wandb.init(project="stream_teacher_student", config=hyper_params, name=f"experiment_{experiment}")
+    run = wandb.init(project="ablation_reverse", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
     kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
@@ -85,6 +104,32 @@ def train(args):
 
     # 모델 (단일 GPU)
     student = VideoDepthStudent(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
+    # --- Teacher (offline, bidirectional) ---
+    teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    # --- KD용 레이어별 channel 정의 (우리 dpt_temporal 인덱스 0..3에 대응)
+    #   idx 0: layer_3 temporal, 1: layer_4 temporal, 2: path_4 temporal, 3: path_3 temporal
+    TEACHER_DIMS = [192,  384,   64,   64]   # teacher out_channels[2], out_channels[3], features, features
+    STUDENT_DIMS = [192,  384,   64,   64]  # student out_channels[2], out_channels[3], features, features  (현재 student 설정 기준)
+
+    # --- AuxBlocks (Student 각 레이어 feat -> C_T로 proj)
+    aux_blocks = nn.ModuleDict({
+        str(i): AuxBlock(
+            c_in=STUDENT_DIMS[i],
+            c_teacher=TEACHER_DIMS[i],
+            nhead=8,
+            dropout=0.0,
+            return_attn=False,
+            return_qkv=True,            # Aux 내부 1L Transformer의 Q/K/V 수집
+            rnn_type="lstm",            # 또는 "mamba" 실험 가능
+            mamba_d_state=16,
+            mamba_d_conv=4,
+            mamba_expand=2,
+        ).to(device) for i in kd_layers
+    })
 
     # Pretrained
     if args.pretrained_ckpt:
@@ -100,6 +145,7 @@ def train(args):
 
     # Optim/Sch
     student_params = [p for p in student.parameters() if p.requires_grad]
+    aux_params     = [p for p in aux_blocks.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(student_params, lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
@@ -139,6 +185,10 @@ def train(args):
             try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             except Exception as e: logger.warning(f"Scheduler state load skipped: {e}")
 
+        if "aux_state_dict" in ckpt:
+            try: aux_blocks.load_state_dict(ckpt["aux_state_dict"])
+            except Exception as e: logger.warning(f"Aux state load skipped: {e}")
+
         # 3) 베스트 스코어 & 스타트 에폭
         if "best_val_delta1" in ckpt:
             try: best_delta1 = float(ckpt["best_val_delta1"])
@@ -149,60 +199,61 @@ def train(args):
         logger.info(f"▶ Resumed from '{args.resume_from}' | start_epoch={start_epoch} / target_epochs={num_epochs} | best_delta1={best_delta1:.4f}")
 
     wandb.watch(student, log="all")
+    wandb.watch(aux_blocks, log="all")
     best_delta1 = 0.0
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
-    
-    # ---- Init real-pipeline validation (epoch = -1) ----
-    # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
-    init_infer_dir = os.path.join(args.val_infer_dir, "init")
-    os.makedirs(init_infer_dir, exist_ok=True)
 
-    # 일시적으로 eval 모드
-    _prev_train_state = student.training
-    student.eval()
-    try:
-        init_metrics = validate_with_infer_eval_subset(
-            model=student,                          # 학생만 사용
-            json_file=args.val_json_file,                 # e.g., scannet_video_500.json
-            infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
-            dataset=args.val_dataset_key,                 # 'scannet'
-            dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            input_size=518,
-            scenes_to_eval=args.val_scenes,               # 2 scenes subset
-            fp32=True
-        )
-    finally:
-        # 원래 학습 모드 복귀
-        if _prev_train_state:
-            student.train()
+    if not args.test:
+        # ---- Init real-pipeline validation (epoch = -1) ----
+        # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
+        init_infer_dir = os.path.join(args.val_infer_dir, "init")
+        os.makedirs(init_infer_dir, exist_ok=True)
 
-    init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-    init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-    init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+        # 일시적으로 eval 모드
+        _prev_train_state = student.training
+        student.eval()
+        try:
+            init_metrics = validate_with_infer_eval_subset(
+                model=student,                          # 학생만 사용
+                json_file=args.val_json_file,                 # e.g., scannet_video_500.json
+                infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
+                dataset=args.val_dataset_key,                 # 'scannet'
+                dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                input_size=518,
+                scenes_to_eval=args.val_scenes,               # 2 scenes subset
+                fp32=True
+            )
+        finally:
+            # 원래 학습 모드 복귀
+            if _prev_train_state:
+                student.train()
 
-    # 콘솔/파일 로그
-    logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
+        init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
+        init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
+        init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
 
-    # W&B 로깅 (epoch=-1로 표기)
-    wandb.log({
-        "init/absrel": init_absrel,
-        "init/rmse":   init_rmse,
-        "init/delta1": init_delta1,
-        "epoch": -1,
-    })
+        # 콘솔/파일 로그
+        logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
 
-    # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
-    best_delta1 = init_delta1
+        # W&B 로깅 (epoch=-1로 표기)
+        wandb.log({
+            "init/absrel": init_absrel,
+            "init/rmse":   init_rmse,
+            "init/delta1": init_delta1,
+            "epoch": -1,
+        })
 
+        # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
+        best_delta1 = init_delta1
 
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
         student.train()
         epoch_loss = epoch_frames = 0.0
-        epoch_ssi = epoch_tgm = 0.0
+        epoch_ssi = epoch_tgm = epoch_kd = 0.0
         accum_loss = 0.0
         step_in_window = 0
         update_frequency = hyper_params.get("update_frequency", 6)
@@ -219,6 +270,66 @@ def train(args):
             cache = None
             prev_pred_raw = prev_mask = prev_y = None
 
+            # ====== (KD) Full-clip forward ======
+            if kd_enabled:
+                with torch.no_grad():
+                    t_out = teacher(
+                        x, return_intermediates=True, return_qkv=True, feature_pool=kd_pool
+                    )
+                    t_inter = t_out["intermediates"]  # dict[idx]-> {"feat":[B,T,Ct], "qkv":{"Q","K","V":[B,A,T,Dh]}}
+                # student도 '학습용 풀클립 경로'(캐시X)로 추론해 intermediates 수집
+                s_out = student(
+                    x, return_intermediates=True, return_qkv=True, feature_pool=kd_pool
+                )
+                s_inter = s_out["intermediates"]     # dict[idx]-> {"feat":[B,T,Cs], "qkv":...}
+
+                # frame 유효 마스크 (KITTI depth에는 invalid가 있음) : [B,T] in {0,1}
+                with torch.no_grad():
+                    # y: [B,T,1,H,W], 값>1e-3 & <80.0 유효 (train_helper.get_mask 기준)
+                    valid_mask_bt = []
+                    for tmask in range(T):
+                        m = get_mask(y[:, tmask:tmask+1], 1e-3, 80.0).to(device)  # [B,1,1,H,W]
+                        # spatial OR/mean → frame-wise 마스크 (하나라도 유효 픽셀이 있으면 1)
+                        v = (m.squeeze(2).squeeze(1).any(dim=(1,2))).float()      # [B]
+                        valid_mask_bt.append(v)
+                    valid_mask_bt = torch.stack(valid_mask_bt, dim=1)  # [B,T]
+
+                # 레이어별 KD 계산
+                kd_terms = {"dis":0.0, "kld":0.0, "apc":0.0}
+                num_used = 0
+                for li in kd_layers:
+                    li = int(li)
+                    h_feat = t_inter[li]["feat"]                    # [B,T,Ct]
+                    t_qkv  = t_inter[li]["qkv"]                    # dict or None
+                    s_feat = s_inter[li]["feat"]                   # [B,T,Cs]
+
+                    # Aux: s_feat -> (z, r, qkv_aux)
+                    z_feat, r_feat, qkv_aux = aux_blocks[str(li)](
+                        s_feat, hole_mask_N=kd_N
+                    )  # z,r:[B,T,Ct], qkv_aux: dict with [B,A,T,Dh] or None
+
+                    # (A) Feature
+                    l_dis = distilhubert_feature_loss(h_feat, z_feat, mask=valid_mask_bt)
+                    # (B) Attn KL (Q/Q + K/K + V/V) — teacher/student 둘 다 qkv가 필요
+                    if (t_qkv is not None) and (qkv_aux is not None):
+                        l_kld = attention_relation_kl(t_qkv, qkv_aux, mask=valid_mask_bt, eps=kd_attn_eps)
+                    else:
+                        l_kld = h_feat.new_tensor(0.0)
+                    # (C) APC
+                    l_apc = apc_loss(h_feat, r_feat, N=kd_N, mask=valid_mask_bt)
+
+                    kd_terms["dis"] += l_dis
+                    kd_terms["kld"] += l_kld
+                    kd_terms["apc"] += l_apc
+                    num_used += 1
+
+                if num_used > 0:
+                    for k in kd_terms:
+                        kd_terms[k] = kd_terms[k] / num_used
+                L_kd = kd_alpha * kd_terms["dis"] + kd_beta * kd_terms["kld"] + kd_gamma * kd_terms["apc"]
+            else:
+                L_kd = torch.tensor(0.0, device=device)
+                kd_terms = {"dis":0.0, "kld":0.0, "apc":0.0}
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
                 x_t = x[:, t:t+1]                              # [B,1,3,H,W]
@@ -256,6 +367,10 @@ def train(args):
 
                     loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
 
+                    # KD는 배치 내 클립 기준 한 번만 더함(여기서는 t==0에만 더함)
+                    if kd_enabled and t == 0:
+                        loss = loss + kd_lambda * L_kd
+
                 # 누적/업데이트
                 accum_loss += loss / update_frequency
                 step_in_window += 1
@@ -280,10 +395,12 @@ def train(args):
                 epoch_frames += B_eff
                 epoch_ssi    += ssi_loss_t.item() * B_eff
                 epoch_tgm    += tgm_loss.item()  * B_eff
+                epoch_kd     += L_kd.item()      * B_eff
 
                 frame_pbar.set_postfix({
                     'SSI': f'{epoch_ssi/ max(1, epoch_frames):.4f}',
-                    'TGM': f'{epoch_tgm/ max(1, epoch_frames):.4f}'
+                    'TGM': f'{epoch_tgm/ max(1, epoch_frames):.4f}',
+                    'L_KD': f'{epoch_kd/ max(1, epoch_frames):.4f}' if kd_enabled else '0.0000'
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -315,6 +432,10 @@ def train(args):
             "val_real/rmse":   val_rmse,
             "val_real/delta1": val_delta1,
             "epoch": epoch,
+            "kd/dis": float(kd_terms["dis"]) if kd_enabled else 0.0,
+            "kd/kld": float(kd_terms["kld"]) if kd_enabled else 0.0,
+            "kd/apc": float(kd_terms["apc"]) if kd_enabled else 0.0,
+            "kd/total": float(L_kd.item()) if kd_enabled else 0.0,
         })
 
         # best 저장 (delta1 ↑)
@@ -341,6 +462,7 @@ def train(args):
             "val_delta1": val_delta1,
             "val_rmse":   val_rmse,
             "config": hyper_params,
+            "aux_state_dict": aux_blocks.state_dict(),
         }, latest_model_path)
         logger.info(f"📁 Latest model saved to {latest_model_path}")
 
@@ -362,12 +484,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
     # real-pipeline mini-validation 설정
-    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth//stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
+    parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
     parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
+    parser.add_argument("--test", action="store_true", help="Only run validation")
     args = parser.parse_args()
     train(args)

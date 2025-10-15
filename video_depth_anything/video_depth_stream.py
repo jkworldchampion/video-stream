@@ -64,9 +64,33 @@ class VideoDepthAnything(nn.Module):
         self.id = -1
 
     # ----------- public / core -----------
-    def forward(self, x):
-        return self.forward_depth(self.forward_features(x), x.shape)[0]
-    
+    def forward(
+        self,
+        x,
+        *,
+        return_intermediates: bool = False,
+        return_qkv: bool = False,
+        feature_pool: str = "mean",
+    ):
+        """
+        학습(풀클립) 경로:
+          - 기본: [B,T,H,W]
+          - return_intermediates=True: {"pred": [B,T,H,W], "intermediates": dict}
+        """
+        features = self.forward_features(x)
+        out = self.forward_depth(
+            features, x.shape,
+            cached_hidden_state_list=None,  # 학습 풀클립에선 캐시 사용 X
+            return_intermediates=return_intermediates,
+            return_qkv=return_qkv,
+            feature_pool=feature_pool,
+        )
+        if return_intermediates or return_qkv:
+            depth_bt, _cache, intermediates = out
+            return {"pred": depth_bt, "intermediates": intermediates}
+        depth_bt, _cache = out
+        return depth_bt
+
     def forward_features(self, x):
         # x: [B, T, C, H, W]
         features = self.pretrained.get_intermediate_layers(
@@ -74,20 +98,39 @@ class VideoDepthAnything(nn.Module):
         )
         return features
 
-    def forward_depth(self, features, x_shape, cached_hidden_state_list=None):
+    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean"):
         """
         features: encoder intermediate features of current clip
         cached_hidden_state_list: (옵션) 과거 hidden state (모션 모듈 4곳의 리스트)
+        반환:
+          - 기본: (depth_bt, cache)
+          - return_intermediates=True: (depth_bt, cache, intermediates)
         """
         B, T, C, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
 
-        depth, cur_cached_hidden_state_list = self.head(
-            features, patch_h, patch_w, T, cached_hidden_state_list=cached_hidden_state_list
-        )
+        if return_intermediates or return_qkv:
+            depth_raw = self.head(
+                features, patch_h, patch_w, T,
+                cached_hidden_state_list=cached_hidden_state_list,
+                return_intermediates=True,
+                return_qkv=return_qkv,
+                feature_pool=feature_pool,
+            )
+            depth, cur_cache, intermediates = depth_raw
+        else:
+            depth, cur_cache = self.head(
+                features, patch_h, patch_w, T,
+                cached_hidden_state_list=cached_hidden_state_list,
+            )
+
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
-        return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list  # [B, T, H, W]
+        depth_bt = depth.squeeze(1).unflatten(0, (B, T))  # [B,T,H,W]
+
+        if return_intermediates or return_qkv:
+            return depth_bt, cur_cache, intermediates
+        return depth_bt, cur_cache
     
     @torch.no_grad()
     def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False):
