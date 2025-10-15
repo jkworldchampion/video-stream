@@ -88,37 +88,87 @@ def _detach_cache(cache):
         return cache.detach()
     return cache  # unknown type as-is
 
-def model_stream_step(model, x_t, cache=None):
+def model_stream_step(
+    model,
+    x_t,
+    cache=None,
+    *,
+    collect_inter: bool = False,
+    collect_qkv: bool = False,
+    feature_pool: str = "mean",
+    return_encoder_feats: bool = False,  # ← 새 플래그
+):
     """
-    최소 베이스라인: '학생 모델 단독' 스트리밍 1-step.
-    캐시를 전달/반환하여 시간축 문맥을 유지한다.
-    x_t: [B,1,3,H,W] → returns (pred[B,H,W], new_cache)
+    Streaming 1-step forward (학생용).
+    - collect_inter=True면 레이어별 temporal feature/QKV(현재 프레임 것만)를 inter_t로 반환.
+    - return_encoder_feats=True면 encoder 출력(feats)도 함께 반환.
+    - 반환 형식:
+        pred_t:   [B,H,W]
+        new_cache: any
+        inter_t:  dict[layer_id] -> {"feat_one":[B,1,C], "qkv":Optional dict(Q/K/V:[B,A,1,Dh])}
+        feats:    list of encoder features (return_encoder_feats=True일 때만)
     """
     m = model.module if hasattr(model, "module") else model
-    if not hasattr(m, "forward_depth"):
-        # 극히 예외적인 경우: 스트리밍 헤드 미구현 — 전체 forward로 폴백(캐시 없음)
-        out = m.forward(x_t)
-        pred = out[0] if isinstance(out, (tuple, list)) else out
-        if pred.dim() == 4 and pred.size(1) == 1:
-            pred = pred[:, 0]
-        return pred, None
 
-    # 정식 스트리밍 경로
+    # 1) 스트리밍 경로
     feats = m.forward_features(x_t)
-    out = m.forward_depth(feats, x_t.shape, cached_hidden_state_list=cache)
+    out = m.forward_depth(
+        feats,
+        x_t.shape,
+        cached_hidden_state_list=cache,
+        return_intermediates=collect_inter,
+        return_qkv=collect_qkv,
+        feature_pool=feature_pool,
+    )
+
+    # 2) 반환 파싱 (pred, new_cache, extra)
     if isinstance(out, (list, tuple)):
         if len(out) == 3:
-            pred_t, _out_cache, new_cache = out
+            pred_t, new_cache, extra = out
         elif len(out) == 2:
             pred_t, new_cache = out
+            extra = None
         else:
             raise RuntimeError(f"Unexpected forward_depth return len={len(out)}")
     else:
-        pred_t, new_cache = out, None
+        # 모델 구현에 따라 단일 객체를 반환하지 않는다고 가정(낙관적 경로)
+        pred_t, new_cache, extra = out
 
-    if isinstance(pred_t, torch.Tensor) and pred_t.dim() == 4 and pred_t.size(1) == 1:
-        pred_t = pred_t[:, 0]  # [B,H,W]
-    return pred_t, new_cache
+    # 3) [B,1,H,W] -> [B,H,W]
+    if hasattr(pred_t, "dim") and pred_t.dim() == 4 and pred_t.size(1) == 1:
+        pred_t = pred_t[:, 0]
+
+    # 4) 인터미디엇 정리
+    if not collect_inter:
+        if return_encoder_feats:
+            return pred_t, new_cache, feats
+        return pred_t, new_cache
+
+    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None}
+    raw_inter = extra.get("intermediates", extra)
+    inter_t = {}
+
+    for k, v in raw_inter.items():
+        feat = v.get("feat_one", v.get("feat", None))  # 'feat_one'을 우선 사용, 없으면 'feat'
+        qkv  = v.get("qkv", None)
+
+        if feat is None:
+            continue
+
+        # 보정: [B,C] -> [B,1,C], [B,T,C] -> 마지막 타임스텝 [B,1,C] 로 맞춤
+        if feat.dim() == 2:
+            feat = feat.unsqueeze(1)                 # [B,1,C]
+        elif feat.dim() == 3 and feat.size(1) != 1:
+            feat = feat[:, -1:, :]                   # [B,1,C] (스트리밍 1-step이면 보통 이미 1임)
+
+        inter_t[int(k)] = {
+            "feat_one": feat,
+            "qkv": qkv if collect_qkv else None
+        }
+
+    if return_encoder_feats:
+        return pred_t, new_cache, inter_t, feats
+    return pred_t, new_cache, inter_t
 
 def batch_ls_scale_shift(pred_disp, gt_disp, mask):
     """

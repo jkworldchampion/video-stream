@@ -18,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# experiment: mamba
+try:
+    from mamba_ssm import Mamba
+    _MAMBA_AVAILABLE = True
+except Exception:
+    _MAMBA_AVAILABLE = False
 
 class SinusoidalPE1D(nn.Module):
     """Simple 1D sinusoidal positional embedding (absolute)."""
@@ -154,7 +160,7 @@ class AuxBlock(nn.Module):
         dropout: float = 0.0,
         return_attn: bool = False,  # kept for compatibility (unused)
         return_qkv: bool = True,
-        rnn_type: str = "lstm",     # "lstm" only in this minimal implementation
+        rnn_type: str = "lstm",     # "lstm" / "mamba"
         mamba_d_state: int = 16,    # placeholders for API compatibility
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
@@ -168,10 +174,11 @@ class AuxBlock(nn.Module):
         self.return_qkv = return_qkv
         self.use_pos_enc = use_pos_enc
 
+        # like TransformerEncoderLayer but with our MHAttention1D and APC uni-LSTM
         # 1) projection to teacher dim
         self.proj_in = nn.Linear(c_in, c_teacher, bias=True)
 
-        # 2) optional APE
+        # 2) optional APE (positional encoding)
         self.pos = SinusoidalPE1D(c_teacher, max_len=8192, dropout=0.0) if use_pos_enc else nn.Identity()
 
         # 3) single-layer transformer (bidirectional)
@@ -179,9 +186,24 @@ class AuxBlock(nn.Module):
             dim=c_teacher, nhead=nhead, mlp_ratio=mlp_ratio, dropout=dropout, return_qkv=return_qkv
         )
 
-        # 4) uni-directional LSTM (APC head)
-        assert rnn_type.lower() == "lstm", "This AuxBlock implements only LSTM for rnn_type."
-        self.rnn = nn.LSTM(input_size=c_teacher, hidden_size=c_teacher, num_layers=1, batch_first=True, bidirectional=False)
+        # 4) uni-directional predictor (APC head)
+        rnn_type = rnn_type.lower()
+        if rnn_type == "lstm":
+            self.predictor = nn.LSTM(input_size=c_teacher, hidden_size=c_teacher, num_layers=1,
+                                     batch_first=True, bidirectional=False)
+            self._pred_is_mamba = False
+        elif rnn_type == "mamba":
+            assert _MAMBA_AVAILABLE, "Install mamba-ssm to use rnn_type='mamba'."
+            # Mamba는 기본적으로 causal(단방향)이며 입력/출력 차원을 d_model로 맞춤
+            self.predictor = Mamba(
+                d_model=c_teacher,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                expand=mamba_expand,
+            )
+            self._pred_is_mamba = True
+        else:
+            raise ValueError(f"Unsupported rnn_type: {rnn_type}")
 
         # 5) (optional) output norm
         self.ln_out = nn.LayerNorm(c_teacher)
@@ -200,10 +222,15 @@ class AuxBlock(nn.Module):
         x = self.proj_in(s_feat)        # [B,T,Ct]
         x = self.pos(x)                 # [B,T,Ct]
 
-        z, qkv = self.tr(x, hole_mask_N=hole_mask_N)  # z: [B,T,Ct]
+        # z: feature KD용 출력, qkv: self-attn Q/K/V
+        z, qkv = self.tr(x, hole_mask_N=hole_mask_N)  # z: [B,T,Ct] Transformer 출력, qkv: dict or None
 
         # Uni-LSTM over z
-        r, _ = self.rnn(z)              # [B,T,Ct]
+        if self._pred_is_mamba:
+            # Mamba는 입력 [B,T,C] → [B,T,C] (causal)
+            r = self.predictor(z)
+        else:
+            r, _ = self.predictor(z)
         z = self.ln_out(z)
         r = self.ln_out(r)
 

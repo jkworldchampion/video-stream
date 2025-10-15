@@ -10,6 +10,7 @@ import wandb
 import math
 import warnings
 from dotenv import load_dotenv
+import collections
 
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -34,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 1
+experiment = 2
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -80,13 +81,17 @@ def train(args):
     kd_cfg = config.get("kd_aux", {})
     kd_enabled   = bool(kd_cfg.get("enabled", True))
     kd_layers    = kd_cfg.get("layers", [0, 1, 2, 3])   # dpt_temporal에서 우리가 잡은 4개 temporal 지점
-    kd_N         = int(kd_cfg.get("N", 2))              # APC 미래 스텝
+    kd_N         = int(kd_cfg.get("N", 1))              # APC 미래 스텝
     kd_alpha     = float(kd_cfg.get("alpha", 1e-2))
     kd_beta      = float(kd_cfg.get("beta", 5e-4))
     kd_gamma     = float(kd_cfg.get("gamma", 5e-3))
     kd_lambda    = float(kd_cfg.get("lambda_kd", 1.0))
     kd_attn_eps  = float(kd_cfg.get("attn_eps", 1e-8))
     kd_pool      = kd_cfg.get("feature_pool", "mean")
+
+    # 추가: 슬라이딩 KD 창 길이/보폭
+    kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
+    kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
@@ -104,7 +109,6 @@ def train(args):
 
     # 모델 (단일 GPU)
     student = VideoDepthStudent(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
-    # --- Teacher (offline, bidirectional) ---
     teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
     teacher.eval()
     for p in teacher.parameters():
@@ -113,7 +117,7 @@ def train(args):
     # --- KD용 레이어별 channel 정의 (우리 dpt_temporal 인덱스 0..3에 대응)
     #   idx 0: layer_3 temporal, 1: layer_4 temporal, 2: path_4 temporal, 3: path_3 temporal
     TEACHER_DIMS = [192,  384,   64,   64]   # teacher out_channels[2], out_channels[3], features, features
-    STUDENT_DIMS = [192,  384,   64,   64]  # student out_channels[2], out_channels[3], features, features  (현재 student 설정 기준)
+    STUDENT_DIMS = [192,  384,   64,   64]  # student out_channels[2], out_channels[3], features, features
 
     # --- AuxBlocks (Student 각 레이어 feat -> C_T로 proj)
     aux_blocks = nn.ModuleDict({
@@ -146,7 +150,10 @@ def train(args):
     # Optim/Sch
     student_params = [p for p in student.parameters() if p.requires_grad]
     aux_params     = [p for p in aux_blocks.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(student_params, lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        list(student_params) + list(aux_params),
+        lr=lr, weight_decay=1e-4
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
     # Loss
@@ -252,8 +259,17 @@ def train(args):
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
         student.train()
+        aux_blocks.train()
         epoch_loss = epoch_frames = 0.0
-        epoch_ssi = epoch_tgm = epoch_kd = 0.0
+        epoch_ssi = epoch_tgm = 0.0
+
+        # KD 누적(스텝 평균용)
+        epoch_kd_total = 0.0
+        epoch_kd_dis   = 0.0
+        epoch_kd_kld   = 0.0
+        epoch_kd_apc   = 0.0
+        kd_steps = 0
+
         accum_loss = 0.0
         step_in_window = 0
         update_frequency = hyper_params.get("update_frequency", 6)
@@ -269,78 +285,40 @@ def train(args):
 
             cache = None
             prev_pred_raw = prev_mask = prev_y = None
+            kd_executed = False
+            # 스트리밍 Student 인터미디엇 버퍼 (KD 윈도우용): 레이어별 [B,1,C]를 프레임 순서대로 누적
+            inter_buf = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
 
-            # ====== (KD) Full-clip forward ======
-            if kd_enabled:
-                with torch.no_grad():
-                    t_out = teacher(
-                        x, return_intermediates=True, return_qkv=True, feature_pool=kd_pool
-                    )
-                    t_inter = t_out["intermediates"]  # dict[idx]-> {"feat":[B,T,Ct], "qkv":{"Q","K","V":[B,A,T,Dh]}}
-                # student도 '학습용 풀클립 경로'(캐시X)로 추론해 intermediates 수집
-                s_out = student(
-                    x, return_intermediates=True, return_qkv=True, feature_pool=kd_pool
-                )
-                s_inter = s_out["intermediates"]     # dict[idx]-> {"feat":[B,T,Cs], "qkv":...}
-
-                # frame 유효 마스크 (KITTI depth에는 invalid가 있음) : [B,T] in {0,1}
-                with torch.no_grad():
-                    # y: [B,T,1,H,W], 값>1e-3 & <80.0 유효 (train_helper.get_mask 기준)
-                    valid_mask_bt = []
-                    for tmask in range(T):
-                        m = get_mask(y[:, tmask:tmask+1], 1e-3, 80.0).to(device)  # [B,1,1,H,W]
-                        # spatial OR/mean → frame-wise 마스크 (하나라도 유효 픽셀이 있으면 1)
-                        v = (m.squeeze(2).squeeze(1).any(dim=(1,2))).float()      # [B]
-                        valid_mask_bt.append(v)
-                    valid_mask_bt = torch.stack(valid_mask_bt, dim=1)  # [B,T]
-
-                # 레이어별 KD 계산
-                kd_terms = {"dis":0.0, "kld":0.0, "apc":0.0}
-                num_used = 0
-                for li in kd_layers:
-                    li = int(li)
-                    h_feat = t_inter[li]["feat"]                    # [B,T,Ct]
-                    t_qkv  = t_inter[li]["qkv"]                    # dict or None
-                    s_feat = s_inter[li]["feat"]                   # [B,T,Cs]
-
-                    # Aux: s_feat -> (z, r, qkv_aux)
-                    z_feat, r_feat, qkv_aux = aux_blocks[str(li)](
-                        s_feat, hole_mask_N=kd_N
-                    )  # z,r:[B,T,Ct], qkv_aux: dict with [B,A,T,Dh] or None
-
-                    # (A) Feature
-                    l_dis = distilhubert_feature_loss(h_feat, z_feat, mask=valid_mask_bt)
-                    # (B) Attn KL (Q/Q + K/K + V/V) — teacher/student 둘 다 qkv가 필요
-                    if (t_qkv is not None) and (qkv_aux is not None):
-                        l_kld = attention_relation_kl(t_qkv, qkv_aux, mask=valid_mask_bt, eps=kd_attn_eps)
-                    else:
-                        l_kld = h_feat.new_tensor(0.0)
-                    # (C) APC
-                    l_apc = apc_loss(h_feat, r_feat, N=kd_N, mask=valid_mask_bt)
-
-                    kd_terms["dis"] += l_dis
-                    kd_terms["kld"] += l_kld
-                    kd_terms["apc"] += l_apc
-                    num_used += 1
-
-                if num_used > 0:
-                    for k in kd_terms:
-                        kd_terms[k] = kd_terms[k] / num_used
-                L_kd = kd_alpha * kd_terms["dis"] + kd_beta * kd_terms["kld"] + kd_gamma * kd_terms["apc"]
-            else:
-                L_kd = torch.tensor(0.0, device=device)
-                kd_terms = {"dis":0.0, "kld":0.0, "apc":0.0}
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
                 x_t = x[:, t:t+1]                              # [B,1,3,H,W]
                 mask_t = get_mask(y[:, t:t+1], 1e-3, 80.0).to(device)
 
-                # === Student: 스트리밍 1-step ===
+                # === Student: 스트리밍 1-step (encoder features 캐시) ===
                 with autocast(enabled=torch.cuda.is_available()):
-                    pred_t_raw, cache = model_stream_step(student, x_t, cache)
+                    # pred_t_raw, cache = model_stream_step(student, x_t, cache)
+                    pred_t_raw, cache, inter_t, student_enc_feats = model_stream_step(
+                        student, x_t, cache,
+                        collect_inter=True,        # ← 내부 temporal features(intermediates)를 inter_t로 반환
+                        collect_qkv=False,         # Q/K/V는 AuxBlock에서 생성
+                        feature_pool=kd_pool,      # 'mean' 등
+                        return_encoder_feats=True, # ← encoder features 반환
+                    )
                     pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
+                    
+                    # Encoder features detach (grad 차단, Teacher 재사용용)
+                    student_enc_feats_detached = [
+                        tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
+                        for f_tuple in student_enc_feats
+                    ]
+                    
+                    # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
+                    for li in kd_layers:
+                        li = int(li)
+                        if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
+                            inter_buf[li].append(inter_t[li]["feat_one"].detach())
 
-                    # ----- Depth Loss -----
+                    # ----- Scale-Shift & Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
                     if pred_t_raw.shape[0] != gt_disp_t.shape[0]:
                         pred_t_raw = pred_t_raw[:1]
@@ -354,6 +332,7 @@ def train(args):
                     disp_normed_t = norm_ssi(y[:, t:t+1], mask_t).squeeze(2)  # [B,1,H,W]
                     ssi_loss_t = loss_ssi(pred_t_aligned_disp.unsqueeze(1), disp_normed_t, mask_t.squeeze(2))
 
+                    # ----- Temporal Geometric Consistency Loss -----
                     if t > 0:
                         prev_aligned_disp = (a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()).squeeze(1)
                         prev_aligned_depth = 1.0 / (prev_aligned_disp.clamp(min=1e-6))
@@ -365,11 +344,113 @@ def train(args):
                     else:
                         tgm_loss  = pred_t_raw.new_tensor(0.0)
 
-                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                    # ----- Sliding Teacher KD at frame t -----
+                    L_kd_t = pred_t_raw.new_tensor(0.0)
+                    kd_terms_step = {"dis": 0.0, "kld": 0.0, "apc": 0.0}
+                    W_eff = min(kd_window, t + 1)
+                    t0 = t - W_eff + 1
+                    x_win = x[:, t0:t+1]  # [B, W_eff, 3, H, W]
+                    num_used = 0
 
-                    # KD는 배치 내 클립 기준 한 번만 더함(여기서는 t==0에만 더함)
-                    if kd_enabled and t == 0:
-                        loss = loss + kd_lambda * L_kd
+                    if kd_enabled and ((t % kd_stride) == 0) and (W_eff >= 1):
+                        kd_executed = True
+
+                        # frame-wise valid mask들 준비
+                        with torch.no_grad():
+                            frame_valid_list = []
+                            for tt in range(W_eff):
+                                m = get_mask(y[:, t0+tt:t0+tt+1], 1e-3, 80.0).to(device)    # [B,1,1,H,W]
+                                v = (m.squeeze(2).squeeze(1).any(dim=(1,2))).float()        # [B]
+                                frame_valid_list.append(v)
+                            frame_valid = torch.stack(frame_valid_list, dim=1)               # [B, W_eff]
+
+                            # DIS/KLD에서 '마지막 프레임'만
+                            mask_last = torch.zeros_like(frame_valid)
+                            mask_last[:, -1] = frame_valid[:, -1]
+
+                        # 3) Teacher: encoder feature 재사용 (과거 프레임만 계산, 현재는 student 재사용)
+                        with torch.no_grad():
+                            if W_eff > 1:
+                                # 과거 프레임 (t0~t-1) encoder
+                                x_past = x_win[:, :-1, ...]  # [B, W_eff-1, 3, H, W]
+                                past_feats = teacher.pretrained.get_intermediate_layers(
+                                    x_past.flatten(0, 1),
+                                    teacher.intermediate_layer_idx[teacher.encoder],
+                                    return_class_token=True
+                                )
+                            else:
+                                past_feats = None
+
+                            # Combine past + current (student encoder 재사용)
+                            if past_feats is not None:
+                                combined_feats = []
+                                for pf_tuple, sf_tuple in zip(past_feats, student_enc_feats_detached):
+                                    # pf_tuple: (tokens[B*(W-1),N,C], cls[B*(W-1),C]) or just (tokens,)
+                                    # sf_tuple: (tokens[B*1,N,C], cls[B*1,C]) or just (tokens,)
+                                    tokens_combined = torch.cat([pf_tuple[0], sf_tuple[0]], dim=0)
+                                    if len(pf_tuple) > 1 and pf_tuple[1] is not None:
+                                        cls_combined = torch.cat([pf_tuple[1], sf_tuple[1]], dim=0)
+                                        combined_feats.append((tokens_combined, cls_combined))
+                                    else:
+                                        combined_feats.append((tokens_combined,))
+                            else:
+                                # W_eff==1: 현재 프레임만
+                                combined_feats = student_enc_feats_detached
+
+                            # Teacher depth head로 intermediate/qkv 추출
+                            _, _, t_intermediates = teacher.head(
+                                combined_feats,
+                                x_win.shape[-2] // 14,  # patch_h
+                                x_win.shape[-1] // 14,  # patch_w
+                                W_eff,                   # frame_length
+                                cached_hidden_state_list=None,
+                                return_intermediates=True,
+                                return_qkv=True,
+                                feature_pool=kd_pool,
+                            )
+                            t_out = {"intermediates": t_intermediates}
+
+                        # 4) 레이어별 KD
+                        for li in kd_layers:
+                            li = int(li)
+                            h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
+                            t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
+
+                            # Student 버퍼 길이 확인
+                            buf_len = len(inter_buf[li])
+                            if buf_len == 0:
+                                continue
+
+                            # 정상 구간: 버퍼 == W_eff
+                            s_list = list(inter_buf[li])
+                            if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
+                                s_list[-1] = inter_t[li]["feat_one"]
+                            s_feat_seq = torch.cat(s_list, dim=1)              # [B, W_eff, C]
+
+                            z_seq, r_seq, qkv_aux_seq = aux_blocks[str(li)](s_feat_seq, hole_mask_N=kd_N)
+                            l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
+                            l_kld = attention_relation_kl(
+                                t_qkv_seq, qkv_aux_seq,
+                                q_mask=mask_last,
+                                k_mask=frame_valid,
+                                eps=kd_attn_eps
+                            ) if (t_qkv_seq is not None and qkv_aux_seq is not None) else h_feat_seq.new_tensor(0.0)
+                            l_apc = apc_loss(h_feat_seq, r_seq, N=kd_N, mask=frame_valid)
+
+                            kd_terms_step["dis"] += l_dis
+                            kd_terms_step["kld"] += l_kld
+                            kd_terms_step["apc"] += l_apc
+                            num_used += 1
+
+                        if num_used > 0:
+                            for k in kd_terms_step:
+                                kd_terms_step[k] = kd_terms_step[k] / num_used
+
+                        L_kd_t = kd_alpha * kd_terms_step["dis"] + kd_beta * kd_terms_step["kld"] + kd_gamma * kd_terms_step["apc"]
+                        # print(f"  [KD @ frame {t}] L_DIS={kd_terms_step['dis']:.4f}  L_KLD={kd_terms_step['kld']:.4f}  L_APC={kd_terms_step['apc']:.4f}  →  L_KD={L_kd_t.item():.4f}")
+
+                    # ---- 최종 loss (KD 꺼져 있어도 depth 손실은 유지!)
+                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * L_kd_t if kd_enabled else 0.0)
 
                 # 누적/업데이트
                 accum_loss += loss / update_frequency
@@ -395,12 +476,19 @@ def train(args):
                 epoch_frames += B_eff
                 epoch_ssi    += ssi_loss_t.item() * B_eff
                 epoch_tgm    += tgm_loss.item()  * B_eff
-                epoch_kd     += L_kd.item()      * B_eff
+
+                # KD가 실제 실행된 스텝만 에폭 누적
+                if kd_executed:
+                    epoch_kd_total += float(L_kd_t.item())
+                    epoch_kd_dis   += float(kd_terms_step["dis"])
+                    epoch_kd_kld   += float(kd_terms_step["kld"])
+                    epoch_kd_apc   += float(kd_terms_step["apc"])
+                    kd_steps += 1
 
                 frame_pbar.set_postfix({
-                    'SSI': f'{epoch_ssi/ max(1, epoch_frames):.4f}',
-                    'TGM': f'{epoch_tgm/ max(1, epoch_frames):.4f}',
-                    'L_KD': f'{epoch_kd/ max(1, epoch_frames):.4f}' if kd_enabled else '0.0000'
+                    'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
+                    'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
+                    'wKD':  f'{(epoch_kd_total / max(1, kd_steps)) * kd_lambda:.4f}' if kd_enabled else '0.0000'
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -428,14 +516,18 @@ def train(args):
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
+
+            # KD는 스텝 평균
+            "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,
+            "train/kd_dis":   (epoch_kd_dis   / max(1, kd_steps)) if kd_enabled else 0.0,
+            "train/kd_kld":   (epoch_kd_kld   / max(1, kd_steps)) if kd_enabled else 0.0,
+            "train/kd_apc":   (epoch_kd_apc   / max(1, kd_steps)) if kd_enabled else 0.0,
+            'train/kd_steps': kd_steps,
+
             "val_real/absrel": val_absrel,
             "val_real/rmse":   val_rmse,
             "val_real/delta1": val_delta1,
             "epoch": epoch,
-            "kd/dis": float(kd_terms["dis"]) if kd_enabled else 0.0,
-            "kd/kld": float(kd_terms["kld"]) if kd_enabled else 0.0,
-            "kd/apc": float(kd_terms["apc"]) if kd_enabled else 0.0,
-            "kd/total": float(L_kd.item()) if kd_enabled else 0.0,
         })
 
         # best 저장 (delta1 ↑)

@@ -8,6 +8,7 @@
 from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
+import math
 
 
 def _safe_mean(x: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
@@ -122,32 +123,61 @@ def _kl_rows(
     return kl.sum() / denom.clamp(min=1e-8)
 
 
-def attention_relation_kl(
-    t_qkv: Dict[str, torch.Tensor],   # {"Q","K","V"} each [B, A, T, Dh]
-    s_qkv: Dict[str, torch.Tensor],   # {"Q","K","V"} each [B, A, T, Dh]
-    mask: Optional[torch.Tensor] = None,  # [B, T] valid frames
-    eps: float = 1e-8,
-) -> torch.Tensor:
+def attention_relation_kl(t_qkv, s_qkv, mask=None, eps=1e-8, q_mask=None, k_mask=None):
     """
-    전체 프레임 범위(0..T-1)에 대해 Q/Q + K/K + V/V KL을 평균.
-    - 열 마스크(mask)는 열(k) 소프트맥스에 적용되어 invalid frame을 무시
-    - 행 마스크(mask)는 KL 평균에서 제외
+    Distill Query-Query, Key-Key, Value-Value attention relation (MiniLM-v2 style).
+    - t_qkv/s_qkv: dict with {"Q","K","V"} each [B,A,T,Dh]
+    - q_mask: [B,T] -> which t rows (anchors) to average over (e.g., mask_last)
+    - k_mask: [B,T] -> which k columns to keep inside the softmax (e.g., frame_valid)
+    - mask (legacy): if provided and q_mask/k_mask are None, use it for BOTH rows & cols (backward compat)
+    returns: scalar tensor
     """
-    # Teacher 분포
-    pQ = _masked_row_softmax_from_proj(t_qkv["Q"], mask, eps)  # [B,A,T,T]
-    pK = _masked_row_softmax_from_proj(t_qkv["K"], mask, eps)
-    pV = _masked_row_softmax_from_proj(t_qkv["V"], mask, eps)
+    def _rel_kl(qT, qS, row_mask, col_mask):
+        # qT,qS: [B,A,T,Dh]
+        B, A, T, Dh = qT.shape
+        scale = 1.0 / math.sqrt(Dh)
+        # logits over (t,k): [B,A,T,T]
+        logitT = torch.einsum('batd,bakd->batk', qT, qT) * scale
+        logitS = torch.einsum('batd,bakd->batk', qS, qS) * scale
 
-    # Student 분포
-    qQ = _masked_row_softmax_from_proj(s_qkv["Q"], mask, eps)
-    qK = _masked_row_softmax_from_proj(s_qkv["K"], mask, eps)
-    qV = _masked_row_softmax_from_proj(s_qkv["V"], mask, eps)
+        # column mask only on k-axis
+        if col_mask is not None:
+            col = col_mask[:, None, None, :].to(dtype=logitT.dtype)
+            neginf = torch.finfo(logitT.dtype).min
+            logitT = logitT.masked_fill(col == 0, neginf)
+            logitS = logitS.masked_fill(col == 0, neginf)
 
-    # KL(T || S) — row-wise 평균
-    lq = _kl_rows(pQ, qQ, row_mask=mask)
-    lk = _kl_rows(pK, qK, row_mask=mask)
-    lv = _kl_rows(pV, qV, row_mask=mask)
-    return lq + lk + lv
+        PT = torch.softmax(logitT, dim=-1)
+        PS = torch.softmax(logitS, dim=-1).clamp_min(eps)
+
+        # KL over k: [B,A,T]
+        kl = (PT * (PT.clamp_min(eps).log() - PS.log())).sum(dim=-1)
+
+        # average over t with row_mask
+        if row_mask is not None:
+            rm = row_mask[:, None, :].to(dtype=kl.dtype)  # [B,1,T]
+            num = (kl * rm).sum()
+            den = rm.sum().clamp_min(1.0)
+            kl_mean = num / den
+        else:
+            kl_mean = kl.mean()
+
+        # average over A, B
+        return kl_mean / A
+
+    # backward compatibility
+    if (q_mask is None) and (k_mask is None) and (mask is not None):
+        q_mask = mask
+        k_mask = mask
+
+    QT_t, QT_s = t_qkv["Q"], s_qkv["Q"]
+    KT_t, KT_s = t_qkv["K"], s_qkv["K"]
+    VT_t, VT_s = t_qkv["V"], s_qkv["V"]
+
+    Lq = _rel_kl(QT_t, QT_s, q_mask, k_mask)
+    Lk = _rel_kl(KT_t, KT_s, q_mask, k_mask)
+    Lv = _rel_kl(VT_t, VT_s, q_mask, k_mask)
+    return Lq + Lk + Lv
 
 
 # -------------------------------
