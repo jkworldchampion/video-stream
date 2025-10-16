@@ -3,6 +3,7 @@ import argparse
 import logging
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import yaml
@@ -30,12 +31,13 @@ from utils.loss_kd_aux import (
     attention_relation_kl,       # L_KLD (Q/Q + K/K + V/V)
     apc_loss                     # L_APC
 )
+from utils.kv_adapter import KVAdapter
 
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 2
+experiment = 3
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -93,8 +95,21 @@ def train(args):
     kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
     kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
 
+    adapter_cfg = kd_cfg.get("kv_adapter", {})
+    kv_adapter_enabled = bool(adapter_cfg.get("enabled", True))
+    kv_adapter_heads = int(adapter_cfg.get("heads", 8))
+    kv_adapter_reg = float(adapter_cfg.get("reg_lambda", 1e-4))
+
     if args.epochs is not None:
         num_epochs = int(args.epochs)
+
+    raw_scene_indices = getattr(args, "val_scene_indices", None)
+    scene_indices = None
+    if raw_scene_indices:
+        scene_indices = [int(idx.strip()) for idx in raw_scene_indices.split(",") if idx.strip()]
+        scene_indices = sorted(set(scene_indices))
+    if scene_indices:
+        logger.info(f"Validation scene indices: {scene_indices}")
 
     # W&B
     load_dotenv(dotenv_path=".env")
@@ -128,12 +143,20 @@ def train(args):
             dropout=0.0,
             return_attn=False,
             return_qkv=True,            # Aux 내부 1L Transformer의 Q/K/V 수집
-            rnn_type="lstm",            # 또는 "mamba" 실험 가능
+            rnn_type="lstm",           # LSTM/mamba
             mamba_d_state=16,
             mamba_d_conv=4,
             mamba_expand=2,
         ).to(device) for i in kd_layers
     })
+
+    kv_adapters = None
+    if kv_adapter_enabled:
+        kv_adapters = nn.ModuleDict({
+            str(i): KVAdapter(TEACHER_DIMS[i], kv_adapter_heads).to(device)
+            for i in kd_layers
+        })
+        logger.info(f"KVAdapter enabled with heads={kv_adapter_heads}, reg_lambda={kv_adapter_reg}")
 
     # Pretrained
     if args.pretrained_ckpt:
@@ -150,8 +173,9 @@ def train(args):
     # Optim/Sch
     student_params = [p for p in student.parameters() if p.requires_grad]
     aux_params     = [p for p in aux_blocks.parameters() if p.requires_grad]
+    kv_adapter_params = [p for p in kv_adapters.parameters() if p.requires_grad] if kv_adapters is not None else []
     optimizer = torch.optim.AdamW(
-        list(student_params) + list(aux_params),
+        list(student_params) + list(aux_params) + list(kv_adapter_params),
         lr=lr, weight_decay=1e-4
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -196,6 +220,10 @@ def train(args):
             try: aux_blocks.load_state_dict(ckpt["aux_state_dict"])
             except Exception as e: logger.warning(f"Aux state load skipped: {e}")
 
+        if kv_adapters is not None and "kv_adapter_state_dict" in ckpt:
+            try: kv_adapters.load_state_dict(ckpt["kv_adapter_state_dict"])
+            except Exception as e: logger.warning(f"KV adapter state load skipped: {e}")
+
         # 3) 베스트 스코어 & 스타트 에폭
         if "best_val_delta1" in ckpt:
             try: best_delta1 = float(ckpt["best_val_delta1"])
@@ -207,6 +235,8 @@ def train(args):
 
     wandb.watch(student, log="all")
     wandb.watch(aux_blocks, log="all")
+    if kv_adapters is not None:
+        wandb.watch(kv_adapters, log="all")
     best_delta1 = 0.0
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
@@ -230,7 +260,8 @@ def train(args):
                 dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
                 device='cuda' if torch.cuda.is_available() else 'cpu',
                 input_size=518,
-                scenes_to_eval=args.val_scenes,               # 2 scenes subset
+                scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
+                scene_indices=scene_indices,
                 fp32=True
             )
         finally:
@@ -238,9 +269,10 @@ def train(args):
             if _prev_train_state:
                 student.train()
 
-        init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-        init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-        init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+        init_avg = init_metrics.get("avg", {}) if isinstance(init_metrics, dict) else {}
+        init_absrel = float(init_avg.get("abs_relative_difference", float('nan')))
+        init_rmse   = float(init_avg.get("rmse_linear", float('nan')))
+        init_delta1 = float(init_avg.get("delta1_acc", float('nan')))
 
         # 콘솔/파일 로그
         logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
@@ -269,6 +301,8 @@ def train(args):
         epoch_kd_kld   = 0.0
         epoch_kd_apc   = 0.0
         kd_steps = 0
+        epoch_kv_reg = 0.0
+        kv_reg_steps = 0
 
         accum_loss = 0.0
         step_in_window = 0
@@ -288,6 +322,8 @@ def train(args):
             kd_executed = False
             # 스트리밍 Student 인터미디엇 버퍼 (KD 윈도우용): 레이어별 [B,1,C]를 프레임 순서대로 누적
             inter_buf = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
+            # Encoder features 캐시 버퍼 (Teacher encoder 완전 생략용)
+            encoder_feats_cache = collections.deque(maxlen=kd_window)
 
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
@@ -306,11 +342,12 @@ def train(args):
                     )
                     pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
                     
-                    # Encoder features detach (grad 차단, Teacher 재사용용)
+                    # Encoder features detach 및 캐시 누적 (Teacher encoder 완전 생략용)
                     student_enc_feats_detached = [
                         tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
                         for f_tuple in student_enc_feats
                     ]
+                    encoder_feats_cache.append(student_enc_feats_detached)  # ← 매 프레임 누적
                     
                     # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
                     for li in kd_layers:
@@ -368,34 +405,27 @@ def train(args):
                             mask_last = torch.zeros_like(frame_valid)
                             mask_last[:, -1] = frame_valid[:, -1]
 
-                        # 3) Teacher: encoder feature 재사용 (과거 프레임만 계산, 현재는 student 재사용)
+                        # 3) Teacher: 캐시된 encoder features 전체 재사용 (Teacher encoder 완전 생략!)
                         with torch.no_grad():
-                            if W_eff > 1:
-                                # 과거 프레임 (t0~t-1) encoder
-                                x_past = x_win[:, :-1, ...]  # [B, W_eff-1, 3, H, W]
-                                past_feats = teacher.pretrained.get_intermediate_layers(
-                                    x_past.flatten(0, 1),
-                                    teacher.intermediate_layer_idx[teacher.encoder],
-                                    return_class_token=True
-                                )
-                            else:
-                                past_feats = None
-
-                            # Combine past + current (student encoder 재사용)
-                            if past_feats is not None:
-                                combined_feats = []
-                                for pf_tuple, sf_tuple in zip(past_feats, student_enc_feats_detached):
-                                    # pf_tuple: (tokens[B*(W-1),N,C], cls[B*(W-1),C]) or just (tokens,)
-                                    # sf_tuple: (tokens[B*1,N,C], cls[B*1,C]) or just (tokens,)
-                                    tokens_combined = torch.cat([pf_tuple[0], sf_tuple[0]], dim=0)
-                                    if len(pf_tuple) > 1 and pf_tuple[1] is not None:
-                                        cls_combined = torch.cat([pf_tuple[1], sf_tuple[1]], dim=0)
-                                        combined_feats.append((tokens_combined, cls_combined))
-                                    else:
-                                        combined_feats.append((tokens_combined,))
-                            else:
-                                # W_eff==1: 현재 프레임만
-                                combined_feats = student_enc_feats_detached
+                            # 캐시된 encoder features 윈도우 추출 (최근 W_eff개)
+                            cached_window = list(encoder_feats_cache)  # deque → list
+                            
+                            # 각 레이어별로 시간축 concat: [B*W_eff, N, C]
+                            combined_feats = []
+                            num_layers = len(cached_window[0])  # e.g., 4 layers
+                            
+                            for layer_idx in range(num_layers):
+                                # cached_window[frame_idx][layer_idx]: (tokens, cls) tuple
+                                tokens_list = [cached_window[frame_idx][layer_idx][0] for frame_idx in range(len(cached_window))]
+                                tokens_combined = torch.cat(tokens_list, dim=0)  # [B*W_eff, N, C]
+                                
+                                # cls_token 처리
+                                if len(cached_window[0][layer_idx]) > 1 and cached_window[0][layer_idx][1] is not None:
+                                    cls_list = [cached_window[frame_idx][layer_idx][1] for frame_idx in range(len(cached_window))]
+                                    cls_combined = torch.cat(cls_list, dim=0)  # [B*W_eff, C]
+                                    combined_feats.append((tokens_combined, cls_combined))
+                                else:
+                                    combined_feats.append((tokens_combined,))
 
                             # Teacher depth head로 intermediate/qkv 추출
                             _, _, t_intermediates = teacher.head(
@@ -429,12 +459,33 @@ def train(args):
 
                             z_seq, r_seq, qkv_aux_seq = aux_blocks[str(li)](s_feat_seq, hole_mask_N=kd_N)
                             l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
-                            l_kld = attention_relation_kl(
-                                t_qkv_seq, qkv_aux_seq,
-                                q_mask=mask_last,
-                                k_mask=frame_valid,
-                                eps=kd_attn_eps
-                            ) if (t_qkv_seq is not None and qkv_aux_seq is not None) else h_feat_seq.new_tensor(0.0)
+                            # If KV adapters enabled, use r_seq to compute small residuals to K/V
+                            if (t_qkv_seq is not None and qkv_aux_seq is not None) and (kv_adapters is not None and str(li) in kv_adapters):
+                                try:
+                                    qkv_aux_prime, kv_reg = kv_adapters[str(li)](r_seq, qkv_aux_seq)
+                                except Exception:
+                                    # Fallback to original if adapter fails
+                                    qkv_aux_prime = qkv_aux_seq
+                                    kv_reg = h_feat_seq.new_tensor(0.0)
+
+                                l_kld = attention_relation_kl(
+                                    t_qkv_seq, qkv_aux_prime,
+                                    q_mask=mask_last,
+                                    k_mask=frame_valid,
+                                    eps=kd_attn_eps
+                                )
+                                # accumulate reg
+                                epoch_kv_reg += float(kv_reg.item())
+                                kv_reg_steps += 1
+                                # lightly penalize delta magnitude
+                                l_kld = l_kld + (kv_adapter_reg * kv_reg)
+                            else:
+                                l_kld = attention_relation_kl(
+                                    t_qkv_seq, qkv_aux_seq,
+                                    q_mask=mask_last,
+                                    k_mask=frame_valid,
+                                    eps=kd_attn_eps
+                                ) if (t_qkv_seq is not None and qkv_aux_seq is not None) else h_feat_seq.new_tensor(0.0)
                             l_apc = apc_loss(h_feat_seq, r_seq, N=kd_N, mask=frame_valid)
 
                             kd_terms_step["dis"] += l_dis
@@ -503,19 +554,24 @@ def train(args):
             dataset_eval_tag=args.val_dataset_tag,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             input_size=518,
-            scenes_to_eval=args.val_scenes,
+            scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
+            scene_indices=scene_indices,
             fp32=True
         )
 
-        val_absrel = float(val_metrics.get("abs_relative_difference", float('nan')))
-        val_rmse   = float(val_metrics.get("rmse_linear", float('nan')))
-        val_delta1 = float(val_metrics.get("delta1_acc", float('nan')))
+        val_avg = val_metrics.get("avg", {}) if isinstance(val_metrics, dict) else {}
+        val_per_scene = val_metrics.get("per_scene", {}) if isinstance(val_metrics, dict) else {}
+
+        val_absrel = float(val_avg.get("abs_relative_difference", float('nan')))
+        val_rmse   = float(val_avg.get("rmse_linear", float('nan')))
+        val_delta1 = float(val_avg.get("delta1_acc", float('nan')))
 
         # 로깅
-        wandb.log({
+        log_payload = {
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
+            "train/kv_reg": (epoch_kv_reg / max(1, kv_reg_steps)) if kv_adapters is not None else 0.0,
 
             # KD는 스텝 평균
             "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,
@@ -528,24 +584,34 @@ def train(args):
             "val_real/rmse":   val_rmse,
             "val_real/delta1": val_delta1,
             "epoch": epoch,
-        })
+        }
+
+        for idx in sorted(val_per_scene.keys()):
+            scene_metrics = val_per_scene[idx]
+            log_payload[f"val_real/{idx}"] = float(scene_metrics.get("delta1_acc", float('nan')))
+
+        wandb.log(log_payload)
 
         # best 저장 (delta1 ↑)
         if val_delta1 > best_delta1:
             best_delta1 = val_delta1
             best_epoch  = epoch
-            torch.save({
+            best_payload = {
                 "epoch": epoch,
                 "model_state_dict": student.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_delta1": best_delta1,
                 "config": hyper_params,
-            }, best_model_path)
+                "aux_state_dict": aux_blocks.state_dict(),
+            }
+            if kv_adapters is not None:
+                best_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
+            torch.save(best_payload, best_model_path)
             logger.info(f"🏆 Best model saved! Epoch {epoch}, Val delta1: {best_delta1:.4f}")
 
         # latest 저장
-        torch.save({
+        latest_payload = {
             "epoch": epoch,
             "model_state_dict": student.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -553,10 +619,14 @@ def train(args):
             "val_absrel": val_absrel,
             "val_delta1": val_delta1,
             "val_rmse":   val_rmse,
+            "val_per_scene": {idx: {k: float(v) for k, v in metrics.items()} for idx, metrics in val_per_scene.items()},
             "config": hyper_params,
             "aux_state_dict": aux_blocks.state_dict(),
-        }, latest_model_path)
-        logger.info(f"📁 Latest model saved to {latest_model_path}")
+        }
+        if kv_adapters is not None:
+            latest_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
+        torch.save(latest_payload, latest_model_path)
+        logger.info(f"Latest model saved to {latest_model_path}")
 
         torch.cuda.empty_cache()
         scheduler.step()
@@ -581,6 +651,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
+    parser.add_argument("--val_scene_indices", type=str, default="0,32,61,73", help="Comma-separated dataset indices for validation subset. Empty string disables explicit selection.")
     parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
     parser.add_argument("--test", action="store_true", help="Only run validation")
