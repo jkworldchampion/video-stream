@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- 수정된 부분 시작 ---
+# vda 가상 환경의 파이썬 실행 파일 전체 경로를 변수로 지정
+PYTHON_EXEC="/home/ajou/miniconda/envs/vda/bin/python"
+# --- 수정된 부분 끝 ---
+
+
 # 이 스크립트의 위치 → 프로젝트 루트
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -11,7 +17,7 @@ export PYTHONUNBUFFERED=1
 
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/ablation/experiment_1"
+INFER_PATH="${ROOT}/benchmark/output/ablation/non-stream"
 
 # 2) JSON 메타데이터
 JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
@@ -23,20 +29,24 @@ BENCHMARK_ROOT="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/da
 mkdir -p "${INFER_PATH}"
 
 echo "▶ Streaming inference → ${INFER_PATH}"
-python "${ROOT}/benchmark/infer/infer_stream.py" \
+# 'python'을 '${PYTHON_EXEC}'으로 변경
+"${PYTHON_EXEC}" "${ROOT}/benchmark/infer/infer.py" \
   --infer_path "${INFER_PATH}" \
   --json_file  "${JSON_FILE}" \
   --datasets scannet
 
 echo
 echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
-python "${ROOT}/benchmark/eval/eval.py" \
+# 'python'을 '${PYTHON_EXEC}'으로 변경
+"${PYTHON_EXEC}" "${ROOT}/benchmark/eval/eval.py" \
   --infer_path "${INFER_PATH}" \
   --benchmark_path "${BENCHMARK_ROOT}" \
   --datasets scannet_500 \
+  --length_sweep "45,90,200,300,500" \
+  --drop_tol 0.05 \
   --wandb \
   --wandb_project evaluation \
-  --wandb_run_name "experiment_1_$(date +%Y%m%d_%H%M)" \
+  --wandb_run_name "VDA_clip_$(date +%Y%m%d_%H%M)" \
   --wandb_group "streaming" \
   --wandb_mode online
 

@@ -13,13 +13,8 @@ import gc
 import torch
 from metric import *
 import metric
+import wandb
 
-# --- wandb (옵션) 추가 시작 ---
-try:
-    import wandb
-except Exception:
-    wandb = None
-# --- wandb (옵션) 추가 끝 ---
 
 device = 'cuda'
 eval_metrics = [
@@ -28,6 +23,18 @@ eval_metrics = [
     "delta1_acc",
 ]
 
+# length_sweep 파싱 함수
+def parse_length_sweep(length_sweep_str):
+    if not length_sweep_str:
+        return None
+    arr = []
+    for x in length_sweep_str.split(','):
+        x = x.strip()
+        if x:
+            arr.append(int(x))
+    return sorted(list(set(arr)))
+
+# 입력된 추론 파일에서 깊이 맵을 로드하는 함수
 def get_infer(infer_path,args, target_size = None):
     if infer_path.split('.')[-1] == 'npy':
         img_gray = np.load(infer_path)
@@ -46,6 +53,7 @@ def get_infer(infer_path,args, target_size = None):
             infer = cv2.resize(infer, (target_size[1], target_size[0]))
     return infer
 
+# GT 깊이 맵을 로드하는 함수
 def get_gt(depth_gt_path, gt_factor, args):
     if depth_gt_path.split('.')[-1] == 'npy':
         depth_gt = np.load(depth_gt_path)
@@ -56,10 +64,12 @@ def get_gt(depth_gt_path, gt_factor, args):
     depth_gt[depth_gt==0] = -1
     return depth_gt
 
+# flow 로드 함수
 def get_flow(flow_path):
     assert os.path.exists(flow_path)
     flow = np.load(flow_path, allow_pickle=True)
     return flow
+
 def depth2disparity(depth, return_mask=False):
     if isinstance(depth, np.ndarray):
         disparity = np.zeros_like(depth)
@@ -70,11 +80,15 @@ def depth2disparity(depth, return_mask=False):
     else:
         return disparity
 
-def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
+# 기존 시그니처에 선택 인자만 추가 (기본값은 기존 동작 유지)
+def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args, seq_length=None):
     depth_errors = []
     gts = []
     infs = []
-    seq_length = args.max_eval_len
+    # 길이 결정: 인자를 주면 그걸 쓰고, 아니면 기존처럼 args.max_eval_len 사용
+    if seq_length is None:
+        seq_length = args.max_eval_len
+
     dataset_max_depth = args.max_depth_eval
     for i in range(len(infer_paths)):
         if not os.path.exists(infer_paths[i]):
@@ -85,13 +99,21 @@ def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
         infer = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
         gts.append(depth_gt)
         infs.append(infer)
+
+    if len(gts) == 0:
+        return [np.nan, np.nan, np.nan]
+
     gts = np.stack(gts, axis=0)
-    
     infs = np.stack(infs, axis=0)
+
+    # 여기서 seq_length 적용 (기존: args.max_eval_len만 사용)
     infs = infs[:seq_length]
     gts = gts[:seq_length]
+
     valid_mask = np.logical_and((gts>1e-3), (gts<dataset_max_depth))
-    
+    if valid_mask.sum() == 0:
+        return [np.nan, np.nan, np.nan]
+
     gt_disp_masked = 1. / (gts[valid_mask].reshape((-1,1)).astype(np.float64) + 1e-8)
     infs = np.clip(infs, a_min=1e-3, a_max=None)
     pred_disp_masked = infs[valid_mask].reshape((-1,1)).astype(np.float64)
@@ -105,9 +127,8 @@ def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
 
     pred_depth = depth2disparity(aligned_pred)
     gt_depth = gts
-    pred_depth = np.clip(
-            pred_depth, a_min=1e-3, a_max=dataset_max_depth
-        )
+    pred_depth = np.clip(pred_depth, a_min=1e-3, a_max=dataset_max_depth)
+
     sample_metric = []
     metric_funcs = [getattr(metric, _met) for _met in eval_metrics]
 
@@ -122,11 +143,9 @@ def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
     valid_mask_ts = valid_mask_ts[valid_frame]
 
     for met_func in metric_funcs:
-        _metric_name = met_func.__name__
         _metric = met_func(pred_depth_ts, gt_depth_ts, valid_mask_ts).item()
         sample_metric.append(_metric)
     return sample_metric
-
 
 def main():
     
@@ -135,6 +154,9 @@ def main():
     parser.add_argument('--infer_type', type=str, default='npy')
     parser.add_argument('--benchmark_path', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['vkitti', 'kitti', 'sintel', 'nyu_v2', 'tartanair', 'bonn', 'ip_lidar'])
+    # --- 길이 스윕 / 드롭 탐지 옵션 ---
+    parser.add_argument('--length_sweep', type=str, default='45, 90, 200, 300, 500', help='예: "32,64,90,128,256,500" (빈 값이면 비활성)')
+    parser.add_argument('--drop_tol', type=float, default=0.01, help='δ1 하락을 드롭으로 간주할 임계치(절대값, 0.01=1pp)')
     # --- wandb 옵션 (최소 추가) ---
     parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='depth-eval', help='wandb project name')
@@ -144,10 +166,12 @@ def main():
     
     args = parser.parse_args()
 
+    length_sweep = parse_length_sweep(args.length_sweep)
     results_save_path = os.path.join(args.infer_path, 'results.txt')
     
     # --- wandb 초기화 (옵션) ---
-    if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+    use_wandb = (args.wandb and wandb is not None and args.wandb_mode != 'disabled')
+    if use_wandb:
         wandb.init(
             project=args.wandb_project,
             name=(args.wandb_run_name if args.wandb_run_name else None),
@@ -158,6 +182,8 @@ def main():
                 'benchmark_path': args.benchmark_path,
                 'datasets': args.datasets,
                 'eval_metrics': eval_metrics,
+                'length_sweep': length_sweep,
+                'drop_tol': args.drop_tol,
             }
         )
         global_step = 0  # wandb 스텝 카운터(옵션)
@@ -166,153 +192,233 @@ def main():
 
         file = open(results_save_path, 'a')
 
-        if dataset == 'kitti':
-            args.json_file = os.path.join(args.benchmark_path,'kitti/kitti_video.json')
-            args.root_path = os.path.join(args.benchmark_path,'kitti')
-            args.max_depth_eval = 80.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 110
-            args.a = 0
-            args.b = 374
-            args.c = 0
-            args.d = 1242
-        if dataset == 'kitti_500':
-            dataset = 'kitti'
-            args.json_file = os.path.join(args.benchmark_path,'kitti/kitti_video_500.json')
-            args.root_path = os.path.join(args.benchmark_path,'kitti')
-            args.max_depth_eval = 80.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 500
-            args.a = 0
-            args.b = 374
-            args.c = 0
-            args.d = 1242
-        elif dataset == 'sintel':
-            args.json_file = os.path.join(args.benchmark_path,'sintel/sintel_video.json')
-            args.root_path = os.path.join(args.benchmark_path,'sintel')
-            args.max_depth_eval = 70
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 100
-            args.a = 0
-            args.b = 436
-            args.c = 0
-            args.d = 1024
-        elif dataset == 'nyuv2_500':
-            dataset = 'nyuv2'
-            args.json_file = os.path.join(args.benchmark_path,'nyuv2/nyuv2_video_500.json')
-            args.root_path = os.path.join(args.benchmark_path,'nyuv2')
-            args.max_depth_eval = 10.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 500
-            args.a = 45
-            args.b = 471
-            args.c = 41
-            args.d = 601
-        elif dataset == 'bonn':
-            args.json_file = os.path.join(args.benchmark_path,'bonn/bonn_video.json')
-            args.root_path = os.path.join(args.benchmark_path,'bonn')
-            args.max_depth_eval = 10.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 110
-            args.a = 0
-            args.b = 480
-            args.c = 0
-            args.d = 640
-        elif dataset == 'bonn_500':
-            dataset = 'bonn'
-            args.json_file = os.path.join(args.benchmark_path,'bonn/bonn_video_500.json')
-            args.root_path = os.path.join(args.benchmark_path,'bonn')
-            args.max_depth_eval = 10.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 500
-            args.a = 0
-            args.b = 480
-            args.c = 0
-            args.d = 640
-        elif dataset == 'scannet':
-            args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video.json')
-            args.root_path = os.path.join(args.benchmark_path,'scannet')
-            args.max_depth_eval = 10.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 90
-            args.a = 8
-            args.b = -8
-            args.c = 11
-            args.d = -11
-        elif dataset == 'scannet_500':
-            dataset = 'scannet'
-            args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video_500.json')
-            args.root_path = os.path.join(args.benchmark_path,'scannet')
-            args.max_depth_eval = 10.0
-            args.min_depth_eval = 0.1
-            args.max_eval_len = 500
-            args.a = 8
-            args.b = -8
-            args.c = 11
-            args.d = -11
+        # if dataset == 'kitti':
+        #     args.json_file = os.path.join(args.benchmark_path,'kitti/kitti_video.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'kitti')
+        #     args.max_depth_eval = 80.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 110
+        #     args.a = 0
+        #     args.b = 374
+        #     args.c = 0
+        #     args.d = 1242
+        # if dataset == 'kitti_500':
+        #     dataset = 'kitti'
+        #     args.json_file = os.path.join(args.benchmark_path,'kitti/kitti_video_500.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'kitti')
+        #     args.max_depth_eval = 80.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 500
+        #     args.a = 0
+        #     args.b = 374
+        #     args.c = 0
+        #     args.d = 1242
+        # elif dataset == 'sintel':
+        #     args.json_file = os.path.join(args.benchmark_path,'sintel/sintel_video.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'sintel')
+        #     args.max_depth_eval = 70
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 100
+        #     args.a = 0
+        #     args.b = 436
+        #     args.c = 0
+        #     args.d = 1024
+        # elif dataset == 'nyuv2_500':
+        #     dataset = 'nyuv2'
+        #     args.json_file = os.path.join(args.benchmark_path,'nyuv2/nyuv2_video_500.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'nyuv2')
+        #     args.max_depth_eval = 10.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 500
+        #     args.a = 45
+        #     args.b = 471
+        #     args.c = 41
+        #     args.d = 601
+        # elif dataset == 'bonn':
+        #     args.json_file = os.path.join(args.benchmark_path,'bonn/bonn_video.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'bonn')
+        #     args.max_depth_eval = 10.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 110
+        #     args.a = 0
+        #     args.b = 480
+        #     args.c = 0
+        #     args.d = 640
+        # elif dataset == 'bonn_500':
+        #     dataset = 'bonn'
+        #     args.json_file = os.path.join(args.benchmark_path,'bonn/bonn_video_500.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'bonn')
+        #     args.max_depth_eval = 10.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 500
+        #     args.a = 0
+        #     args.b = 480
+        #     args.c = 0
+        #     args.d = 640
+        # elif dataset == 'scannet':
+        #     args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video.json')
+        #     args.root_path = os.path.join(args.benchmark_path,'scannet')
+        #     args.max_depth_eval = 10.0
+        #     args.min_depth_eval = 0.1
+        #     args.max_eval_len = 90
+        #     args.a = 8
+        #     args.b = -8
+        #     args.c = 11
+        #     args.d = -11
+        # elif dataset == 'scannet_500':
+
+        # 의심의 여지없이 scannet_500만 사용
+        dataset = 'scannet'
+        args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video_500.json')
+        args.root_path = os.path.join(args.benchmark_path,'scannet')
+        args.max_depth_eval = 10.0
+        args.min_depth_eval = 0.1
+        args.max_eval_len = 500
+        args.a = 8
+        args.b = -8
+        args.c = 11
+        args.d = -11
 
         with open(args.json_file, 'r') as fs:
             path_json = json.load(fs)
         
         json_data = path_json[dataset]
-        scale_stds = shift_stds = stable_result_fulls = stable_result_wins = 0
-        depth_result_fulls = np.zeros(5)
-        depth_result_wins = np.zeros(5)
-        depth_result_onlys = np.zeros(5)
-        count = 0
         line = '-' * 50
         print(f'<{line} {dataset} start {line}>')
         file.write(f'<{line} {dataset} start {line}>\n')
+        
+        # W&B 테이블 (선택)
+        seq_table = None
+        if use_wandb:
+            seq_table = wandb.Table(columns=[
+                'dataset','sequence','length','abs_rel','rmse','delta1'
+            ])
+        
         results_all = []
+        drop_lens = []
+
         for data in tqdm(json_data):
             for key in data.keys():
                 value = data[key]
+
                 infer_paths = []
                 depth_gt_paths = []
-                flow_paths = []
                 factors = []
                 for images in value:
-                    infer_path = (args.infer_path + '/'+ dataset + '/' + images['image']).replace('.jpg', '.npy').replace('.png', '.npy')
-                    
+                    infer_path = (args.infer_path + '/' + dataset + '/' + images['image']) \
+                                .replace('.jpg', '.npy').replace('.png', '.npy')
                     infer_paths.append(infer_path)
                     depth_gt_paths.append(args.root_path + '/' + images['gt_depth'])
                     factors.append(images['factor'])
-                infer_paths = infer_paths[:args.max_eval_len]
-                depth_gt_paths = depth_gt_paths[:args.max_eval_len]
-                factors = factors[:args.max_eval_len]
-                results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)
-                results_all.append(results_single)
-                
-                # --- wandb: 시퀀스별 로그 (최소 추가) ---
-                if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+
+                # 캐시: 길이 L -> [abs_rel, rmse, delta1]
+                computed_metrics = {}
+
+                # ① 기본 길이(= max_eval_len) 평가 (전통 기준)
+                base_metrics = eval_depthcrafter(
+                    infer_paths, depth_gt_paths, factors, args,
+                    seq_length=args.max_eval_len
+                )
+                results_all.append(base_metrics)
+                computed_metrics[args.max_eval_len] = base_metrics  # 캐시에 저장
+
+                if use_wandb and seq_table is not None:
+                    seq_table.add_data(
+                        dataset, str(key),
+                        int(min(args.max_eval_len, len(infer_paths))),
+                        base_metrics[0], base_metrics[1], base_metrics[2]
+                    )
+
+                # ② 길이 스윕: 중복 계산 방지
+                if length_sweep:
+                    base_L = min(length_sweep)
+
+                    # base_L 성능(최소 길이) – 캐시에 없으면 한 번만 계산
+                    if base_L in computed_metrics:
+                        base_at_L = computed_metrics[base_L]
+                    else:
+                        base_at_L = eval_depthcrafter(
+                            infer_paths, depth_gt_paths, factors, args,
+                            seq_length=base_L
+                        )
+                        computed_metrics[base_L] = base_at_L
+
+                    base_d1 = base_at_L[2]
+                    drop_len = None
+
+                    for L in length_sweep:
+                        # 이미 계산된 길이면 재사용(여기서 500, base_L 중복 방지)
+                        if L in computed_metrics:
+                            metL = computed_metrics[L]
+                        else:
+                            metL = eval_depthcrafter(
+                                infer_paths, depth_gt_paths, factors, args,
+                                seq_length=L
+                            )
+                            computed_metrics[L] = metL
+
+                        if use_wandb and seq_table is not None:
+                            seq_table.add_data(
+                                dataset, str(key),
+                                int(min(L, len(infer_paths))),
+                                metL[0], metL[1], metL[2]
+                            )
+
+                        # 드롭 탐지: δ1(base_L) - δ1(L) >= tol 인 최초 L
+                        if (not np.isnan(base_d1)) and (not np.isnan(metL[2])) and drop_len is None:
+                            if (base_d1 - metL[2]) >= args.drop_tol:
+                                drop_len = L
+
+                    if drop_len is not None:
+                        drop_lens.append(drop_len)
+
+                # --- wandb: 시퀀스별 기본 로그
+                if use_wandb:
                     log_dict = {
                         'dataset': dataset,
                         'sequence': str(key),
-                        eval_metrics[0]: results_single[0],
-                        eval_metrics[1]: results_single[1],
-                        eval_metrics[2]: results_single[2],
+                        f'{eval_metrics[0]}': base_metrics[0],
+                        f'{eval_metrics[1]}': base_metrics[1],
+                        f'{eval_metrics[2]}': base_metrics[2],
                     }
-                    wandb.log(log_dict, step=global_step)
-                    global_step += 1
-                    
-                    
-        final_results =  np.array(results_all)
-        final_results_mean = np.mean(final_results, axis=0)
-        result_dict = { 'name': dataset }
-        for i, metric in enumerate(eval_metrics):
-            result_dict[metric] = final_results_mean[i]
-            print(f"{metric}: {final_results_mean[i]:04f}")
-            file.write(f"{metric}: {final_results_mean[i]:04f}\n")
-        file.write(f'<{line} {dataset} finish {line}>\n')
-        
-        # --- wandb: 데이터셋 평균 로그 (최소 추가) ---
-        if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
-            wandb.log({
-                f'{dataset}_mean/{eval_metrics[0]}': final_results_mean[0],
-                f'{dataset}_mean/{eval_metrics[1]}': final_results_mean[1],
-                f'{dataset}_mean/{eval_metrics[2]}': final_results_mean[2],
-            }, step=global_step)
+                    wandb.log(log_dict)
 
-        
+        # 데이터셋 평균 출력/저장
+        def safe_mean(arr, idx=None):
+            arr = np.array(arr, dtype=np.float64)
+            if idx is not None:
+                arr = arr[:, idx]
+            arr = arr[~np.isnan(arr)]
+            return float(arr.mean()) if arr.size > 0 else float('nan')
+
+        final_arr = np.array(results_all) if len(results_all) > 0 else np.empty((0,3))
+        off_mean = [safe_mean(final_arr, i) for i in range(3)]
+        mean_drop_len = safe_mean(drop_lens) if len(drop_lens) > 0 else np.nan
+
+        for i, m in enumerate(eval_metrics):
+            print(f"{m}: {off_mean[i]:.6f}")
+            file.write(f"{m}: {off_mean[i]:.6f}\n")
+        if length_sweep:
+            print(f"mean_drop_len: {mean_drop_len:.2f}")
+            file.write(f"mean_drop_len: {mean_drop_len:.2f}\n")
+
+        file.write(f'<{line} {dataset} finish {line}>\n')
+
+        # --- wandb: 데이터셋 평균 로그 + 테이블 업로드
+        if use_wandb:
+            log_mean = {
+                f'{dataset}_mean/{eval_metrics[0]}': off_mean[0],
+                f'{dataset}_mean/{eval_metrics[1]}': off_mean[1],
+                f'{dataset}_mean/{eval_metrics[2]}': off_mean[2],
+            }
+            if length_sweep:
+                log_mean.update({
+                    f'{dataset}_mean/drop_len': mean_drop_len
+                })
+            wandb.log(log_mean)
+
+            if seq_table is not None and len(seq_table.data) > 0:
+                wandb.log({f'{dataset}/sequences_offline': seq_table})
+
 if __name__ == '__main__':
     main()
