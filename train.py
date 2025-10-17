@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 2
+experiment = 4
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +95,14 @@ def train(args):
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
+
+    raw_scene_indices = getattr(args, "val_scene_indices", None)
+    scene_indices = None
+    if raw_scene_indices:
+        scene_indices = [int(idx.strip()) for idx in raw_scene_indices.split(",") if idx.strip()]
+        scene_indices = sorted(set(scene_indices))
+    if scene_indices:
+        logger.info(f"Validation scene indices: {scene_indices}")
 
     # W&B
     load_dotenv(dotenv_path=".env")
@@ -230,7 +238,8 @@ def train(args):
                 dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
                 device='cuda' if torch.cuda.is_available() else 'cpu',
                 input_size=518,
-                scenes_to_eval=args.val_scenes,               # 2 scenes subset
+                scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
+                scene_indices=scene_indices,
                 fp32=True
             )
         finally:
@@ -238,9 +247,12 @@ def train(args):
             if _prev_train_state:
                 student.train()
 
-        init_absrel = float(init_metrics.get("abs_relative_difference", float('nan')))
-        init_rmse   = float(init_metrics.get("rmse_linear", float('nan')))
-        init_delta1 = float(init_metrics.get("delta1_acc", float('nan')))
+        init_avg = init_metrics.get("avg", {}) if isinstance(init_metrics, dict) else {}
+        init_absrel = float(init_avg.get("abs_relative_difference", float('nan')))
+        init_rmse   = float(init_avg.get("rmse_linear", float('nan')))
+        init_delta1 = float(init_avg.get("delta1_acc", float('nan')))
+
+        init_per_scene = init_metrics.get("per_scene", {}) if isinstance(init_metrics, dict) else {}
 
         # 콘솔/파일 로그
         logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
@@ -252,6 +264,10 @@ def train(args):
             "init/delta1": init_delta1,
             "epoch": -1,
         })
+
+        for idx in sorted(init_per_scene.keys()):
+            scene_metrics = init_per_scene[idx]
+            wandb.log({f"init/{idx}": float(scene_metrics.get("delta1_acc", float('nan')))})
 
         # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
         best_delta1 = init_delta1
@@ -503,19 +519,24 @@ def train(args):
             dataset_eval_tag=args.val_dataset_tag,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             input_size=518,
-            scenes_to_eval=args.val_scenes,
+            scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
+            scene_indices=scene_indices,
             fp32=True
         )
 
-        val_absrel = float(val_metrics.get("abs_relative_difference", float('nan')))
-        val_rmse   = float(val_metrics.get("rmse_linear", float('nan')))
-        val_delta1 = float(val_metrics.get("delta1_acc", float('nan')))
+        val_avg = val_metrics.get("avg", {}) if isinstance(val_metrics, dict) else {}
+        val_per_scene = val_metrics.get("per_scene", {}) if isinstance(val_metrics, dict) else {}
+
+        val_absrel = float(val_avg.get("abs_relative_difference", float('nan')))
+        val_rmse   = float(val_avg.get("rmse_linear", float('nan')))
+        val_delta1 = float(val_avg.get("delta1_acc", float('nan')))
 
         # 로깅
-        wandb.log({
+        log_payload = {
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
+            # "train/kv_reg": (epoch_kv_reg / max(1, kv_reg_steps)) if kv_adapters is not None else 0.0,
 
             # KD는 스텝 평균
             "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,
@@ -528,24 +549,34 @@ def train(args):
             "val_real/rmse":   val_rmse,
             "val_real/delta1": val_delta1,
             "epoch": epoch,
-        })
+        }
+
+        for idx in sorted(val_per_scene.keys()):
+            scene_metrics = val_per_scene[idx]
+            log_payload[f"val_real/{idx}"] = float(scene_metrics.get("delta1_acc", float('nan')))
+
+        wandb.log(log_payload)
 
         # best 저장 (delta1 ↑)
         if val_delta1 > best_delta1:
             best_delta1 = val_delta1
             best_epoch  = epoch
-            torch.save({
+            best_payload = {
                 "epoch": epoch,
                 "model_state_dict": student.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_delta1": best_delta1,
                 "config": hyper_params,
-            }, best_model_path)
+                "aux_state_dict": aux_blocks.state_dict(),
+            }
+            # if kv_adapters is not None:
+            #     best_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
+            torch.save(best_payload, best_model_path)
             logger.info(f"🏆 Best model saved! Epoch {epoch}, Val delta1: {best_delta1:.4f}")
 
         # latest 저장
-        torch.save({
+        latest_payload = {
             "epoch": epoch,
             "model_state_dict": student.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -553,10 +584,14 @@ def train(args):
             "val_absrel": val_absrel,
             "val_delta1": val_delta1,
             "val_rmse":   val_rmse,
+            "val_per_scene": {idx: {k: float(v) for k, v in metrics.items()} for idx, metrics in val_per_scene.items()},
             "config": hyper_params,
             "aux_state_dict": aux_blocks.state_dict(),
-        }, latest_model_path)
-        logger.info(f"📁 Latest model saved to {latest_model_path}")
+        }
+        # if kv_adapters is not None:
+        #     latest_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
+        torch.save(latest_payload, latest_model_path)
+        logger.info(f"Latest model saved to {latest_model_path}")
 
         torch.cuda.empty_cache()
         scheduler.step()
@@ -581,6 +616,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
+    parser.add_argument("--val_scene_indices", type=str, default="0,32,61,73", help="Comma-separated dataset indices for validation subset. Empty string disables explicit selection.")
     parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
     parser.add_argument("--test", action="store_true", help="Only run validation")

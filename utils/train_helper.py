@@ -317,6 +317,17 @@ def validate_with_infer_eval_subset(
     model_was_training = model.training
     model.eval()
 
+    target_indices = None
+    if scene_indices is not None:
+        if isinstance(scene_indices, (list, tuple, set)):
+            if len(scene_indices) == 0:
+                raise ValueError("scene_indices must contain at least one index when provided")
+            target_indices = sorted({int(idx) for idx in scene_indices})
+        else:
+            raise TypeError("scene_indices must be an iterable of integers or None")
+    target_index_set = set(target_indices) if target_indices is not None else None
+    target_count = len(target_indices) if target_indices is not None else scenes_to_eval
+
     # 1) JSON 로드 & 루트 경로
     with open(json_file, 'r') as fs:
         path_json = json.load(fs)
@@ -326,11 +337,11 @@ def validate_with_infer_eval_subset(
     processed = 0
     seq_registry = []  # 평가 시 동일 순서/동일 subset을 재사용하기 위해 기록
 
-    for i, data in enumerate(tqdm(path_json[dataset], desc=f"[VAL] Streaming {dataset} (subset)")):
-        if scene_indices is not None and i not in set(scene_indices):
+    for scene_idx, data in enumerate(tqdm(path_json[dataset], desc=f"[VAL] Streaming {dataset} (subset)")):
+        if target_index_set is not None and scene_idx not in target_index_set:
             continue
         for key in data.keys():
-            if processed >= scenes_to_eval:
+            if processed >= target_count:
                 break
             frames = data[key]  # list of dicts: {'image','gt_depth','factor',...}
 
@@ -353,13 +364,13 @@ def validate_with_infer_eval_subset(
                 depth_np = _vdainfer_one(model, rgb, input_size=input_size, device=device, fp32=fp32)
                 np.save(out_path, depth_np)
 
-            seq_registry.append((key, frames))
+            seq_registry.append((scene_idx, key, frames))
             processed += 1
             
-            # scene_indices 모드가 아닐 때만 early stop
-            if scene_indices is None and processed >= scenes_to_eval:
+            # scene_indices 모드에서는 각 index당 하나씩만 처리
+            if target_index_set is not None:
                 break
-        if scene_indices is None and processed >= scenes_to_eval:
+        if processed >= target_count:
             break
 
     torch.cuda.empty_cache(); gc.collect()
@@ -373,7 +384,7 @@ def validate_with_infer_eval_subset(
 
     # metric 집계
     all_metrics = []
-    for (key, frames) in seq_registry:
+    for (scene_idx, key, frames) in seq_registry:
         infer_paths = []
         depth_gt_paths = []
         factors = []
@@ -437,21 +448,24 @@ def validate_with_infer_eval_subset(
             seq_metrics["rmse_linear"] = torch.sqrt((diff ** 2).sum() / denom).item()
         seq_metrics["delta1_acc"] = delta1_acc(pred_ts, gt_ts, mask_ts).item()
 
-        all_metrics.append(seq_metrics)
+        all_metrics.append((scene_idx, seq_metrics))
 
     # 평균 내기
     if len(all_metrics) == 0:
         avg = {"abs_relative_difference": float("nan"),
                "rmse_linear": float("nan"),
                "delta1_acc": float("nan")}
+        per_scene = {}
     else:
+        per_scene = {scene_idx: metrics for scene_idx, metrics in all_metrics}
+        metric_keys = list(next(iter(per_scene.values())).keys())
         avg = {
-            k: float(np.mean([m[k] for m in all_metrics]))
-            for k in all_metrics[0].keys()
+            k: float(np.mean([metrics[k] for metrics in per_scene.values()]))
+            for k in metric_keys
         }
 
     # 모델 모드 복구
     if model_was_training:
         model.train()
 
-    return avg
+    return {"avg": avg, "per_scene": per_scene}
