@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 4
+experiment = 7
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -90,7 +90,7 @@ def train(args):
     kd_pool      = kd_cfg.get("feature_pool", "mean")
 
     # 추가: 슬라이딩 KD 창 길이/보폭
-    kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
+    kd_window = int(kd_cfg.get("window", 32))  # 보통 32, 경험상 16으로 하는게 젤 나음
     kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
 
     if args.epochs is not None:

@@ -4,9 +4,22 @@ hyper_parameter:
   ratio_ssi: 1
   ratio_tgm: 10
   epochs: 100
-  batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
+  batch_size: 2  # 4 -> 2로 줄여서 메모리 사용량 감소
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
   
   # Teacher-Student parameters
   pred_distill_weight: 1.0  # Distillation loss 가중치
   cache_distill_weight: 1.0    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)
+
+kd_aux:
+  enabled: true            # KD 활성화
+  layers: [0, 1, 2, 3]     # KD를 적용할 temporal 레이어 인덱스
+  N: 1                     # APC 미래 스텝
+  alpha: 0.01              # L_DIS 가중치
+  beta: 0.0005             # L_KLD 가중치
+  gamma: 0.005             # L_APC 가중치
+  lambda_kd: 1.0           # 최종 KD loss 계수
+  attn_eps: 1.0e-08        # KL 안정화 epsilon
+  feature_pool: "mean"     # KD feature 풀링 방식
+  window: 32               # KD 윈도우 길이 (clip_len과 동일)
+  stride: 1                # KD 수행 간격

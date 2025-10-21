@@ -17,7 +17,7 @@ export PYTHONUNBUFFERED=1
 
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/ablation/non-stream"
+INFER_PATH="${ROOT}/benchmark/output/ablation/experiment_2_re"
 
 # 2) JSON 메타데이터
 JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
@@ -30,7 +30,7 @@ mkdir -p "${INFER_PATH}"
 
 echo "▶ Streaming inference → ${INFER_PATH}"
 # 'python'을 '${PYTHON_EXEC}'으로 변경
-"${PYTHON_EXEC}" "${ROOT}/benchmark/infer/infer.py" \
+"${PYTHON_EXEC}" "${ROOT}/benchmark/infer/infer_stream.py" \
   --infer_path "${INFER_PATH}" \
   --json_file  "${JSON_FILE}" \
   --datasets scannet
@@ -42,11 +42,9 @@ echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
   --infer_path "${INFER_PATH}" \
   --benchmark_path "${BENCHMARK_ROOT}" \
   --datasets scannet_500 \
-  --length_sweep "45,90,200,300,500" \
-  --drop_tol 0.05 \
   --wandb \
   --wandb_project evaluation \
-  --wandb_run_name "VDA_clip_$(date +%Y%m%d_%H%M)" \
+  --wandb_run_name "VDA_stream_2_re" \
   --wandb_group "streaming" \
   --wandb_mode online
 

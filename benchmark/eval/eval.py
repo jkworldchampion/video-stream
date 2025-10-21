@@ -14,6 +14,7 @@ import torch
 from metric import *
 import metric
 import wandb
+from dotenv import load_dotenv
 
 
 device = 'cuda'
@@ -155,7 +156,7 @@ def main():
     parser.add_argument('--benchmark_path', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['vkitti', 'kitti', 'sintel', 'nyu_v2', 'tartanair', 'bonn', 'ip_lidar'])
     # --- 길이 스윕 / 드롭 탐지 옵션 ---
-    parser.add_argument('--length_sweep', type=str, default='45, 90, 200, 300, 500', help='예: "32,64,90,128,256,500" (빈 값이면 비활성)')
+    parser.add_argument('--length_sweep', type=str, default='', help='예: "32,64,90,128,256,500" (빈 값이면 비활성)')
     parser.add_argument('--drop_tol', type=float, default=0.01, help='δ1 하락을 드롭으로 간주할 임계치(절대값, 0.01=1pp)')
     # --- wandb 옵션 (최소 추가) ---
     parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
@@ -172,6 +173,7 @@ def main():
     # --- wandb 초기화 (옵션) ---
     use_wandb = (args.wandb and wandb is not None and args.wandb_mode != 'disabled')
     if use_wandb:
+        wandb.login(key="edafa2d4d3d64c0268e9e7856783c659b9c255e3", relogin=True)
         wandb.init(
             project=args.wandb_project,
             name=(args.wandb_run_name if args.wandb_run_name else None),
@@ -281,21 +283,24 @@ def main():
 
         with open(args.json_file, 'r') as fs:
             path_json = json.load(fs)
-        
+
         json_data = path_json[dataset]
         line = '-' * 50
         print(f'<{line} {dataset} start {line}>')
         file.write(f'<{line} {dataset} start {line}>\n')
-        
+
         # W&B 테이블 (선택)
         seq_table = None
         if use_wandb:
             seq_table = wandb.Table(columns=[
                 'dataset','sequence','length','abs_rel','rmse','delta1'
             ])
-        
+
         results_all = []
         drop_lens = []
+
+        # ✅ 추가: 씬 인덱스(그래프 x축용)
+        scene_idx = 0
 
         for data in tqdm(json_data):
             for key in data.keys():
@@ -329,11 +334,21 @@ def main():
                         base_metrics[0], base_metrics[1], base_metrics[2]
                     )
 
+                # ✅ 추가: base=500도 len_sweep 시리즈로 즉시 스칼라 로그
+                if use_wandb:
+                    wandb.log({
+                        'dataset': dataset,
+                        'sequence': str(key),
+                        'scene_idx': scene_idx,
+                        f'len_sweep/abs_rel@{args.max_eval_len}': base_metrics[0],
+                        f'len_sweep/rmse@{args.max_eval_len}': base_metrics[1],
+                        f'len_sweep/delta1@{args.max_eval_len}': base_metrics[2],
+                    }, step=scene_idx)
+
                 # ② 길이 스윕: 중복 계산 방지
                 if length_sweep:
                     base_L = min(length_sweep)
 
-                    # base_L 성능(최소 길이) – 캐시에 없으면 한 번만 계산
                     if base_L in computed_metrics:
                         base_at_L = computed_metrics[base_L]
                     else:
@@ -347,7 +362,6 @@ def main():
                     drop_len = None
 
                     for L in length_sweep:
-                        # 이미 계산된 길이면 재사용(여기서 500, base_L 중복 방지)
                         if L in computed_metrics:
                             metL = computed_metrics[L]
                         else:
@@ -364,7 +378,18 @@ def main():
                                 metL[0], metL[1], metL[2]
                             )
 
-                        # 드롭 탐지: δ1(base_L) - δ1(L) >= tol 인 최초 L
+                        # ✅ 추가: L 길이 결과도 즉시 스칼라 로그 (씬별 x=scene_idx 에 점 1개씩)
+                        if use_wandb:
+                            wandb.log({
+                                'dataset': dataset,
+                                'sequence': str(key),
+                                'scene_idx': scene_idx,
+                                f'len_sweep/abs_rel@{L}': metL[0],
+                                f'len_sweep/rmse@{L}': metL[1],
+                                f'len_sweep/delta1@{L}': metL[2],
+                            }, step=scene_idx)
+
+                        # 드롭 탐지
                         if (not np.isnan(base_d1)) and (not np.isnan(metL[2])) and drop_len is None:
                             if (base_d1 - metL[2]) >= args.drop_tol:
                                 drop_len = L
@@ -372,7 +397,7 @@ def main():
                     if drop_len is not None:
                         drop_lens.append(drop_len)
 
-                # --- wandb: 시퀀스별 기본 로그
+                # --- wandb: 시퀀스별 기본 로그 (기존 유지)
                 if use_wandb:
                     log_dict = {
                         'dataset': dataset,
@@ -382,6 +407,9 @@ def main():
                         f'{eval_metrics[2]}': base_metrics[2],
                     }
                     wandb.log(log_dict)
+
+                # ✅ 추가: 다음 씬으로 step 증가
+                scene_idx += 1
 
         # 데이터셋 평균 출력/저장
         def safe_mean(arr, idx=None):
