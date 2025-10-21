@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 2
+experiment = 8
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +61,21 @@ def _detach_cache(cache):
         return cache.detach()
     return cache
 
+
+def _resolve_motion_module_channels(model):
+    """Read per-temporal-module channel dims from a VideoDepthAnything model."""
+    base = model.module if hasattr(model, "module") else model
+    dims = []
+    for module in getattr(base.head, "motion_modules", []):
+        temporal = getattr(module, "temporal_transformer", None)
+        norm = getattr(temporal, "norm", None) if temporal is not None else None
+        if norm is None or not hasattr(norm, "num_channels"):
+            raise AttributeError("Unable to resolve temporal channel size for KD aux blocks.")
+        dims.append(int(norm.num_channels))
+    if not dims:
+        raise ValueError("VideoDepthAnything model does not expose motion module channels.")
+    return dims
+
 # ================ 학습 루프 ================
 def train(args):
     OUTPUT_DIR = f"outputs/experiment_{experiment}"
@@ -81,6 +96,7 @@ def train(args):
     kd_cfg = config.get("kd_aux", {})
     kd_enabled   = bool(kd_cfg.get("enabled", True))
     kd_layers    = kd_cfg.get("layers", [0, 1, 2, 3])   # dpt_temporal에서 우리가 잡은 4개 temporal 지점
+    kd_layers    = [int(li) for li in kd_layers]
     kd_N         = int(kd_cfg.get("N", 1))              # APC 미래 스텝
     kd_alpha     = float(kd_cfg.get("alpha", 1e-2))
     kd_beta      = float(kd_cfg.get("beta", 5e-4))
@@ -108,22 +124,24 @@ def train(args):
     kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     # 모델 (단일 GPU)
-    student = VideoDepthStudent(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
-    teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
+    student = VideoDepthStudent(encoder="vitl", features=256, out_channels=[256, 512, 1024, 1024], num_frames=CLIP_LEN).to(device)
+    teacher = VideoDepthTeacher(encoder="vitl", features=256, out_channels=[256, 512, 1024, 1024], num_frames=CLIP_LEN).to(device)
+    # teacher = VideoDepthTeacher(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # --- KD용 레이어별 channel 정의 (우리 dpt_temporal 인덱스 0..3에 대응)
-    #   idx 0: layer_3 temporal, 1: layer_4 temporal, 2: path_4 temporal, 3: path_3 temporal
-    TEACHER_DIMS = [192,  384,   64,   64]   # teacher out_channels[2], out_channels[3], features, features
-    STUDENT_DIMS = [192,  384,   64,   64]  # student out_channels[2], out_channels[3], features, features
+    # --- KD용 레이어별 channel 정의를 모델에서 직접 추출 (idx: 0..3)
+    teacher_dims = _resolve_motion_module_channels(teacher)
+    student_dims = _resolve_motion_module_channels(student)
+    if any(li >= len(student_dims) for li in kd_layers):
+        raise ValueError(f"Configured kd_layers {kd_layers} exceed available motion modules {len(student_dims)}.")
 
     # --- AuxBlocks (Student 각 레이어 feat -> C_T로 proj)
     aux_blocks = nn.ModuleDict({
         str(i): AuxBlock(
-            c_in=STUDENT_DIMS[i],
-            c_teacher=TEACHER_DIMS[i],
+            c_in=student_dims[i],
+            c_teacher=teacher_dims[i],
             nhead=8,
             dropout=0.0,
             return_attn=False,
@@ -287,7 +305,7 @@ def train(args):
             prev_pred_raw = prev_mask = prev_y = None
             kd_executed = False
             # 스트리밍 Student 인터미디엇 버퍼 (KD 윈도우용): 레이어별 [B,1,C]를 프레임 순서대로 누적
-            inter_buf = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
+            inter_buf = {li: collections.deque(maxlen=kd_window) for li in kd_layers}
 
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
@@ -314,7 +332,6 @@ def train(args):
                     
                     # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
                     for li in kd_layers:
-                        li = int(li)
                         if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
                             inter_buf[li].append(inter_t[li]["feat_one"].detach())
 
@@ -412,7 +429,6 @@ def train(args):
 
                         # 4) 레이어별 KD
                         for li in kd_layers:
-                            li = int(li)
                             h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
                             t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
 
@@ -574,7 +590,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vits.pth")
+    parser.add_argument("--pretrained_ckpt", type=str, default="./checkpoints/video_depth_anything_vitl.pth")
     # real-pipeline mini-validation 설정
     parser.add_argument("--val_json_file",    type=str, default="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json")
     parser.add_argument("--val_infer_dir",    type=str, default="benchmark/output/scannet_stream_valmini")
