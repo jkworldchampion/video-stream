@@ -372,7 +372,7 @@ class KITTIVideoDataset(Dataset):
         rgb_std=(0.229, 0.224, 0.225),
         resize_size=350,
         split="train",
-        clip_len=16,
+        clip_len=32,
     ):
         super().__init__()
         assert split in ["train", "val"]

@@ -3,6 +3,7 @@ import argparse
 import logging
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import yaml
@@ -35,7 +36,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 8
+experiment = 10
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +110,9 @@ def train(args):
     kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
     kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
 
+    if not kd_enabled:
+        kd_layers = []
+
     if args.epochs is not None:
         num_epochs = int(args.epochs)
 
@@ -131,27 +135,30 @@ def train(args):
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # --- KD용 레이어별 channel 정의를 모델에서 직접 추출 (idx: 0..3)
-    teacher_dims = _resolve_motion_module_channels(teacher)
-    student_dims = _resolve_motion_module_channels(student)
-    if any(li >= len(student_dims) for li in kd_layers):
-        raise ValueError(f"Configured kd_layers {kd_layers} exceed available motion modules {len(student_dims)}.")
+    if kd_enabled:
+        # --- KD용 레이어별 channel 정의를 모델에서 직접 추출 (idx: 0..3)
+        teacher_dims = _resolve_motion_module_channels(teacher)
+        student_dims = _resolve_motion_module_channels(student)
+        if any(li >= len(student_dims) for li in kd_layers):
+            raise ValueError(f"Configured kd_layers {kd_layers} exceed available motion modules {len(student_dims)}.")
 
-    # --- AuxBlocks (Student 각 레이어 feat -> C_T로 proj)
-    aux_blocks = nn.ModuleDict({
-        str(i): AuxBlock(
-            c_in=student_dims[i],
-            c_teacher=teacher_dims[i],
-            nhead=8,
-            dropout=0.0,
-            return_attn=False,
-            return_qkv=True,            # Aux 내부 1L Transformer의 Q/K/V 수집
-            rnn_type="lstm",            # 또는 "mamba" 실험 가능
-            mamba_d_state=16,
-            mamba_d_conv=4,
-            mamba_expand=2,
-        ).to(device) for i in kd_layers
-    })
+        # --- AuxBlocks (Student 각 레이어 feat -> C_T로 proj)
+        aux_blocks = nn.ModuleDict({
+            str(i): AuxBlock(
+                c_in=student_dims[i],
+                c_teacher=teacher_dims[i],
+                nhead=8,
+                dropout=0.0,
+                return_attn=False,
+                return_qkv=True,
+                rnn_type="lstm",
+                mamba_d_state=16,
+                mamba_d_conv=4,
+                mamba_expand=2,
+            ).to(device) for i in kd_layers
+        })
+    else:
+        aux_blocks = nn.ModuleDict()
 
     # Pretrained
     if args.pretrained_ckpt:
@@ -210,7 +217,7 @@ def train(args):
             try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             except Exception as e: logger.warning(f"Scheduler state load skipped: {e}")
 
-        if "aux_state_dict" in ckpt:
+        if kd_enabled and "aux_state_dict" in ckpt:
             try: aux_blocks.load_state_dict(ckpt["aux_state_dict"])
             except Exception as e: logger.warning(f"Aux state load skipped: {e}")
 
@@ -224,7 +231,8 @@ def train(args):
         logger.info(f"▶ Resumed from '{args.resume_from}' | start_epoch={start_epoch} / target_epochs={num_epochs} | best_delta1={best_delta1:.4f}")
 
     wandb.watch(student, log="all")
-    wandb.watch(aux_blocks, log="all")
+    if kd_enabled and any(p.requires_grad for p in aux_blocks.parameters()):
+        wandb.watch(aux_blocks, log="all")
     best_delta1 = 0.0
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
@@ -314,26 +322,35 @@ def train(args):
 
                 # === Student: 스트리밍 1-step (encoder features 캐시) ===
                 with autocast(enabled=torch.cuda.is_available()):
-                    # pred_t_raw, cache = model_stream_step(student, x_t, cache)
-                    pred_t_raw, cache, inter_t, student_enc_feats = model_stream_step(
-                        student, x_t, cache,
-                        collect_inter=True,        # ← 내부 temporal features(intermediates)를 inter_t로 반환
-                        collect_qkv=False,         # Q/K/V는 AuxBlock에서 생성
-                        feature_pool=kd_pool,      # 'mean' 등
-                        return_encoder_feats=True, # ← encoder features 반환
-                    )
-                    pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
-                    
-                    # Encoder features detach (grad 차단, Teacher 재사용용)
-                    student_enc_feats_detached = [
-                        tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
-                        for f_tuple in student_enc_feats
-                    ]
-                    
-                    # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
-                    for li in kd_layers:
-                        if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
-                            inter_buf[li].append(inter_t[li]["feat_one"].detach())
+                    if kd_enabled:
+                        pred_t_raw, cache, inter_t, student_enc_feats = model_stream_step(
+                            student, x_t, cache,
+                            collect_inter=True,
+                            collect_qkv=False,
+                            feature_pool=kd_pool,
+                            return_encoder_feats=True,
+                        )
+                        pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
+
+                        student_enc_feats_detached = [
+                            tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
+                            for f_tuple in student_enc_feats
+                        ]
+
+                        for li in kd_layers:
+                            if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
+                                inter_buf[li].append(inter_t[li]["feat_one"].detach())
+                    else:
+                        pred_t_raw, cache = model_stream_step(
+                            student, x_t, cache,
+                            collect_inter=False,
+                            collect_qkv=False,
+                            feature_pool=kd_pool,
+                            return_encoder_feats=False,
+                        )
+                        pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
+                        inter_t = None
+                        student_enc_feats_detached = None
 
                     # ----- Scale-Shift & Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]

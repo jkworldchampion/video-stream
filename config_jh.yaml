@@ -10,3 +10,16 @@ hyper_parameter:
   # Teacher-Student parameters
   pred_distill_weight: 1.0  # Distillation loss 가중치
   cache_distill_weight: 1.0    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)
+
+kd_aux:
+  enabled: false
+  layers: [0, 1, 2, 3]
+  N: 1
+  alpha: 0.01
+  beta: 0.0005
+  gamma: 0.005
+  lambda_kd: 1.0
+  attn_eps: 1.0e-08
+  feature_pool: mean
+  window: 32
+  stride: 1
