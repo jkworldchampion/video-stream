@@ -1,0 +1,173 @@
+{
+  "timestamp": "2025-10-29T16:01:43.115016",
+  "device": "cuda",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "model_config": {
+    "encoder": "vits",
+    "features": 64,
+    "out_channels": [
+      48,
+      96,
+      192,
+      384
+    ]
+  },
+  "input_size": 518,
+  "checkpoint": "./outputs/experiment_2/best_model.pth",
+  "benchmarks": {
+    "Custom_518": {
+      "resolution": {
+        "width": 518,
+        "height": 518
+      },
+      "description": "Square Input (Current)",
+      "single_frame": {
+        "avg_time_ms": 27.881251997314394,
+        "std_time_ms": 0.5560894922412255,
+        "min_time_ms": 27.129618916660547,
+        "max_time_ms": 28.55727099813521,
+        "fps": 35.866395099342135,
+        "memory_stats": [
+          {
+            "allocated": 119.38671875,
+            "reserved": 318.0,
+            "max_allocated": 245.1767578125
+          },
+          {
+            "allocated": 119.38671875,
+            "reserved": 318.0,
+            "max_allocated": 245.1767578125
+          }
+        ],
+        "output_shape": [
+          518,
+          518
+        ]
+      },
+      "streaming": {
+        "total_frames": 16,
+        "avg_time_ms": 28.681349387625232,
+        "std_time_ms": 0.1962033183569746,
+        "first_frame_ms": 28.607364045456052,
+        "cached_frames_avg_ms": 28.686281743769843,
+        "fps_overall": 34.865863055643295,
+        "fps_cached": 34.85986817434722,
+        "memory_stats": [
+          {
+            "frame": 0,
+            "allocated": 119.38671875,
+            "reserved": 318.0,
+            "max_allocated": 245.1767578125
+          },
+          {
+            "frame": 8,
+            "allocated": 119.38671875,
+            "reserved": 318.0,
+            "max_allocated": 245.1767578125
+          },
+          {
+            "frame": 15,
+            "allocated": 119.38671875,
+            "reserved": 318.0,
+            "max_allocated": 245.1767578125
+          }
+        ],
+        "per_frame_times": [
+          28.607364045456052,
+          29.230679152533412,
+          28.578768018633127,
+          28.84128806181252,
+          28.553477954119444,
+          28.474787948653102,
+          28.836060082539916,
+          28.642752906307578,
+          28.42545905150473,
+          28.817852027714252,
+          28.58820604160428,
+          28.65101001225412,
+          28.856487944722176,
+          28.554085874930024,
+          28.47945410758257,
+          28.763856971636415
+        ]
+      }
+    },
+    "2K": {
+      "resolution": {
+        "width": 2560,
+        "height": 1440
+      },
+      "description": "2K - QHD",
+      "single_frame": {
+        "avg_time_ms": 65.20785719621927,
+        "std_time_ms": 0.5403662152598769,
+        "min_time_ms": 64.32084599509835,
+        "max_time_ms": 66.24200684018433,
+        "fps": 15.335575235831852,
+        "memory_stats": [
+          {
+            "allocated": 119.38671875,
+            "reserved": 580.0,
+            "max_allocated": 432.119140625
+          },
+          {
+            "allocated": 119.38671875,
+            "reserved": 580.0,
+            "max_allocated": 432.119140625
+          }
+        ],
+        "output_shape": [
+          1440,
+          2560
+        ]
+      },
+      "streaming": {
+        "total_frames": 16,
+        "avg_time_ms": 68.98529233876616,
+        "std_time_ms": 11.819577064779319,
+        "first_frame_ms": 113.71155292727053,
+        "cached_frames_avg_ms": 66.00354163286586,
+        "fps_overall": 14.495843477611123,
+        "fps_cached": 15.150702148111082,
+        "memory_stats": [
+          {
+            "frame": 0,
+            "allocated": 119.38671875,
+            "reserved": 580.0,
+            "max_allocated": 432.119140625
+          },
+          {
+            "frame": 8,
+            "allocated": 119.38671875,
+            "reserved": 580.0,
+            "max_allocated": 432.119140625
+          },
+          {
+            "frame": 15,
+            "allocated": 119.38671875,
+            "reserved": 580.0,
+            "max_allocated": 432.119140625
+          }
+        ],
+        "per_frame_times": [
+          113.71155292727053,
+          74.05888801440597,
+          70.51043095998466,
+          65.3691841289401,
+          65.40936813689768,
+          65.33821881748736,
+          65.52846310660243,
+          65.36126299761236,
+          65.37423515692353,
+          65.35177305340767,
+          65.40027097798884,
+          65.34298392944038,
+          64.86478820443153,
+          63.98710096254945,
+          64.10798500292003,
+          64.048171043396
+        ]
+      }
+    }
+  }
+}
