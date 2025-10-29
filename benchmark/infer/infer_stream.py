@@ -21,7 +21,7 @@ if __name__ == '__main__':
     parser.add_argument('--json_file', type=str, default='')
     parser.add_argument('--datasets', type=str, nargs='+', default=['scannet'])
     parser.add_argument('--input_size', type=int, default=518)
-    parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
+    parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitl'])
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
     args = parser.parse_args()
 
@@ -34,7 +34,7 @@ if __name__ == '__main__':
 
     vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
     # checkpoint load
-    ckpt = torch.load('./outputs/experiment_1/best_model.pth', map_location='cpu', weights_only=True)
+    ckpt = torch.load('./outputs/experiment_12/best_model.pth', map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거
