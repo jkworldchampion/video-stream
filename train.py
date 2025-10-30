@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 2
+experiment = 13
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +92,9 @@ def train(args):
     # 추가: 슬라이딩 KD 창 길이/보폭
     kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
     kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
+    
+    # NEW: Spatial-aware enhancement (Video-specific)
+    use_spatial_attention = bool(kd_cfg.get("use_spatial_attention", True))
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
@@ -132,6 +135,7 @@ def train(args):
             mamba_d_state=16,
             mamba_d_conv=4,
             mamba_expand=2,
+            use_spatial_attention=use_spatial_attention,  # NEW: Video-specific enhancement
         ).to(device) for i in kd_layers
     })
 
@@ -207,6 +211,14 @@ def train(args):
 
     wandb.watch(student, log="all")
     wandb.watch(aux_blocks, log="all")
+    
+    # Log configuration
+    logger.info(f"KD Configuration:")
+    logger.info(f"  - Enabled: {kd_enabled}")
+    logger.info(f"  - Window: {kd_window}, Stride: {kd_stride}")
+    logger.info(f"  - Spatial Attention: {use_spatial_attention} (Video-specific enhancement)")
+    logger.info(f"  - Alpha: {kd_alpha}, Beta: {kd_beta}, Gamma: {kd_gamma}")
+    
     best_delta1 = 0.0
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
@@ -288,6 +300,10 @@ def train(args):
             kd_executed = False
             # 스트리밍 Student 인터미디엇 버퍼 (KD 윈도우용): 레이어별 [B,1,C]를 프레임 순서대로 누적
             inter_buf = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
+            # NEW: Spatial features buffer for spatial-aware pooling
+            inter_buf_spatial = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
+            # Teacher head 입력을 위해 Student encoder 출력을 프레임 순으로 저장
+            enc_feat_buf = collections.deque(maxlen=kd_window)
 
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
@@ -311,12 +327,20 @@ def train(args):
                         tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
                         for f_tuple in student_enc_feats
                     ]
-                    
+                    current_feats_tuple = tuple(student_enc_feats_detached)
+
+                    # Teacher backbone 재사용을 위한 encoder feature 누적 (프레임 순 유지)
+                    enc_feat_buf.append(current_feats_tuple)
+
                     # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
                     for li in kd_layers:
                         li = int(li)
-                        if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
-                            inter_buf[li].append(inter_t[li]["feat_one"].detach())
+                        if inter_t is not None and inter_t.get(li) is not None:
+                            if inter_t[li].get("feat_one") is not None:
+                                inter_buf[li].append(inter_t[li]["feat_one"].detach())
+                            # NEW: Store spatial features for spatial-aware pooling
+                            if inter_t[li].get("feat_spatial") is not None:
+                                inter_buf_spatial[li].append(inter_t[li]["feat_spatial"].detach())
 
                     # ----- Scale-Shift & Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
@@ -364,38 +388,22 @@ def train(args):
                                 frame_valid_list.append(v)
                             frame_valid = torch.stack(frame_valid_list, dim=1)               # [B, W_eff]
 
-                            # DIS/KLD에서 '마지막 프레임'만
+                            # DIS에서 '마지막 프레임'만
                             mask_last = torch.zeros_like(frame_valid)
                             mask_last[:, -1] = frame_valid[:, -1]
 
-                        # 3) Teacher: encoder feature 재사용 (과거 프레임만 계산, 현재는 student 재사용)
+                        # 3) Teacher: Student encoder feature 재사용 (단순 결합)
                         with torch.no_grad():
-                            if W_eff > 1:
-                                # 과거 프레임 (t0~t-1) encoder
-                                x_past = x_win[:, :-1, ...]  # [B, W_eff-1, 3, H, W]
-                                past_feats = teacher.pretrained.get_intermediate_layers(
-                                    x_past.flatten(0, 1),
-                                    teacher.intermediate_layer_idx[teacher.encoder],
-                                    return_class_token=True
-                                )
-                            else:
-                                past_feats = None
+                            frames_feats = list(enc_feat_buf)[-W_eff:]
 
-                            # Combine past + current (student encoder 재사용)
-                            if past_feats is not None:
-                                combined_feats = []
-                                for pf_tuple, sf_tuple in zip(past_feats, student_enc_feats_detached):
-                                    # pf_tuple: (tokens[B*(W-1),N,C], cls[B*(W-1),C]) or just (tokens,)
-                                    # sf_tuple: (tokens[B*1,N,C], cls[B*1,C]) or just (tokens,)
-                                    tokens_combined = torch.cat([pf_tuple[0], sf_tuple[0]], dim=0)
-                                    if len(pf_tuple) > 1 and pf_tuple[1] is not None:
-                                        cls_combined = torch.cat([pf_tuple[1], sf_tuple[1]], dim=0)
-                                        combined_feats.append((tokens_combined, cls_combined))
-                                    else:
-                                        combined_feats.append((tokens_combined,))
-                            else:
-                                # W_eff==1: 현재 프레임만
-                                combined_feats = student_enc_feats_detached
+                            combined_feats = []
+                            for layer_idx in range(len(frames_feats[0])):
+                                tokens_seq = torch.cat([frame_feats[layer_idx][0] for frame_feats in frames_feats], dim=0)
+                                if len(frames_feats[0][layer_idx]) > 1 and frames_feats[0][layer_idx][1] is not None:
+                                    cls_seq = torch.cat([frame_feats[layer_idx][1] for frame_feats in frames_feats], dim=0)
+                                    combined_feats.append((tokens_seq, cls_seq))
+                                else:
+                                    combined_feats.append((tokens_seq,))
 
                             # Teacher depth head로 intermediate/qkv 추출
                             _, _, t_intermediates = teacher.head(
@@ -415,6 +423,8 @@ def train(args):
                             li = int(li)
                             h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
                             t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
+                            # NEW: Teacher spatial features for comparison
+                            t_feat_spatial = t_out["intermediates"][li].get("feat_spatial")  # [B, C, W_eff, H, W]
 
                             # Student 버퍼 길이 확인
                             buf_len = len(inter_buf[li])
@@ -427,7 +437,21 @@ def train(args):
                                 s_list[-1] = inter_t[li]["feat_one"]
                             s_feat_seq = torch.cat(s_list, dim=1)              # [B, W_eff, C]
 
-                            z_seq, r_seq, qkv_aux_seq = aux_blocks[str(li)](s_feat_seq, hole_mask_N=kd_N)
+                            # NEW: Prepare spatial features if available
+                            s_feat_spatial = None
+                            if len(inter_buf_spatial[li]) > 0:
+                                s_spatial_list = list(inter_buf_spatial[li])
+                                if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_spatial") is not None:
+                                    s_spatial_list[-1] = inter_t[li]["feat_spatial"]
+                                # Concatenate along temporal dimension: [B, C, T, H, W]
+                                s_feat_spatial = torch.cat(s_spatial_list, dim=2)  # [B, C, W_eff, H, W]
+
+                            # AuxBlock forward with spatial features
+                            z_seq, r_seq, qkv_aux_seq = aux_blocks[str(li)](
+                                s_feat_seq, 
+                                hole_mask_N=kd_N,
+                                s_feat_spatial=s_feat_spatial  # NEW: Pass spatial features
+                            )
                             l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
                             l_kld = attention_relation_kl(
                                 t_qkv_seq, qkv_aux_seq,

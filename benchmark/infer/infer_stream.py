@@ -34,7 +34,8 @@ if __name__ == '__main__':
 
     vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
     # checkpoint load
-    ckpt = torch.load('./outputs/experiment_1/best_model.pth', map_location='cpu', weights_only=True)
+    # ckpt = torch.load('./outputs/experiment_2/best_model.pth', map_location='cpu', weights_only=True)
+    ckpt = torch.load('./checkpoints/video_depth_anything_vits.pth', map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거
@@ -75,6 +76,10 @@ if __name__ == '__main__':
                         base, _ = os.path.splitext(item['image'])
                         out_path = os.path.join(args.infer_path, dataset, base + '.npy')
                         os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+                        # Resume safely by skipping frames that already have cached results
+                        if os.path.exists(out_path):
+                            continue
 
                         # BGR -> RGB (저자 릴리스 버그 보정)
                         img = cv2.cvtColor(cv2.imread(img_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)

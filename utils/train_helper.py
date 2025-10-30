@@ -144,13 +144,14 @@ def model_stream_step(
             return pred_t, new_cache, feats
         return pred_t, new_cache
 
-    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None}
+    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None, "feat_spatial": [B,C,1,H,W]}
     raw_inter = extra.get("intermediates", extra)
     inter_t = {}
 
     for k, v in raw_inter.items():
         feat = v.get("feat_one", v.get("feat", None))  # 'feat_one'을 우선 사용, 없으면 'feat'
         qkv  = v.get("qkv", None)
+        feat_spatial = v.get("feat_spatial", None)  # NEW: spatial features [B, C, T, H, W]
 
         if feat is None:
             continue
@@ -161,9 +162,15 @@ def model_stream_step(
         elif feat.dim() == 3 and feat.size(1) != 1:
             feat = feat[:, -1:, :]                   # [B,1,C] (스트리밍 1-step이면 보통 이미 1임)
 
+        # Spatial features: extract current frame only
+        if feat_spatial is not None and feat_spatial.dim() == 5:
+            # [B, C, T, H, W] -> [B, C, 1, H, W] (last frame)
+            feat_spatial = feat_spatial[:, :, -1:, :, :]
+
         inter_t[int(k)] = {
             "feat_one": feat,
-            "qkv": qkv if collect_qkv else None
+            "qkv": qkv if collect_qkv else None,
+            "feat_spatial": feat_spatial  # NEW
         }
 
     if return_encoder_feats:

@@ -18,6 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Spatial-aware modules (video-specific)
+from .spatial_modules import SpatialAttentionPooling, MultiScaleSpatialEncoder
+
 # experiment: mamba
 try:
     from mamba_ssm import Mamba
@@ -151,6 +154,10 @@ class AuxBlock(nn.Module):
     """
     Student temporal features -> (Aux non-streaming layer) -> z (feature KD) + r (APC head)
     Optionally export per-head Q/K/V of the transformer.
+    
+    **Video-Specific Enhancement**: 
+    Uses spatial attention pooling instead of naive mean pooling,
+    exploiting 2D structure of video frames (differentiates from ASR's 1D approach).
     """
     def __init__(
         self,
@@ -166,6 +173,7 @@ class AuxBlock(nn.Module):
         mamba_expand: int = 2,
         use_pos_enc: bool = True,
         mlp_ratio: float = 4.0,
+        use_spatial_attention: bool = True,  # NEW: Enable spatial-aware pooling
     ):
         super().__init__()
         self.c_in = c_in
@@ -173,6 +181,7 @@ class AuxBlock(nn.Module):
         self.nhead = nhead
         self.return_qkv = return_qkv
         self.use_pos_enc = use_pos_enc
+        self.use_spatial_attention = use_spatial_attention
 
         # like TransformerEncoderLayer but with our MHAttention1D and APC uni-LSTM
         # 1) projection to teacher dim
@@ -208,15 +217,26 @@ class AuxBlock(nn.Module):
         # 5) (optional) output norm
         self.ln_out = nn.LayerNorm(c_teacher)
 
-    def forward(self, s_feat: torch.Tensor, hole_mask_N: int = 0):
+    def forward(self, s_feat: torch.Tensor, hole_mask_N: int = 0, s_feat_spatial: torch.Tensor = None):
         """
-        s_feat: [B, T, C_in]  (student temporal features pooled to [B,T,C_in])
+        s_feat: [B, T, C_in]  (student temporal features, already pooled OR to be pooled if s_feat_spatial provided)
         hole_mask_N: for the transformer attention — block [t+1..t+N] to avoid APC leakage
+        s_feat_spatial: [B, C_in, T, H, W] (optional) raw spatial features for spatial attention pooling
+        
         returns:
           z:   [B, T, C_t]  (to match teacher feature h for feature loss)
           r:   [B, T, C_t]  (uni-LSTM outputs, for APC to predict h_{t+N})
           qkv: dict or None; {"Q","K","V"} each [B, A, T, Dh]
         """
+        # If spatial features provided, use spatial attention pooling
+        if s_feat_spatial is not None and self.use_spatial_attention:
+            # s_feat_spatial: [B, C, T, H, W]
+            if not hasattr(self, 'spatial_pool'):
+                # Lazy initialization (backward compatibility)
+                self.spatial_pool = SpatialAttentionPooling(self.c_in).to(s_feat_spatial.device)
+            
+            s_feat = self.spatial_pool(s_feat_spatial)  # [B, T, C_in]
+        
         assert s_feat.dim() == 3, f"s_feat must be [B,T,C_in], got {s_feat.shape}"
         B, T, _ = s_feat.shape
         x = self.proj_in(s_feat)        # [B,T,Ct]

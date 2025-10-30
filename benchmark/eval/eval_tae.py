@@ -221,6 +221,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--infer_path', type=str, default='')
     parser.add_argument('--benchmark_path', type=str, default='')
+    parser.add_argument('--json_file', type=str, default='')
 
     parser.add_argument('--datasets', type=str, nargs='+', default=['scannet', 'sintel'])
     parser.add_argument('--start_idx', type=int, default=0)
@@ -236,7 +237,8 @@ if __name__ == '__main__':
 
         file = open(results_save_path, 'a')
         if dataset == 'scannet':
-            args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video.json')
+            default_json = os.path.join(args.benchmark_path,'scannet/scannet_video.json')
+            json_file = args.json_file if args.json_file else default_json
             args.root_path = os.path.join(args.benchmark_path, 'scannet/')
             args.max_depth_eval = 10.0
             args.min_depth_eval = 0.1
@@ -247,8 +249,13 @@ if __name__ == '__main__':
             args.b = -8
             args.c = 11
             args.d = -11
-        
-        with open(args.json_file, 'r') as fs:
+        else:
+            json_file = args.json_file
+
+        if not json_file:
+            raise ValueError(f"No json metadata file provided for dataset '{dataset}'.")
+
+        with open(json_file, 'r') as fs:
             path_json = json.load(fs)
         
         json_data = path_json[dataset]
@@ -273,8 +280,12 @@ if __name__ == '__main__':
                     infer_paths.append(infer_path)
                     depth_gt_paths.append(args.root_path + '/' + images['gt_depth'])
                     factors.append(images['factor'])
-                    Ks.append(np.array(images['K']))
-                    poses.append(np.array(images['pose']))
+                    try:
+                        Ks.append(np.array(images['K']))
+                        poses.append(np.array(images['pose']))
+                    except KeyError as exc:
+                        missing_key = exc.args[0]
+                        raise KeyError(f"Metadata missing '{missing_key}'. Ensure the json file '{json_file}' contains camera intrinsics and poses for TAE evaluation.") from exc
                     
                     if args.mask:
                         masks.append(args.root_path + '/' + images['mask'])

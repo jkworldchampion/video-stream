@@ -10,3 +10,20 @@ hyper_parameter:
   # Teacher-Student parameters
   pred_distill_weight: 1.0  # Distillation loss 가중치
   cache_distill_weight: 1.0    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)
+
+# KD Aux configuration (NEW: Spatial-Aware Enhancement)
+kd_aux:
+  enabled: true
+  layers: [0, 1, 2, 3]  # 4 temporal module locations
+  N: 1                  # APC future prediction steps
+  alpha: 0.01           # L_DIS weight (feature distillation)
+  beta: 0.0005          # L_KLD weight (attention relation)
+  gamma: 0.005          # L_APC weight (autoregressive predictive coding)
+  lambda_kd: 1.0        # Overall KD loss weight
+  attn_eps: 1.0e-8      # Attention stability epsilon
+  feature_pool: "mean"  # Pooling method for temporal features
+  window: 16            # KD sliding window size (frames)
+  stride: 1             # KD computation stride
+  
+  # NEW: Spatial-Aware settings (Video-specific enhancement)
+  use_spatial_attention: true  # Enable spatial attention pooling (vs naive mean)
