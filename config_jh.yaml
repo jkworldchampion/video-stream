@@ -25,5 +25,10 @@ kd_aux:
   window: 16            # KD sliding window size (frames)
   stride: 1             # KD computation stride
   
-  # NEW: Spatial-Aware settings (Video-specific enhancement)
-  use_spatial_attention: true  # Enable spatial attention pooling (vs naive mean)
+  # C: Dynamic KV Refinement (Video-specific enhancement)
+  use_kv_refiner: true          # Enable KV refinement
+  kv_refiner_context: 4         # Number of context frames for refinement
+  kv_refiner_dropout: 0.1       # Dropout rate in refiner
+  zeta: 0.05                    # L_AUX_KV loss weight
+  kv_loss_type: "mse"           # KV loss: 'mse' or 'cosine'
+  kv_normalize: true            # Normalize K/V before loss computation

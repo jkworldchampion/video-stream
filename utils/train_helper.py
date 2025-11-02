@@ -144,14 +144,13 @@ def model_stream_step(
             return pred_t, new_cache, feats
         return pred_t, new_cache
 
-    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None, "feat_spatial": [B,C,1,H,W]}
+    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None}
     raw_inter = extra.get("intermediates", extra)
     inter_t = {}
 
     for k, v in raw_inter.items():
         feat = v.get("feat_one", v.get("feat", None))  # 'feat_one'을 우선 사용, 없으면 'feat'
         qkv  = v.get("qkv", None)
-        feat_spatial = v.get("feat_spatial", None)  # NEW: spatial features [B, C, T, H, W]
 
         if feat is None:
             continue
@@ -162,15 +161,9 @@ def model_stream_step(
         elif feat.dim() == 3 and feat.size(1) != 1:
             feat = feat[:, -1:, :]                   # [B,1,C] (스트리밍 1-step이면 보통 이미 1임)
 
-        # Spatial features: extract current frame only
-        if feat_spatial is not None and feat_spatial.dim() == 5:
-            # [B, C, T, H, W] -> [B, C, 1, H, W] (last frame)
-            feat_spatial = feat_spatial[:, :, -1:, :, :]
-
         inter_t[int(k)] = {
             "feat_one": feat,
             "qkv": qkv if collect_qkv else None,
-            "feat_spatial": feat_spatial  # NEW
         }
 
     if return_encoder_feats:
@@ -462,3 +455,147 @@ def validate_with_infer_eval_subset(
         model.train()
 
     return avg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KITTI Validation (Stream mode with SSI+TGM losses + depth metrics)
+# ──────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def validate_kitti_streaming(
+    model,
+    val_loader,
+    device,
+    loss_ssi_fn,
+    loss_tgm_fn,
+    ratio_ssi=1.0,
+    ratio_tgm=10.0,
+    min_depth=1e-3,
+    max_depth=80.0
+):
+    """
+    KITTI validation with streaming inference.
+    
+    Returns:
+        dict: {
+            'loss': average validation loss,
+            'ssi': average SSI loss,
+            'tgm': average TGM loss,
+            'absrel': average absolute relative error,
+            'delta1': average delta1 accuracy
+        }
+    """
+    model_was_training = model.training
+    model.eval()
+    
+    total_loss = 0.0
+    total_ssi = 0.0
+    total_tgm = 0.0
+    total_absrel = 0.0
+    total_delta1 = 0.0
+    total_samples = 0
+    
+    for batch_idx, batch_data in enumerate(tqdm(val_loader, desc="KITTI Val", leave=False)):
+        # KITTI val returns multiple values, we only need x and y
+        # Unpack first two regardless of total length
+        x = batch_data[0]
+        y = batch_data[1]
+        # Ignore extrinsics, intrinsics, cam_ids if present
+        
+        x = x.to(device)  # [B, T, 3, H, W]
+        y = y.to(device)  # [B, T, 1, H, W]
+        
+        B, T = x.shape[:2]
+        
+        # Reset streaming state
+        _reset_streaming_state(model)
+        
+        pred_list = []
+        cache = None
+        
+        # Frame-by-frame streaming
+        for t in range(T):
+            x_t = x[:, t:t+1]  # [B, 1, 3, H, W]
+            
+            # Streaming inference
+            pred_t, cache = model_stream_step(model, x_t, cache, collect_inter=False)
+            pred_t = to_BHW_pred(pred_t).clamp(min=1e-6)  # [B, H, W]
+            pred_list.append(pred_t)
+        
+        # Stack predictions: [B, T, H, W]
+        pred_clip = torch.stack(pred_list, dim=1)
+        
+        # Compute mask
+        mask = get_mask(y, min_depth, max_depth).squeeze(2)  # [B, T, H, W]
+        
+        # Convert to disparity for loss computation
+        gt_disp = (1.0 / y.clamp(min=1e-6)).squeeze(2)  # [B, T, H, W]
+        pred_disp = pred_clip  # Already disparity from model
+        
+        # Scale-shift alignment per clip (batch-wise)
+        pred_disp_flat = pred_disp.view(B, -1)  # [B, T*H*W]
+        gt_disp_flat = gt_disp.view(B, -1)
+        mask_flat = mask.view(B, -1).float()
+        
+        # Compute scale & shift
+        count = mask_flat.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean_pred = (pred_disp_flat * mask_flat).sum(dim=1, keepdim=True) / count
+        mean_gt = (gt_disp_flat * mask_flat).sum(dim=1, keepdim=True) / count
+        
+        pred_centered = (pred_disp_flat - mean_pred) * mask_flat
+        gt_centered = (gt_disp_flat - mean_gt) * mask_flat
+        
+        cov = (pred_centered * gt_centered).sum(dim=1, keepdim=True)
+        var = (pred_centered ** 2).sum(dim=1, keepdim=True).clamp_min(1e-6)
+        
+        scale = cov / var
+        shift = mean_gt - scale * mean_pred
+        
+        # Aligned prediction
+        pred_aligned_flat = pred_disp_flat * scale + shift
+        pred_aligned = pred_aligned_flat.view(B, T, pred_clip.shape[-2], pred_clip.shape[-1])
+        
+        # SSI loss (normalized)
+        disp_normed = norm_ssi(y, mask.unsqueeze(2)).squeeze(2)  # [B, T, H, W]
+        ssi_loss = loss_ssi_fn(pred_aligned.unsqueeze(2), disp_normed.unsqueeze(2), mask)
+        
+        # TGM loss (temporal consistency)
+        if T >= 2:
+            pred_depth = 1.0 / pred_aligned.clamp(min=1e-6)
+            gt_depth = y.squeeze(2)
+            tgm_loss = loss_tgm_fn(pred_aligned, gt_depth, mask)
+        else:
+            tgm_loss = torch.tensor(0.0, device=device)
+        
+        # Total loss
+        loss = ratio_ssi * ssi_loss + ratio_tgm * tgm_loss
+        
+        # Depth metrics (convert back to depth domain)
+        pred_depth_aligned = 1.0 / pred_aligned.clamp(min=1e-6)
+        gt_depth = y.squeeze(2)
+        
+        # Per-clip metrics
+        absrel = abs_relative_difference(pred_depth_aligned, gt_depth, mask).item()
+        delta1 = delta1_acc(pred_depth_aligned, gt_depth, mask).item()
+        
+        # Accumulate
+        total_loss += loss.item() * B
+        total_ssi += ssi_loss.item() * B
+        total_tgm += tgm_loss.item() * B
+        total_absrel += absrel * B
+        total_delta1 += delta1 * B
+        total_samples += B
+    
+    # Average
+    avg_metrics = {
+        'loss': total_loss / max(1, total_samples),
+        'ssi': total_ssi / max(1, total_samples),
+        'tgm': total_tgm / max(1, total_samples),
+        'absrel': total_absrel / max(1, total_samples),
+        'delta1': total_delta1 / max(1, total_samples)
+    }
+    
+    # Restore model mode
+    if model_was_training:
+        model.train()
+    
+    return avg_metrics

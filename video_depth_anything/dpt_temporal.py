@@ -145,11 +145,7 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_0 = self._pool_feat_bcthw_to_btc(layer_3_out, mode=feature_pool)  # [B,T,C]
-            intermediates[0] = {
-                "feat": feat_0, 
-                "qkv": qkv_0,
-                "feat_spatial": layer_3_out  # [B, C, T, H, W] for spatial-aware pooling
-            }
+            intermediates[0] = {"feat": feat_0, "qkv": qkv_0}
 
         layer_3 = layer_3_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -174,11 +170,7 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_1 = self._pool_feat_bcthw_to_btc(layer_4_out, mode=feature_pool)
-            intermediates[1] = {
-                "feat": feat_1, 
-                "qkv": qkv_1,
-                "feat_spatial": layer_4_out  # [B, C, T, H, W]
-            }
+            intermediates[1] = {"feat": feat_1, "qkv": qkv_1}
 
         layer_4 = layer_4_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -211,11 +203,7 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_2 = self._pool_feat_bcthw_to_btc(path_4_out, mode=feature_pool)
-            intermediates[2] = {
-                "feat": feat_2, 
-                "qkv": qkv_2,
-                "feat_spatial": path_4_out  # [B, C, T, H, W]
-            }
+            intermediates[2] = {"feat": feat_2, "qkv": qkv_2}
 
         path_4 = path_4_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -242,11 +230,7 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_3 = self._pool_feat_bcthw_to_btc(path_3_out, mode=feature_pool)
-            intermediates[3] = {
-                "feat": feat_3, 
-                "qkv": qkv_3,
-                "feat_spatial": path_3_out  # [B, C, T, H, W]
-            }
+            intermediates[3] = {"feat": feat_3, "qkv": qkv_3}
 
         path_3 = path_3_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
