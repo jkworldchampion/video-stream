@@ -11,7 +11,7 @@ export PYTHONUNBUFFERED=1
 
 
 # 1) streaming inference 결과 디렉토리
-INFER_PATH="${ROOT}/benchmark/output/ablation/experiment_15"
+INFER_PATH="${ROOT}/benchmark/output/sliding_window_eval"
 
 # 2) JSON 메타데이터
 JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
@@ -20,13 +20,13 @@ JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/dataset
 BENCHMARK_ROOT="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets"
 
 
-mkdir -p "${INFER_PATH}"
+# mkdir -p "${INFER_PATH}"
 
-echo "▶ Streaming inference → ${INFER_PATH}"
-python "${ROOT}/benchmark/infer/infer_stream.py" \
-  --infer_path "${INFER_PATH}" \
-  --json_file  "${JSON_FILE}" \
-  --datasets scannet
+# echo "▶ Streaming inference → ${INFER_PATH}"
+# python "${ROOT}/benchmark/infer/infer_stream.py" \
+#   --infer_path "${INFER_PATH}" \
+#   --json_file  "${JSON_FILE}" \
+#   --datasets scannet
 
 echo
 echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
@@ -36,7 +36,7 @@ python "${ROOT}/benchmark/eval/eval.py" \
   --datasets scannet_500 \
   --wandb \
   --wandb_project evaluation \
-  --wandb_run_name "experiment_15_$(date +%Y%m%d_%H%M)" \
+  --wandb_run_name "experiment_sliding" \
   --wandb_group "streaming" \
   --wandb_mode online
 
