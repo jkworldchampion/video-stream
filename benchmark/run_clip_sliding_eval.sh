@@ -48,24 +48,24 @@ echo "Dataset: ${DATASET}"
 echo "Output: ${INFER_DIR}"
 echo "=========================================="
 
-# mkdir -p "${INFER_DIR}"
+mkdir -p "${INFER_DIR}"
 
-# # Step 1: Run CLIP-style sliding window inference (TRUE batch)
-# echo ""
-# echo "[Step 1/2] Running clip-style sliding window inference..."
-# echo "  → Multiple windows processed simultaneously (batch_size=8)"
-# echo "  → Position encoding: [0-31] for each window"
-# echo "  → GPU memory optimized for speed (24GB VRAM)"
-# echo ""
-# python "${ROOT}/benchmark/infer/infer_clip_eval.py" \
-#     --infer_path "${INFER_DIR}" \
-#     --json_file "${JSON_FILE}" \
-#     --datasets ${DATASET} \
-#     --input_size ${INPUT_SIZE} \
-#     --encoder ${ENCODER} \
-#     --window_size ${WINDOW_SIZE} \
-#     --checkpoint "${CHECKPOINT}" \
-#     --batch_size 1
+# Step 1: Run CLIP-style sliding window inference (TRUE batch)
+echo ""
+echo "[Step 1/2] Running clip-style sliding window inference..."
+echo "  → Multiple windows processed simultaneously (batch_size=8)"
+echo "  → Position encoding: [0-31] for each window"
+echo "  → GPU memory optimized for speed (24GB VRAM)"
+echo ""
+python "${ROOT}/benchmark/infer/infer_clip_eval.py" \
+    --infer_path "${INFER_DIR}" \
+    --json_file "${JSON_FILE}" \
+    --datasets ${DATASET} \
+    --input_size ${INPUT_SIZE} \
+    --encoder ${ENCODER} \
+    --window_size ${WINDOW_SIZE} \
+    --checkpoint "${CHECKPOINT}" \
+    --batch_size 1
 
 # Step 2: Evaluate metrics (using eval.py like run.sh)
 echo ""

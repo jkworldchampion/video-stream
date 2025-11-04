@@ -1,0 +1,163 @@
+nohup: ignoring input
+==========================================
+Attention Pattern Visualization
+==========================================
+
+목적:
+  1. CLIP: 새로운 window마다 attention 패턴
+  2. STREAM: 캐시가 쌓이면서 attention 변화
+  3. 비교: Stream이 먼 과거에 제대로 attend하는가?
+
+Scenes: 3
+Max frames: 100 (per scene)
+Output: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization
+==========================================
+xFormers not available
+xFormers not available
+xFormers not available
+================================================================================
+Attention Pattern Visualization: Stream vs Clip
+================================================================================
+Encoder: vits
+Window size: 32
+Output: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization
+================================================================================
+
+Loading models...
+✓ Loaded CLIP model (batch processing)
+✓ Loaded STREAM model (cache accumulation)
+
+================================================================================
+Scene 1/3: scene0019_00
+Total frames: 500
+================================================================================
+
+[1/2] CLIP Inference (batch processing)...
+  Collected 16 attention maps
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_000.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_001.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_002.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_003.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_004.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_005.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_006.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_007.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_008.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_009.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_010.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_011.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_012.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_013.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_014.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/clip_window_015.png
+
+[2/2] STREAM Inference (cache accumulation)...
+  Stream inference:   0%|          | 0/100 [00:00<?, ?it/s]  Stream inference:   2%|▏         | 2/100 [00:00<00:05, 18.79it/s]  Stream inference:   6%|▌         | 6/100 [00:00<00:03, 26.80it/s]  Stream inference:  10%|█         | 10/100 [00:00<00:03, 29.24it/s]  Stream inference:  14%|█▍        | 14/100 [00:00<00:02, 30.29it/s]  Stream inference:  18%|█▊        | 18/100 [00:00<00:02, 30.66it/s]  Stream inference:  22%|██▏       | 22/100 [00:00<00:02, 31.02it/s]  Stream inference:  26%|██▌       | 26/100 [00:00<00:02, 31.27it/s]  Stream inference:  30%|███       | 30/100 [00:00<00:02, 31.44it/s]  Stream inference:  34%|███▍      | 34/100 [00:01<00:02, 31.47it/s]  Stream inference:  38%|███▊      | 38/100 [00:01<00:01, 31.58it/s]  Stream inference:  42%|████▏     | 42/100 [00:01<00:01, 31.71it/s]  Stream inference:  46%|████▌     | 46/100 [00:01<00:01, 31.80it/s]  Stream inference:  50%|█████     | 50/100 [00:01<00:01, 31.80it/s]  Stream inference:  54%|█████▍    | 54/100 [00:01<00:01, 31.88it/s]  Stream inference:  58%|█████▊    | 58/100 [00:01<00:01, 31.96it/s]  Stream inference:  62%|██████▏   | 62/100 [00:01<00:01, 32.00it/s]  Stream inference:  66%|██████▌   | 66/100 [00:02<00:01, 31.96it/s]  Stream inference:  70%|███████   | 70/100 [00:02<00:00, 32.02it/s]  Stream inference:  74%|███████▍  | 74/100 [00:02<00:00, 32.03it/s]  Stream inference:  78%|███████▊  | 78/100 [00:02<00:00, 32.09it/s]  Stream inference:  82%|████████▏ | 82/100 [00:02<00:00, 32.09it/s]  Stream inference:  86%|████████▌ | 86/100 [00:02<00:00, 32.18it/s]  Stream inference:  90%|█████████ | 90/100 [00:02<00:00, 32.20it/s]  Stream inference:  94%|█████████▍| 94/100 [00:02<00:00, 32.24it/s]  Stream inference:  98%|█████████▊| 98/100 [00:03<00:00, 32.22it/s]  Stream inference: 100%|██████████| 100/100 [00:03<00:00, 31.52it/s]
+  Collected 6 attention snapshots
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0015.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0031.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0047.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0063.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0079.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/stream_frame_0095.png
+
+[3/3] Generating comparison plot...
+  ✓ Saved comparison: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/comparison.png
+  ✓ Saved statistics: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_00/statistics.json
+
+================================================================================
+Scene 2/3: scene0019_01
+Total frames: 500
+================================================================================
+
+[1/2] CLIP Inference (batch processing)...
+  Collected 16 attention maps
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_000.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_001.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_002.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_003.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_004.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_005.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_006.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_007.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_008.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_009.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_010.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_011.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_012.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_013.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_014.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/clip_window_015.png
+
+[2/2] STREAM Inference (cache accumulation)...
+  Stream inference:   0%|          | 0/100 [00:00<?, ?it/s]  Stream inference:   4%|▍         | 4/100 [00:00<00:03, 30.62it/s]  Stream inference:   8%|▊         | 8/100 [00:00<00:02, 31.06it/s]  Stream inference:  12%|█▏        | 12/100 [00:00<00:02, 31.15it/s]  Stream inference:  16%|█▌        | 16/100 [00:00<00:02, 31.05it/s]  Stream inference:  20%|██        | 20/100 [00:00<00:02, 31.06it/s]  Stream inference:  24%|██▍       | 24/100 [00:00<00:02, 31.11it/s]  Stream inference:  28%|██▊       | 28/100 [00:00<00:02, 31.10it/s]  Stream inference:  32%|███▏      | 32/100 [00:01<00:02, 30.97it/s]  Stream inference:  36%|███▌      | 36/100 [00:01<00:02, 31.03it/s]  Stream inference:  40%|████      | 40/100 [00:01<00:01, 31.07it/s]  Stream inference:  44%|████▍     | 44/100 [00:01<00:01, 31.08it/s]  Stream inference:  48%|████▊     | 48/100 [00:01<00:01, 31.00it/s]  Stream inference:  52%|█████▏    | 52/100 [00:01<00:01, 31.00it/s]  Stream inference:  56%|█████▌    | 56/100 [00:01<00:01, 31.07it/s]  Stream inference:  60%|██████    | 60/100 [00:01<00:01, 31.10it/s]  Stream inference:  64%|██████▍   | 64/100 [00:02<00:01, 31.02it/s]  Stream inference:  68%|██████▊   | 68/100 [00:02<00:01, 31.02it/s]  Stream inference:  72%|███████▏  | 72/100 [00:02<00:00, 31.02it/s]  Stream inference:  76%|███████▌  | 76/100 [00:02<00:00, 31.00it/s]  Stream inference:  80%|████████  | 80/100 [00:02<00:00, 30.89it/s]  Stream inference:  84%|████████▍ | 84/100 [00:02<00:00, 30.89it/s]  Stream inference:  88%|████████▊ | 88/100 [00:02<00:00, 30.90it/s]  Stream inference:  92%|█████████▏| 92/100 [00:02<00:00, 30.90it/s]  Stream inference:  96%|█████████▌| 96/100 [00:03<00:00, 30.81it/s]  Stream inference: 100%|██████████| 100/100 [00:03<00:00, 30.83it/s]  Stream inference: 100%|██████████| 100/100 [00:03<00:00, 30.98it/s]
+  Collected 6 attention snapshots
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0015.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0031.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0047.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0063.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0079.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/stream_frame_0095.png
+
+[3/3] Generating comparison plot...
+  ✓ Saved comparison: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/comparison.png
+  ✓ Saved statistics: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0019_01/statistics.json
+
+================================================================================
+Scene 3/3: scene0025_00
+Total frames: 500
+================================================================================
+
+[1/2] CLIP Inference (batch processing)...
+  Collected 16 attention maps
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_000.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_001.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_002.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_003.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_004.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_005.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_006.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_007.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_008.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_009.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_010.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_011.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_012.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_013.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_014.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/clip_window_015.png
+
+[2/2] STREAM Inference (cache accumulation)...
+  Stream inference:   0%|          | 0/100 [00:00<?, ?it/s]  Stream inference:   4%|▍         | 4/100 [00:00<00:03, 30.68it/s]  Stream inference:   8%|▊         | 8/100 [00:00<00:02, 30.92it/s]  Stream inference:  12%|█▏        | 12/100 [00:00<00:02, 30.87it/s]  Stream inference:  16%|█▌        | 16/100 [00:00<00:02, 30.68it/s]  Stream inference:  20%|██        | 20/100 [00:00<00:02, 30.80it/s]  Stream inference:  24%|██▍       | 24/100 [00:00<00:02, 30.93it/s]  Stream inference:  28%|██▊       | 28/100 [00:00<00:02, 31.05it/s]  Stream inference:  32%|███▏      | 32/100 [00:01<00:02, 31.06it/s]  Stream inference:  36%|███▌      | 36/100 [00:01<00:02, 30.98it/s]  Stream inference:  40%|████      | 40/100 [00:01<00:01, 31.10it/s]  Stream inference:  44%|████▍     | 44/100 [00:01<00:01, 31.08it/s]  Stream inference:  48%|████▊     | 48/100 [00:01<00:01, 31.11it/s]  Stream inference:  52%|█████▏    | 52/100 [00:01<00:01, 31.23it/s]  Stream inference:  56%|█████▌    | 56/100 [00:01<00:01, 31.32it/s]  Stream inference:  60%|██████    | 60/100 [00:01<00:01, 31.33it/s]  Stream inference:  64%|██████▍   | 64/100 [00:02<00:01, 31.22it/s]  Stream inference:  68%|██████▊   | 68/100 [00:02<00:01, 31.25it/s]  Stream inference:  72%|███████▏  | 72/100 [00:02<00:00, 31.21it/s]  Stream inference:  76%|███████▌  | 76/100 [00:02<00:00, 31.22it/s]  Stream inference:  80%|████████  | 80/100 [00:02<00:00, 31.20it/s]  Stream inference:  84%|████████▍ | 84/100 [00:02<00:00, 31.27it/s]  Stream inference:  88%|████████▊ | 88/100 [00:02<00:00, 31.39it/s]  Stream inference:  92%|█████████▏| 92/100 [00:02<00:00, 31.45it/s]  Stream inference:  96%|█████████▌| 96/100 [00:03<00:00, 31.31it/s]  Stream inference: 100%|██████████| 100/100 [00:03<00:00, 31.33it/s]  Stream inference: 100%|██████████| 100/100 [00:03<00:00, 31.16it/s]
+  Collected 6 attention snapshots
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0015.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0031.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0047.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0063.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0079.png
+  ✓ Saved attention map: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/stream_frame_0095.png
+
+[3/3] Generating comparison plot...
+  ✓ Saved comparison: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/comparison.png
+  ✓ Saved statistics: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/scene0025_00/statistics.json
+
+================================================================================
+✅ Attention Visualization Complete!
+Results saved to: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization
+================================================================================
+
+==========================================
+✅ Attention Visualization Complete!
+==========================================
+
+결과:
+  - CLIP attention maps: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/*/clip_window_*.png
+  - STREAM attention snapshots: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/*/stream_frame_*.png
+  - Comparison plots: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/*/comparison.png
+  - Statistics: /home/work/juhwan/monocular_depth/stream/video-stream/benchmark/output/attention_visualization/*/statistics.json
+
+분석 포인트:
+  1. Self-attention: CLIP vs STREAM 차이?
+  2. Far attention: Stream이 먼 과거 프레임을 무시하는가?
+  3. Attention spread: Stream이 최근 프레임에만 집중하는가?
+==========================================

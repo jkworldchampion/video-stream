@@ -57,18 +57,29 @@ if __name__ == '__main__':
                         help='Positional encoding type')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Number of windows to process simultaneously (GPU memory dependent)')
+    parser.add_argument('--target_position', type=str, default='last', 
+                        choices=['first', 'middle', 'last'],
+                        help='Target frame position in window: first (causal future), middle (bidirectional), last (causal past)')
+    parser.add_argument('--max_scenes', type=int, default=None,
+                        help='Maximum number of scenes to process (for quick testing)')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     print("=" * 80)
-    print("Clip-style Sliding Window Inference - TRUE Batch Processing")
+    print("Position Ablation Experiment - Clip-style Batch Processing")
     print("=" * 80)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Window Size: {args.window_size}")
+    print(f"Target Position: {args.target_position.upper()}")
+    print(f"  - first:  predict frame at START of window (future context)")
+    print(f"  - middle: predict frame at MIDDLE of window (bidirectional)")
+    print(f"  - last:   predict frame at END of window (past context)")
     print(f"Input Size: {args.input_size}")
     print(f"Encoder: {args.encoder}")
     print(f"Device: {DEVICE}")
+    if args.max_scenes:
+        print(f"Max Scenes: {args.max_scenes} (quick test mode)")
     print("=" * 80)
 
     model_configs = {
@@ -134,6 +145,11 @@ if __name__ == '__main__':
         print(f"\nProcessing dataset: {dataset}")
         json_data = path_json[dataset]
         
+        # Limit number of scenes if specified
+        if args.max_scenes:
+            json_data = json_data[:args.max_scenes]
+            print(f"Processing only first {args.max_scenes} scenes (quick test)")
+        
         for data in tqdm(json_data, desc=f"Scenes ({dataset})"):
             for scene_key in data.keys():
                 frames_info = data[scene_key]
@@ -170,10 +186,18 @@ if __name__ == '__main__':
                 # 3. Sliding window BATCH inference (with batching across windows)
                 frame_height, frame_width = frames[0].shape[:2]
                 
+                # Determine target position in window
+                if args.target_position == 'first':
+                    target_idx = 0  # First frame in window
+                elif args.target_position == 'middle':
+                    target_idx = args.window_size // 2  # Middle frame
+                else:  # 'last'
+                    target_idx = args.window_size - 1  # Last frame
+                
                 # Process in batches of windows
                 num_batches = (len(indices_to_process) + args.batch_size - 1) // args.batch_size
                 
-                for batch_idx in tqdm(range(num_batches), desc="Sliding Window (Batch)", leave=False):
+                for batch_idx in tqdm(range(num_batches), desc=f"Position={args.target_position}", leave=False):
                     batch_start = batch_idx * args.batch_size
                     batch_end = min(batch_start + args.batch_size, len(indices_to_process))
                     batch_indices = indices_to_process[batch_start:batch_end]
@@ -183,11 +207,27 @@ if __name__ == '__main__':
                     batch_out_paths = []
                     
                     for i in batch_indices:
-                        # Window: [i-31, ..., i]
+                        # Window construction depends on target position
+                        if args.target_position == 'first':
+                            # [i, i+1, ..., i+31] → predict i (future context)
+                            start_idx = i
+                            end_idx = i + args.window_size
+                        elif args.target_position == 'middle':
+                            # [i-15, ..., i, ..., i+16] → predict i (bidirectional)
+                            half_window = args.window_size // 2
+                            start_idx = i - half_window + 1
+                            end_idx = i + half_window + 1
+                        else:  # 'last'
+                            # [i-31, ..., i] → predict i (past context)
+                            start_idx = i - args.window_size + 1
+                            end_idx = i + 1
+                        
                         window_frames = []
-                        for j in range(i - args.window_size + 1, i + 1):
-                            if j < 0:  # 음수는 0번째 프레임 padding
-                                window_frames.append(frames[0])
+                        for j in range(start_idx, end_idx):
+                            if j < 0:
+                                window_frames.append(frames[0])  # Pad with first frame
+                            elif j >= len(frames):
+                                window_frames.append(frames[-1])  # Pad with last frame
                             else:
                                 window_frames.append(frames[j])
                         
@@ -218,9 +258,9 @@ if __name__ == '__main__':
                     # Reshape back: [B, T, 1, H, W]
                     depth_batch = depth_batch.view(len(batch_indices), args.window_size, 1, frame_height, frame_width)
                     
-                    # Save LAST frame of each window
+                    # Save TARGET frame of each window (position-dependent)
                     for b_idx, out_path in enumerate(batch_out_paths):
-                        depth_np = depth_batch[b_idx, -1, 0].cpu().numpy()  # Last frame
+                        depth_np = depth_batch[b_idx, target_idx, 0].cpu().numpy()  # Target position frame
                         
                         try:
                             os.makedirs(os.path.dirname(out_path), exist_ok=True)
