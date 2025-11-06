@@ -11,11 +11,17 @@ hyper_parameter:
   pred_distill_weight: 1.0  # Distillation loss 가중치
   cache_distill_weight: 1.0    # Feature distillation loss 가중치 (0.1 -> 0.01로 더욱 감소)
 
-# KD Aux configuration (NEW: Spatial-Aware Enhancement)
+# KD Aux configuration (NEW: Ablation Study)
 kd_aux:
   enabled: true
   layers: [0, 1, 2, 3]  # 4 temporal module locations
   N: 1                  # APC future prediction steps
+  
+  # Ablation flags: Enable/disable each loss component
+  enable_dis: true      # L_DIS: Feature distillation loss
+  enable_kld: true      # L_KLD: Attention relation KL divergence
+  enable_apc: true      # L_APC: Autoregressive predictive coding
+  
   alpha: 0.01           # L_DIS weight (feature distillation)
   beta: 0.0005          # L_KLD weight (attention relation)
   gamma: 0.005          # L_APC weight (autoregressive predictive coding)
@@ -24,11 +30,3 @@ kd_aux:
   feature_pool: "mean"  # Pooling method for temporal features
   window: 16            # KD sliding window size (frames)
   stride: 1             # KD computation stride
-  
-  # C: Dynamic KV Refinement (Video-specific enhancement)
-  use_kv_refiner: true          # Enable KV refinement
-  kv_refiner_context: 4         # Number of context frames for refinement
-  kv_refiner_dropout: 0.1       # Dropout rate in refiner
-  zeta: 0.05                    # L_AUX_KV loss weight
-  kv_loss_type: "mse"           # KV loss: 'mse' or 'cosine'
-  kv_normalize: true            # Normalize K/V before loss computation

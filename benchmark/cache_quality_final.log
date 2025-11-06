@@ -1,0 +1,125 @@
+========================================
+KV Cache Quality Analysis
+========================================
+JSON: /home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json
+Checkpoint: ../checkpoints/video_depth_anything_vits.pth
+Output: ./output/cache_quality_analysis
+Encoder: vits
+Window Size: 32
+Num Windows: 10
+========================================
+
+🔬 Running Cache Age Analysis...
+xFormers not available
+xFormers not available
+xFormers not available
+================================================================================
+KV Cache Quality Analysis: Cache Age Impact
+================================================================================
+Encoder: vits
+Window size: 32
+Num windows: 10
+================================================================================
+
+Loading model...
+✓ Loaded model
+
+Processing scene: scene0019_00
+Total frames: 500
+
+📥 Loading all RGB frames into memory...
+Loading frames:   0%|          | 0/320 [00:00<?, ?it/s]Loading frames:   6%|▌         | 19/320 [00:00<00:01, 186.72it/s]Loading frames:  12%|█▏        | 39/320 [00:00<00:01, 190.06it/s]Loading frames:  18%|█▊        | 59/320 [00:00<00:01, 193.78it/s]Loading frames:  25%|██▌       | 80/320 [00:00<00:01, 198.15it/s]Loading frames:  31%|███▏      | 100/320 [00:00<00:01, 195.02it/s]Loading frames:  38%|███▊      | 120/320 [00:00<00:01, 196.14it/s]Loading frames:  44%|████▍     | 140/320 [00:00<00:00, 196.64it/s]Loading frames:  50%|█████     | 160/320 [00:00<00:00, 196.12it/s]Loading frames:  56%|█████▋    | 180/320 [00:00<00:00, 195.86it/s]Loading frames:  62%|██████▎   | 200/320 [00:01<00:00, 194.84it/s]Loading frames:  69%|██████▉   | 220/320 [00:01<00:00, 195.22it/s]Loading frames:  75%|███████▌  | 241/320 [00:01<00:00, 199.12it/s]Loading frames:  82%|████████▏ | 262/320 [00:01<00:00, 202.24it/s]Loading frames:  88%|████████▊ | 283/320 [00:01<00:00, 203.80it/s]Loading frames:  95%|█████████▌| 304/320 [00:01<00:00, 203.69it/s]Loading frames: 100%|██████████| 320/320 [00:01<00:00, 197.96it/s]
+✓ Loaded 320 frames
+
+🔄 Running CLIP Inference (Non-overlapping windows, Fresh KV)...
+✓ CLIP inference complete: 320 frames
+
+🔄 Running STREAM Inference (Frame-by-frame, Cached KV)...
+✓ STREAM inference complete: 320 frames
+
+📊 Computing CLIP vs STREAM Differences...
+
+✓ Saved results: ./output/cache_quality_analysis/cache_age_results.json
+
+================================================================================
+CLIP vs STREAM Comparison
+================================================================================
+
+📊 Overall Statistics:
+  Total frames: 320
+  Average MAE: 0.759687 ± 0.442939
+  Average RMSE: 0.865088 ± 0.434802
+  Median MAE: 0.709447
+  Max MAE: 2.565469
+  Min MAE: 0.139869
+
+📊 Window-Level Results:
+Window     Frames          Avg MAE      Avg RMSE     Std MAE     
+--------------------------------------------------------------------------------
+0          0-31            0.514251     0.605020     0.160949    
+1          32-63           0.787516     0.996051     0.152914    
+2          64-95           0.805212     0.969770     0.090940    
+3          96-127          1.397916     1.458557     0.223349    
+4          128-159         1.100199     1.180872     0.817581    
+5          160-191         0.765396     0.887666     0.356803    
+6          192-223         0.417805     0.558951     0.204518    
+7          224-255         0.527653     0.579663     0.249319    
+8          256-287         0.670286     0.737495     0.266078    
+9          288-319         0.610634     0.676837     0.310870    
+
+📈 Cache Age vs Error:
+Cache Age    Avg MAE      Avg RMSE     Std MAE      Num Frames  
+--------------------------------------------------------------------------------
+0            0.754353     0.890458     0.000000     1           
+1            0.448301     0.519566     0.000000     1           
+2            0.504291     0.608760     0.000000     1           
+3            0.419944     0.492157     0.000000     1           
+4            0.495877     0.607548     0.000000     1           
+5            0.596424     0.728225     0.000000     1           
+6            0.598293     0.717157     0.000000     1           
+7            0.555035     0.646447     0.000000     1           
+8            0.532886     0.629232     0.000000     1           
+9            0.538920     0.647869     0.000000     1           
+10           0.499507     0.592524     0.000000     1           
+11           0.481558     0.553680     0.000000     1           
+12           0.522618     0.654530     0.000000     1           
+13           0.437833     0.500066     0.000000     1           
+14           0.400122     0.461262     0.000000     1           
+15           0.457967     0.526353     0.000000     1           
+16           0.404215     0.468830     0.000000     1           
+17           0.370525     0.424856     0.000000     1           
+18           0.460750     0.528523     0.000000     1           
+19           0.450012     0.516579     0.000000     1           
+20           0.372595     0.495617     0.000000     1           
+21           0.397957     0.480533     0.000000     1           
+22           0.266718     0.379119     0.000000     1           
+23           0.330538     0.386625     0.000000     1           
+24           0.457304     0.539727     0.000000     1           
+25           0.461918     0.559077     0.000000     1           
+26           0.364121     0.421376     0.000000     1           
+27           0.408343     0.479778     0.000000     1           
+28           0.770328     0.854469     0.000000     1           
+29           0.890389     1.037605     0.000000     1           
+30           0.896566     1.042214     0.000000     1           
+31           0.787383     0.894247     0.454986     289         
+
+✓ Saved plot: ./output/cache_quality_analysis/clip_vs_stream_analysis.png
+
+================================================================================
+✅ CLIP vs STREAM Analysis Complete!
+================================================================================
+
+🔍 Key Findings:
+  1. Average depth difference (CLIP vs STREAM): 0.7597 MAE
+  2. This represents the performance gap we see in validation
+  3. Cache age impact:
+     - MAE at cache age 0: 0.7544
+     - MAE at cache age 31: 0.7874
+     - Change: +0.0330 (+4.4%)
+     → Cache quality is STABLE across different ages
+     → Performance gap is NOT primarily due to cache staleness
+     → Other factors may be more important (e.g., temporal modeling)
+================================================================================
+
+✅ Analysis Complete!
+Results saved to: ./output/cache_quality_analysis

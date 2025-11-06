@@ -1,0 +1,37 @@
+========================================
+KV Cache Quality Analysis
+========================================
+JSON: ../dataset/scannet_val_split.json
+Checkpoint: ../../checkpoints/video_depth_anything_vits.pth
+Output: ./output/cache_quality_analysis
+Encoder: vits
+Window Size: 32
+Num Windows: 10
+========================================
+
+🔬 Running Cache Age Analysis...
+xFormers not available
+xFormers not available
+xFormers not available
+================================================================================
+KV Cache Quality Analysis: Cache Age Impact
+================================================================================
+Encoder: vits
+Window size: 32
+Num windows: 10
+================================================================================
+
+Loading model...
+Traceback (most recent call last):
+  File "/home/work/juhwan/monocular_depth/stream/video-stream/benchmark/infer/analyze_cache_quality.py", line 168, in <module>
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+  File "/home/ajou/miniconda/envs/vda/lib/python3.10/site-packages/torch/serialization.py", line 1319, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/home/ajou/miniconda/envs/vda/lib/python3.10/site-packages/torch/serialization.py", line 659, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/ajou/miniconda/envs/vda/lib/python3.10/site-packages/torch/serialization.py", line 640, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: '../../checkpoints/video_depth_anything_vits.pth'
+
+✅ Analysis Complete!
+Results saved to: ./output/cache_quality_analysis

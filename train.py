@@ -25,19 +25,17 @@ from data.dataLoader import *                 # KITTIVideoDataset, get_data_list
 from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthStudent
 from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTeacher
 from video_depth_anything.aux.aux_block import AuxBlock          # Proj -> 1L Transformer(bi, hole-mask) -> Uni-LSTM
-from video_depth_anything.aux.kv_refiner import KVRefinerWrapper  # C: Dynamic KV Refinement
 from utils.loss_kd_aux import (
     distilhubert_feature_loss,   # L_DIS
     attention_relation_kl,       # L_KLD (Q/Q + K/K + V/V)
     apc_loss                     # L_APC
 )
-from loss.loss_kv_refinement import KVRefinementLoss  # L_AUX_KV (C enhancement)
 
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 16  # Scenario A: Unified Loss (L_AUX_KV + L_APC only)
+experiment = 1  # KD Ablation Study: Testing DIS, KLD, APC independently
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +82,12 @@ def train(args):
     kd_enabled   = bool(kd_cfg.get("enabled", True))
     kd_layers    = kd_cfg.get("layers", [0, 1, 2, 3])   # dpt_temporal에서 우리가 잡은 4개 temporal 지점
     kd_N         = int(kd_cfg.get("N", 1))              # APC 미래 스텝
+    
+    # Ablation flags for each loss component
+    enable_dis   = bool(kd_cfg.get("enable_dis", True))
+    enable_kld   = bool(kd_cfg.get("enable_kld", True))
+    enable_apc   = bool(kd_cfg.get("enable_apc", True))
+    
     kd_alpha     = float(kd_cfg.get("alpha", 1e-2))
     kd_beta      = float(kd_cfg.get("beta", 5e-4))
     kd_gamma     = float(kd_cfg.get("gamma", 5e-3))
@@ -94,14 +98,6 @@ def train(args):
     # 추가: 슬라이딩 KD 창 길이/보폭
     kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
     kd_stride = int(kd_cfg.get("stride", 1))         # 매 프레임 KD면 1, 비용 줄이려면 2/4
-    
-    # C: Dynamic KV Refinement
-    use_kv_refiner = bool(kd_cfg.get("use_kv_refiner", False))
-    kv_context_frames = int(kd_cfg.get("kv_refiner_context", 4))
-    kv_dropout = float(kd_cfg.get("kv_refiner_dropout", 0.1))
-    kd_zeta = float(kd_cfg.get("zeta", 5e-2))  # L_AUX_KV weight
-    kv_loss_type = kd_cfg.get("kv_loss_type", "mse")
-    kv_normalize = bool(kd_cfg.get("kv_normalize", True))
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
@@ -109,7 +105,7 @@ def train(args):
     # W&B
     load_dotenv(dotenv_path=".env")
     wandb.login(key=os.getenv("WANDB_API_KEY", ""), relogin=True)
-    run = wandb.init(project="ablation_reverse", config=hyper_params, name=f"experiment_{experiment}")
+    run = wandb.init(project="3kd_checking", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
     kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
@@ -154,33 +150,13 @@ def train(args):
             nhead=8,
             dropout=0.0,
             return_attn=False,
-            return_qkv=True,            # Aux 내부 1L Transformer의 Q/K/V 수집
+            return_qkv=enable_kld,      # Only collect Q/K/V if KLD is enabled
             rnn_type="lstm",            # 또는 "mamba" 실험 가능
             mamba_d_state=16,
             mamba_d_conv=4,
             mamba_expand=2,
         ).to(device) for i in kd_layers
     })
-    
-    # C: KV Refiners (one per layer)
-    if use_kv_refiner:
-        kv_refiners = nn.ModuleDict({
-            str(i): KVRefinerWrapper(
-                dim=STUDENT_DIMS[i],
-                context_frames=kv_context_frames,
-                dropout=kv_dropout
-            ).to(device) for i in kd_layers
-        })
-        kv_refinement_criterion = KVRefinementLoss(
-            loss_type=kv_loss_type,
-            normalize=kv_normalize,
-            separate_kv=True
-        ).to(device)
-        logger.info(f"✓ KV Refiner enabled: zeta={kd_zeta}, context={kv_context_frames}, loss={kv_loss_type}")
-    else:
-        kv_refiners = None
-        kv_refinement_criterion = None
-        logger.info("✗ KV Refiner disabled")
 
     # Pretrained
     if args.pretrained_ckpt:
@@ -198,10 +174,6 @@ def train(args):
     student_params = [p for p in student.parameters() if p.requires_grad]
     aux_params     = [p for p in aux_blocks.parameters() if p.requires_grad]
     all_params = list(student_params) + list(aux_params)
-    
-    if use_kv_refiner:
-        kv_refiner_params = [p for p in kv_refiners.parameters() if p.requires_grad]
-        all_params += kv_refiner_params
     
     optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -257,19 +229,18 @@ def train(args):
 
     wandb.watch(student, log="all")
     wandb.watch(aux_blocks, log="all")
-    if use_kv_refiner:
-        wandb.watch(kv_refiners, log="all")
     
     # Log configuration
     logger.info(f"=" * 60)
-    logger.info(f"Scenario A: Unified Loss (L_AUX_KV + L_APC)")
-    logger.info(f"  - Removed: L_DIS, L_KLD (redundant if KV refinement works)")
+    logger.info(f"KD Ablation Study")
+    logger.info(f"  - L_DIS (Feature Distillation): {'ENABLED' if enable_dis else 'DISABLED'} (α={kd_alpha})")
+    logger.info(f"  - L_KLD (Attention Relation): {'ENABLED' if enable_kld else 'DISABLED'} (β={kd_beta})")
+    logger.info(f"  - L_APC (Predictive Coding): {'ENABLED' if enable_apc else 'DISABLED'} (γ={kd_gamma})")
     logger.info(f"=" * 60)
     logger.info(f"KD Configuration:")
     logger.info(f"  - Enabled: {kd_enabled}")
     logger.info(f"  - Window: {kd_window}, Stride: {kd_stride}")
-    logger.info(f"  - Gamma (APC): {kd_gamma}, Zeta (KV): {kd_zeta}")
-    logger.info(f"  - KV Refiner: {use_kv_refiner}")
+    logger.info(f"  - Lambda (overall): {kd_lambda}")
     
     best_delta1 = 0.0
     best_epoch  = 0
@@ -350,15 +321,14 @@ def train(args):
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
         student.train()
         aux_blocks.train()
-        if use_kv_refiner:
-            kv_refiners.train()
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = 0.0
 
-        # KD 누적(스텝 평균용) - Scenario A: Unified Loss (only APC + KV)
+        # KD 누적(스텝 평균용) - Ablation: DIS, KLD, APC separately
         epoch_kd_total = 0.0
+        epoch_kd_dis   = 0.0
+        epoch_kd_kld   = 0.0
         epoch_kd_apc   = 0.0
-        epoch_kd_kv    = 0.0  # C: KV refinement loss
         kd_steps = 0
 
         accum_loss = 0.0
@@ -393,7 +363,7 @@ def train(args):
                     pred_t_raw, cache, inter_t, student_enc_feats = model_stream_step(
                         student, x_t, cache,
                         collect_inter=True,        # ← 내부 temporal features(intermediates)를 inter_t로 반환
-                        collect_qkv=use_kv_refiner,  # C: Collect Q/K/V if KV refiner enabled
+                        collect_qkv=False,         # Not needed anymore (QKV from AuxBlock instead)
                         feature_pool=kd_pool,      # 'mean' 등
                         return_encoder_feats=True, # ← encoder features 반환
                     )
@@ -444,7 +414,7 @@ def train(args):
 
                     # ----- Sliding Teacher KD at frame t -----
                     L_kd_t = pred_t_raw.new_tensor(0.0)
-                    kd_terms_step = {"apc": 0.0}  # Scenario A: only APC (no DIS, KLD)
+                    kd_terms_step = {"dis": 0.0, "kld": 0.0, "apc": 0.0}  # Track each loss component
                     W_eff = min(kd_window, t + 1)
                     t0 = t - W_eff + 1
                     x_win = x[:, t0:t+1]  # [B, W_eff, 3, H, W]
@@ -487,7 +457,7 @@ def train(args):
                                 W_eff,                   # frame_length
                                 cached_hidden_state_list=None,
                                 return_intermediates=True,
-                                return_qkv=True,
+                                return_qkv=enable_kld,  # Only get QKV if KLD is enabled
                                 feature_pool=kd_pool,
                             )
                             t_out = {"intermediates": t_intermediates}
@@ -496,7 +466,7 @@ def train(args):
                         for li in kd_layers:
                             li = int(li)
                             h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
-                            t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
+                            t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh] (if enable_kld)
 
                             # Student 버퍼 길이 확인
                             buf_len = len(inter_buf[li])
@@ -515,68 +485,27 @@ def train(args):
                                 hole_mask_N=kd_N
                             )
                             
-                            # Scenario A: Unified Loss - Only use L_APC
-                            # L_DIS and L_KLD removed (redundant if KV refinement works well)
-                            l_apc = apc_loss(h_feat_seq, r_seq, N=kd_N, mask=frame_valid)
-                            kd_terms_step["apc"] += l_apc
+                            # Ablation: Compute each loss component separately
                             
-                            # C: KV Refinement Loss
-                            if use_kv_refiner and qkv_aux_seq is not None and t_qkv_seq is not None:
-                                # Extract K, V from Aux and Teacher
-                                # qkv_aux_seq: {"Q": [B,A,T,d], "K": [B,A,T,d], "V": [B,A,T,d]}
-                                s_k_seq = qkv_aux_seq.get("K")  # Student K from AuxBlock
-                                s_v_seq = qkv_aux_seq.get("V")  # Student V from AuxBlock
-                                t_k_seq = t_qkv_seq.get("K")    # Teacher K (dynamic)
-                                t_v_seq = t_qkv_seq.get("V")    # Teacher V (dynamic)
-                                
-                                if s_k_seq is not None and t_k_seq is not None:
-                                    # Convert multi-head format to feature space FIRST
-                                    # [B, A, T, d] -> [B, T, A*d]
-                                    B, A, T_win, d = s_k_seq.shape
-                                    s_k_flat = s_k_seq.permute(0, 2, 1, 3).flatten(2, 3)  # [B, T, C] where C=A*d
-                                    s_v_flat = s_v_seq.permute(0, 2, 1, 3).flatten(2, 3)
-                                    t_k_flat = t_k_seq.permute(0, 2, 1, 3).flatten(2, 3)
-                                    t_v_flat = t_v_seq.permute(0, 2, 1, 3).flatten(2, 3)
-                                    
-                                    # Build refined K/V sequence by applying refiner frame-by-frame
-                                    s_k_refined_list = []
-                                    s_v_refined_list = []
-                                    
-                                    for frame_idx in range(T_win):
-                                        # Extract single frame: [B, 1, C]
-                                        s_k_frame = s_k_flat[:, frame_idx:frame_idx+1, :]  # [B, 1, C]
-                                        s_v_frame = s_v_flat[:, frame_idx:frame_idx+1, :]
-                                        
-                                        # Get context from buffer (previous frames in THIS window)
-                                        # Context should be [B, 1, C] tensors from previous frames
-                                        if frame_idx > 0:
-                                            k_ctx = [s_k_flat[:, idx:idx+1, :] for idx in range(frame_idx)]
-                                            v_ctx = [s_v_flat[:, idx:idx+1, :] for idx in range(frame_idx)]
-                                        else:
-                                            k_ctx = []
-                                            v_ctx = []
-                                        
-                                        # Refine K and V
-                                        s_k_refined, s_v_refined = kv_refiners[str(li)](s_k_frame, s_v_frame, k_ctx, v_ctx)
-                                        s_k_refined_list.append(s_k_refined)
-                                        s_v_refined_list.append(s_v_refined)
-                                    
-                                    # Stack refined K/V: [B, T, C]
-                                    s_k_refined_seq = torch.cat(s_k_refined_list, dim=1)  # [B, T, C]
-                                    s_v_refined_seq = torch.cat(s_v_refined_list, dim=1)
-                                    
-                                    # Compute KV refinement loss (both in [B, T, C] format now)
-                                    kv_loss_dict = kv_refinement_criterion(
-                                        t_k_flat, t_v_flat,
-                                        s_k_refined_seq, s_v_refined_seq,
-                                        mask=frame_valid
-                                    )
-                                    l_kv = kv_loss_dict['total']
-                                    kd_terms_step["kv"] = kd_terms_step.get("kv", 0.0) + l_kv.item()
-                                else:
-                                    l_kv = h_feat_seq.new_tensor(0.0)
-                            else:
-                                l_kv = h_feat_seq.new_tensor(0.0)
+                            # L_DIS: Feature distillation (last frame only)
+                            if enable_dis:
+                                l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
+                                kd_terms_step["dis"] += l_dis.item()
+                            
+                            # L_KLD: Attention relation KL (Q/K/V)
+                            if enable_kld and qkv_aux_seq is not None and t_qkv_seq is not None:
+                                l_kld = attention_relation_kl(
+                                    t_qkv_seq, qkv_aux_seq,
+                                    q_mask=mask_last,     # anchor: last frame
+                                    k_mask=frame_valid,   # context: all valid frames
+                                    eps=kd_attn_eps
+                                )
+                                kd_terms_step["kld"] += l_kld.item()
+                            
+                            # L_APC: Autoregressive predictive coding
+                            if enable_apc:
+                                l_apc = apc_loss(h_feat_seq, r_seq, N=kd_N, mask=frame_valid)
+                                kd_terms_step["apc"] += l_apc.item()
                             
                             num_used += 1
 
@@ -584,12 +513,11 @@ def train(args):
                             for k in kd_terms_step:
                                 kd_terms_step[k] = kd_terms_step[k] / num_used
 
-                        # Scenario A: Unified Loss
-                        # L_total = L_AUX_KV + L_APC (no L_DIS, L_KLD)
-                        L_apc_t = kd_gamma * kd_terms_step["apc"]
-                        L_kv_t = kd_zeta * kd_terms_step.get("kv", 0.0) if use_kv_refiner else 0.0
-                        L_kd_t = L_apc_t + L_kv_t
-                        # print(f"  [KD @ frame {t}] L_APC={L_apc_t:.4f}  L_KV={L_kv_t:.4f}  →  L_KD_unified={L_kd_t:.4f}")
+                        # Ablation: Combine enabled loss components with their weights
+                        L_dis_t = kd_alpha * kd_terms_step["dis"] if enable_dis else 0.0
+                        L_kld_t = kd_beta * kd_terms_step["kld"] if enable_kld else 0.0
+                        L_apc_t = kd_gamma * kd_terms_step["apc"] if enable_apc else 0.0
+                        L_kd_t = L_dis_t + L_kld_t + L_apc_t
 
                     # ---- 최종 loss (KD 꺼져 있어도 depth 손실은 유지!)
                     loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * L_kd_t if kd_enabled else 0.0)
@@ -619,12 +547,12 @@ def train(args):
                 epoch_ssi    += ssi_loss_t.item() * B_eff
                 epoch_tgm    += tgm_loss.item()  * B_eff
 
-                # KD가 실제 실행된 스텝만 에폭 누적 (Scenario A: only APC + KV)
+                # KD가 실제 실행된 스텝만 에폭 누적 (Ablation: DIS, KLD, APC)
                 if kd_executed:
                     epoch_kd_total += float(L_kd_t) if isinstance(L_kd_t, (int, float)) else float(L_kd_t.item())
+                    epoch_kd_dis   += float(kd_terms_step["dis"])
+                    epoch_kd_kld   += float(kd_terms_step["kld"])
                     epoch_kd_apc   += float(kd_terms_step["apc"])
-                    if use_kv_refiner:
-                        epoch_kd_kv += float(L_kv_t) if isinstance(L_kv_t, (int, float)) else float(L_kv_t.item())
                     kd_steps += 1
 
                 postfix_dict = {
@@ -633,8 +561,12 @@ def train(args):
                 }
                 if kd_enabled:
                     postfix_dict['wKD'] = f'{(epoch_kd_total / max(1, kd_steps)) * kd_lambda:.4f}'
-                    if use_kv_refiner:
-                        postfix_dict['wKV'] = f'{(epoch_kd_kv / max(1, kd_steps)) * kd_zeta:.4f}'
+                    if enable_dis:
+                        postfix_dict['DIS'] = f'{(epoch_kd_dis / max(1, kd_steps)) * kd_alpha:.5f}'
+                    if enable_kld:
+                        postfix_dict['KLD'] = f'{(epoch_kd_kld / max(1, kd_steps)) * kd_beta:.5f}'
+                    if enable_apc:
+                        postfix_dict['APC'] = f'{(epoch_kd_apc / max(1, kd_steps)) * kd_gamma:.5f}'
                 frame_pbar.set_postfix(postfix_dict)
             frame_pbar.close()
         batch_pbar.close()
@@ -673,16 +605,14 @@ def train(args):
         scannet_rmse   = float(scannet_metrics.get("rmse_linear", float('nan')))
         scannet_delta1 = float(scannet_metrics.get("delta1_acc", float('nan')))
 
-        # 로깅 (Scenario A: Unified Loss - only APC + KV)
-        wandb.log({
+        # 로깅 (Ablation: DIS, KLD, APC separately tracked)
+        wandb_log_dict = {
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
 
-            # KD는 스텝 평균 (Scenario A: L_DIS, L_KLD removed)
+            # KD는 스텝 평균 (Ablation)
             "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,
-            "train/kd_apc":   (epoch_kd_apc   / max(1, kd_steps)) if kd_enabled else 0.0,
-            "train/kd_kv":    (epoch_kd_kv    / max(1, kd_steps)) if (kd_enabled and use_kv_refiner) else 0.0,
             'train/kd_steps': kd_steps,
 
             # KITTI val (for best model selection)
@@ -696,7 +626,21 @@ def train(args):
             "val_real/delta1": scannet_delta1,
             
             "epoch": epoch,
-        })
+        }
+        
+        # Add individual KD components only if enabled
+        if kd_enabled:
+            if enable_dis:
+                wandb_log_dict["train/kd_dis"] = (epoch_kd_dis / max(1, kd_steps))
+                wandb_log_dict["train/kd_dis_weighted"] = (epoch_kd_dis / max(1, kd_steps)) * kd_alpha
+            if enable_kld:
+                wandb_log_dict["train/kd_kld"] = (epoch_kd_kld / max(1, kd_steps))
+                wandb_log_dict["train/kd_kld_weighted"] = (epoch_kd_kld / max(1, kd_steps)) * kd_beta
+            if enable_apc:
+                wandb_log_dict["train/kd_apc"] = (epoch_kd_apc / max(1, kd_steps))
+                wandb_log_dict["train/kd_apc_weighted"] = (epoch_kd_apc / max(1, kd_steps)) * kd_gamma
+        
+        wandb.log(wandb_log_dict)
 
         # best 저장 (ScanNet delta1 기준 ↑ - 이전 실험과 동일하게 비교하기 위함)
         if scannet_delta1 > best_delta1:
@@ -711,8 +655,6 @@ def train(args):
                 "best_val_delta1": best_delta1,
                 "config": hyper_params,
             }
-            if use_kv_refiner:
-                save_dict["kv_refiner_state_dict"] = kv_refiners.state_dict()
             torch.save(save_dict, best_model_path)
             logger.info(f"🏆 Best model saved! Epoch {epoch}, ScanNet (val_real) delta1: {best_delta1:.4f} (KITTI delta1: {kitti_val_delta1:.4f})")
 
@@ -727,8 +669,6 @@ def train(args):
             "scannet_val_delta1": scannet_delta1,
             "config": hyper_params,
         }
-        if use_kv_refiner:
-            save_dict_latest["kv_refiner_state_dict"] = kv_refiners.state_dict()
         torch.save(save_dict_latest, latest_model_path)
         logger.info(f"📁 Latest model saved | Epoch {epoch} | ScanNet delta1: {scannet_delta1:.4f} | KITTI delta1: {kitti_val_delta1:.4f}")
 
