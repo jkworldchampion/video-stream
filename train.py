@@ -616,7 +616,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_dataset_key",  type=str, default="scannet")
     parser.add_argument("--val_dataset_tag",  type=str, default="scannet_500")
     parser.add_argument("--val_scenes",       type=int, default=2)
-    parser.add_argument("--val_scene_indices", type=str, default="0,32,61,73", help="Comma-separated dataset indices for validation subset. Empty string disables explicit selection.")
+    parser.add_argument("--val_scene_indices", type=str, default="0,1", help="Comma-separated dataset indices for validation subset. Empty string disables explicit selection.")
     parser.add_argument("--resume_from", type=str, default="", help="Path to latest/best checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override total epochs (e.g., 60)")
     parser.add_argument("--test", action="store_true", help="Only run validation")
