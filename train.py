@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 4
+experiment = 23
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -302,13 +302,23 @@ def train(args):
             cache = None
             prev_pred_raw = prev_mask = prev_y = None
             kd_executed = False
-            # 스트리밍 Student 인터미디엇 버퍼 (KD 윈도우용): 레이어별 [B,1,C]를 프레임 순서대로 누적
-            inter_buf = {int(li): collections.deque(maxlen=kd_window) for li in kd_layers}
+            layer_buffers = {
+                int(li): {
+                    "z": collections.deque(maxlen=kd_window),
+                    "r": collections.deque(maxlen=kd_window),
+                    "q": collections.deque(maxlen=kd_window),
+                    "k": collections.deque(maxlen=kd_window),
+                    "v": collections.deque(maxlen=kd_window),
+                    "cache": None,
+                }
+                for li in kd_layers
+            } if kd_enabled else {}
 
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
                 x_t = x[:, t:t+1]                              # [B,1,3,H,W]
                 mask_t = get_mask(y[:, t:t+1], 1e-3, 80.0).to(device)
+                layer_step_outputs = {}
 
                 # === Student: 스트리밍 1-step (encoder features 캐시) ===
                 with autocast(enabled=torch.cuda.is_available()):
@@ -327,12 +337,43 @@ def train(args):
                         tuple(f_i.detach() if f_i is not None else None for f_i in f_tuple)
                         for f_tuple in student_enc_feats
                     ]
-                    
-                    # 레이어별 feature_one: [B,1,C]를 버퍼에 누적 (과거는 detach로 그래프 단절)
-                    for li in kd_layers:
-                        li = int(li)
-                        if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
-                            inter_buf[li].append(inter_t[li]["feat_one"].detach())
+
+                    if kd_enabled and inter_t is not None:
+                        for li in kd_layers:
+                            li = int(li)
+                            info = inter_t.get(li)
+                            if info is None:
+                                continue
+                            feat_one = info.get("feat_one")
+                            if feat_one is None:
+                                continue
+
+                            state = layer_buffers[li]
+                            stream_cache = state["cache"]
+                            z_t, r_t, qkv_t, stream_cache = aux_blocks[str(li)].forward_stream(
+                                feat_one,
+                                cache=stream_cache,
+                                hole_mask_n=kd_N,
+                                max_len=kd_window,
+                            )
+                            state["cache"] = stream_cache
+                            state["z"].append(z_t.detach().unsqueeze(1))
+                            state["r"].append(r_t.detach().unsqueeze(1))
+
+                            if aux_blocks[str(li)].return_qkv and qkv_t is not None:
+                                state["q"].append(qkv_t["Q"].detach())
+                                state["k"].append(qkv_t["K"].detach())
+                                state["v"].append(qkv_t["V"].detach())
+                            else:
+                                state["q"].append(None)
+                                state["k"].append(None)
+                                state["v"].append(None)
+
+                            layer_step_outputs[li] = {
+                                "z": z_t.unsqueeze(1),
+                                "r": r_t.unsqueeze(1),
+                                "qkv": qkv_t,
+                            }
 
                     # ----- Scale-Shift & Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
@@ -429,21 +470,46 @@ def train(args):
                         # 4) 레이어별 KD
                         for li in kd_layers:
                             li = int(li)
+                            state = layer_buffers.get(li) if kd_enabled else None
+                            if state is None or len(state["z"]) == 0:
+                                continue
+
                             h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
                             t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
 
-                            # Student 버퍼 길이 확인
-                            buf_len = len(inter_buf[li])
-                            if buf_len == 0:
+                            z_entries = list(state["z"])[-W_eff:]
+                            r_entries = list(state["r"])[-W_eff:]
+                            if len(z_entries) < W_eff or len(r_entries) < W_eff:
                                 continue
 
-                            # 정상 구간: 버퍼 == W_eff
-                            s_list = list(inter_buf[li])
-                            if inter_t is not None and inter_t.get(li) is not None and inter_t[li].get("feat_one") is not None:
-                                s_list[-1] = inter_t[li]["feat_one"]
-                            s_feat_seq = torch.cat(s_list, dim=1)              # [B, W_eff, C]
+                            latest_vals = layer_step_outputs.get(li, {}) if li in layer_step_outputs else {}
+                            z_latest = latest_vals.get("z")
+                            r_latest = latest_vals.get("r")
+                            if z_latest is not None:
+                                z_entries[-1] = z_latest
+                            if r_latest is not None:
+                                r_entries[-1] = r_latest
 
-                            z_seq, r_seq, qkv_aux_seq = aux_blocks[str(li)](s_feat_seq, hole_mask_N=kd_N)
+                            z_seq = torch.cat(z_entries, dim=1)
+                            r_seq = torch.cat(r_entries, dim=1)
+
+                            qkv_aux_seq = None
+                            if aux_blocks[str(li)].return_qkv:
+                                q_entries = list(state["q"])[-W_eff:]
+                                k_entries = list(state["k"])[-W_eff:]
+                                v_entries = list(state["v"])[-W_eff:]
+                                if len(q_entries) >= W_eff and len(k_entries) >= W_eff and len(v_entries) >= W_eff:
+                                    latest_qkv = latest_vals.get("qkv") if latest_vals else None
+                                    if latest_qkv is not None:
+                                        q_entries[-1] = latest_qkv["Q"]
+                                        k_entries[-1] = latest_qkv["K"]
+                                        v_entries[-1] = latest_qkv["V"]
+
+                                    if all(q is not None for q in q_entries) and all(k is not None for k in k_entries) and all(v is not None for v in v_entries):
+                                        q_seq = torch.cat(q_entries, dim=2)
+                                        k_seq = torch.cat(k_entries, dim=2)
+                                        v_seq = torch.cat(v_entries, dim=2)
+                                        qkv_aux_seq = {"Q": q_seq, "K": k_seq, "V": v_seq}
                             l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
                             l_kld = attention_relation_kl(
                                 t_qkv_seq, qkv_aux_seq,
