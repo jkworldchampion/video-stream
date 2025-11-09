@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 23
+experiment = 2
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -104,10 +104,78 @@ def train(args):
     if scene_indices:
         logger.info(f"Validation scene indices: {scene_indices}")
 
+    # ================ 설정 출력 ================
+    logger.info("=" * 60)
+    logger.info("TRAINING CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info(f"Experiment Number: {experiment}")
+    logger.info(f"Output Directory: {OUTPUT_DIR}")
+    logger.info("")
+    
+    logger.info("--- Hyperparameters ---")
+    logger.info(f"  Learning Rate: {lr}")
+    logger.info(f"  Epochs: {num_epochs}")
+    logger.info(f"  Batch Size: {batch_size}")
+    logger.info(f"  Clip Length: {CLIP_LEN}")
+    logger.info(f"  Update Frequency: {hyper_params.get('update_frequency', 6)}")
+    logger.info(f"  SSI Loss Weight: {ratio_ssi}")
+    logger.info(f"  TGM Loss Weight: {ratio_tgm}")
+    logger.info("")
+    
+    logger.info("--- Knowledge Distillation (KD) ---")
+    logger.info(f"  KD Enabled: {kd_enabled}")
+    if kd_enabled:
+        logger.info(f"  KD Layers: {kd_layers}")
+        logger.info(f"  KD Alpha (DIS): {kd_alpha}")
+        logger.info(f"  KD Beta (KLD): {kd_beta}")
+        logger.info(f"  KD Gamma (APC): {kd_gamma}")
+        logger.info(f"  KD Lambda (Total Weight): {kd_lambda}")
+        logger.info(f"  KD Window: {kd_window}")
+        logger.info(f"  KD Stride: {kd_stride}")
+        logger.info(f"  KD N (APC Future Steps): {kd_N}")
+        logger.info(f"  Feature Pool: {kd_pool}")
+        logger.info(f"  Attention Epsilon: {kd_attn_eps}")
+    logger.info("")
+    
+    logger.info("--- Model Architecture ---")
+    logger.info(f"  Student Encoder: vits")
+    logger.info(f"  Teacher Encoder: vits")
+    logger.info(f"  Features: 64")
+    logger.info(f"  Out Channels: [48, 96, 192, 384]")
+    logger.info(f"  Num Frames: {CLIP_LEN}")
+    logger.info("")
+    
+    logger.info("--- Optimizer & Scheduler ---")
+    logger.info(f"  Optimizer: AdamW")
+    logger.info(f"  Weight Decay: 1e-4")
+    logger.info(f"  Scheduler: CosineAnnealingLR")
+    logger.info(f"  Scheduler Eta Min: 1e-6")
+    logger.info("")
+    
+    logger.info("--- Data Configuration ---")
+    logger.info(f"  KITTI Path: /home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI")
+    logger.info(f"  Data Split: train")
+    logger.info(f"  Num Workers: 4")
+    logger.info("")
+    
+    logger.info("--- Validation Configuration ---")
+    logger.info(f"  Dataset: {args.val_dataset_key}")
+    logger.info(f"  Dataset Tag: {args.val_dataset_tag}")
+    logger.info(f"  Scenes to Eval: {len(scene_indices) if scene_indices else args.val_scenes}")
+    if scene_indices:
+        logger.info(f"  Scene Indices: {scene_indices}")
+    logger.info("")
+    
+    logger.info("--- Pretrained & Resume ---")
+    logger.info(f"  Pretrained Checkpoint: {args.pretrained_ckpt if args.pretrained_ckpt else 'None'}")
+    logger.info(f"  Resume From: {args.resume_from if args.resume_from else 'None'}")
+    logger.info("=" * 60)
+    logger.info("")
+
     # W&B
     load_dotenv(dotenv_path=".env")
     wandb.login(key=os.getenv("WANDB_API_KEY", ""), relogin=True)
-    run = wandb.init(project="ablation_reverse", config=hyper_params, name=f"experiment_{experiment}")
+    run = wandb.init(project="3kd_checking", config=hyper_params, name=f"experiment_{experiment}")
 
     # 데이터
     kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
