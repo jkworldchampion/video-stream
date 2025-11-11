@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 2
+experiment = 6
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -104,84 +104,43 @@ def train(args):
     if scene_indices:
         logger.info(f"Validation scene indices: {scene_indices}")
 
-    # ================ 설정 출력 ================
-    logger.info("=" * 60)
-    logger.info("TRAINING CONFIGURATION")
-    logger.info("=" * 60)
-    logger.info(f"Experiment Number: {experiment}")
-    logger.info(f"Output Directory: {OUTPUT_DIR}")
-    logger.info("")
-    
-    logger.info("--- Hyperparameters ---")
-    logger.info(f"  Learning Rate: {lr}")
-    logger.info(f"  Epochs: {num_epochs}")
-    logger.info(f"  Batch Size: {batch_size}")
-    logger.info(f"  Clip Length: {CLIP_LEN}")
-    logger.info(f"  Update Frequency: {hyper_params.get('update_frequency', 6)}")
-    logger.info(f"  SSI Loss Weight: {ratio_ssi}")
-    logger.info(f"  TGM Loss Weight: {ratio_tgm}")
-    logger.info("")
-    
-    logger.info("--- Knowledge Distillation (KD) ---")
-    logger.info(f"  KD Enabled: {kd_enabled}")
-    if kd_enabled:
-        logger.info(f"  KD Layers: {kd_layers}")
-        logger.info(f"  KD Alpha (DIS): {kd_alpha}")
-        logger.info(f"  KD Beta (KLD): {kd_beta}")
-        logger.info(f"  KD Gamma (APC): {kd_gamma}")
-        logger.info(f"  KD Lambda (Total Weight): {kd_lambda}")
-        logger.info(f"  KD Window: {kd_window}")
-        logger.info(f"  KD Stride: {kd_stride}")
-        logger.info(f"  KD N (APC Future Steps): {kd_N}")
-        logger.info(f"  Feature Pool: {kd_pool}")
-        logger.info(f"  Attention Epsilon: {kd_attn_eps}")
-    logger.info("")
-    
-    logger.info("--- Model Architecture ---")
-    logger.info(f"  Student Encoder: vits")
-    logger.info(f"  Teacher Encoder: vits")
-    logger.info(f"  Features: 64")
-    logger.info(f"  Out Channels: [48, 96, 192, 384]")
-    logger.info(f"  Num Frames: {CLIP_LEN}")
-    logger.info("")
-    
-    logger.info("--- Optimizer & Scheduler ---")
-    logger.info(f"  Optimizer: AdamW")
-    logger.info(f"  Weight Decay: 1e-4")
-    logger.info(f"  Scheduler: CosineAnnealingLR")
-    logger.info(f"  Scheduler Eta Min: 1e-6")
-    logger.info("")
-    
-    logger.info("--- Data Configuration ---")
-    logger.info(f"  KITTI Path: /home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI")
-    logger.info(f"  Data Split: train")
-    logger.info(f"  Num Workers: 4")
-    logger.info("")
-    
-    logger.info("--- Validation Configuration ---")
-    logger.info(f"  Dataset: {args.val_dataset_key}")
-    logger.info(f"  Dataset Tag: {args.val_dataset_tag}")
-    logger.info(f"  Scenes to Eval: {len(scene_indices) if scene_indices else args.val_scenes}")
-    if scene_indices:
-        logger.info(f"  Scene Indices: {scene_indices}")
-    logger.info("")
-    
-    logger.info("--- Pretrained & Resume ---")
-    logger.info(f"  Pretrained Checkpoint: {args.pretrained_ckpt if args.pretrained_ckpt else 'None'}")
-    logger.info(f"  Resume From: {args.resume_from if args.resume_from else 'None'}")
-    logger.info("=" * 60)
-    logger.info("")
-
     # W&B
+    wandb_config = config.get("wandb", {})
+    wandb_entity = wandb_config.get("entity", "depth-finder")  # 기본값: depth-finder
+    wandb_project = wandb_config.get("project", "3kd_checking")
+    
     load_dotenv(dotenv_path=".env")
     wandb.login(key=os.getenv("WANDB_API_KEY", ""), relogin=True)
-    run = wandb.init(project="3kd_checking", config=hyper_params, name=f"experiment_{experiment}")
+    run = wandb.init(
+        entity=wandb_entity,
+        project=wandb_project,
+        config=hyper_params,
+        name=f"experiment_{experiment}"
+    )
 
     # 데이터
     kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
+    
+    # Train set
     rgb_clips, depth_clips = get_data_list(root_dir=kitti_path, data_name="kitti", split="train", clip_len=CLIP_LEN)
     kitti_train = KITTIVideoDataset(rgb_paths=rgb_clips, depth_paths=depth_clips, resize_size=518, split="train")
     kitti_train_loader = DataLoader(kitti_train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    
+    # Validation set (KITTI) - returns 5 values for val split
+    rgb_clips_val, depth_clips_val, cam_ids_val, intrin_clips_val, extrin_clips_val = get_data_list(
+        root_dir=kitti_path, data_name="kitti", split="val", clip_len=CLIP_LEN
+    )
+    kitti_val = KITTIVideoDataset(
+        rgb_paths=rgb_clips_val, 
+        depth_paths=depth_clips_val, 
+        cam_ids=cam_ids_val,
+        intrin_clips=intrin_clips_val,
+        extrin_clips=extrin_clips_val,
+        resize_size=518, 
+        split="val"
+    )
+    kitti_val_loader = DataLoader(kitti_val, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+
 
     # 모델 (단일 GPU)
     student = VideoDepthStudent(encoder="vits", features=64, out_channels=[48,96,192,384], num_frames=CLIP_LEN).to(device)
@@ -239,7 +198,7 @@ def train(args):
 
     # ----- Resume (optional) -----
     start_epoch = 0
-    best_delta1 = 0.0  # 이어서 학습 시에도 유지/갱신
+    best_val_loss = float('inf')  # KITTI val loss 기준으로 변경 (최소화)
 
     if args.resume_from and os.path.isfile(args.resume_from):
         ckpt = torch.load(args.resume_from, map_location="cpu")
@@ -273,72 +232,161 @@ def train(args):
             except Exception as e: logger.warning(f"Aux state load skipped: {e}")
 
         # 3) 베스트 스코어 & 스타트 에폭
-        if "best_val_delta1" in ckpt:
-            try: best_delta1 = float(ckpt["best_val_delta1"])
+        if "best_val_loss" in ckpt:
+            try: best_val_loss = float(ckpt["best_val_loss"])
             except: pass
         if "epoch" in ckpt:
             start_epoch = int(ckpt["epoch"]) + 1
 
-        logger.info(f"▶ Resumed from '{args.resume_from}' | start_epoch={start_epoch} / target_epochs={num_epochs} | best_delta1={best_delta1:.4f}")
+        logger.info(f"▶ Resumed from '{args.resume_from}' | start_epoch={start_epoch} / target_epochs={num_epochs} | best_val_loss={best_val_loss:.4f}")
 
     wandb.watch(student, log="all")
     wandb.watch(aux_blocks, log="all")
-    best_delta1 = 0.0
+    best_val_loss = float('inf')  # KITTI val loss 기준으로 best 모델 선택
     best_epoch  = 0
     best_model_path   = os.path.join(OUTPUT_DIR, "best_model.pth")
     latest_model_path = os.path.join(OUTPUT_DIR, "latest_model.pth")
+    
+    # ================ 설정 출력 ================
+    logger.info("=" * 60)
+    logger.info("TRAINING CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info(f"Experiment Number: {experiment}")
+    logger.info(f"Output Directory: {OUTPUT_DIR}")
+    logger.info("")
+    
+    logger.info("--- Hyperparameters ---")
+    logger.info(f"  Learning Rate: {lr}")
+    logger.info(f"  Epochs: {num_epochs}")
+    logger.info(f"  Batch Size: {batch_size}")
+    logger.info(f"  Clip Length: {CLIP_LEN}")
+    logger.info(f"  Update Frequency: {hyper_params.get('update_frequency', 6)}")
+    logger.info(f"  SSI Loss Weight: {ratio_ssi}")
+    logger.info(f"  TGM Loss Weight: {ratio_tgm}")
+    logger.info("")
+    
+    logger.info("--- Knowledge Distillation (KD) ---")
+    logger.info(f"  KD Enabled: {kd_enabled}")
+    if kd_enabled:
+        logger.info(f"  KD Layers: {kd_layers}")
+        logger.info(f"  KD Alpha (DIS): {kd_alpha}")
+        logger.info(f"  KD Beta (KLD): {kd_beta}")
+        logger.info(f"  KD Gamma (APC): {kd_gamma}")
+        logger.info(f"  KD Lambda (Total Weight): {kd_lambda}")
+        logger.info(f"  KD Window: {kd_window}")
+        logger.info(f"  KD Stride: {kd_stride}")
+        logger.info(f"  KD N (APC Future Steps): {kd_N}")
+        logger.info(f"  Feature Pool: {kd_pool}")
+        logger.info(f"  Attention Epsilon: {kd_attn_eps}")
+    logger.info("")
+    
+    logger.info("--- Model Architecture ---")
+    logger.info(f"  Student Encoder: {student.encoder}")
+    logger.info(f"  Teacher Encoder: {teacher.encoder}")
+    logger.info(f"  Features: 64")
+    logger.info(f"  Out Channels: [48, 96, 192, 384]")
+    logger.info(f"  Num Frames: {CLIP_LEN}")
+    logger.info("")
+    
+    logger.info("--- Optimizer & Scheduler ---")
+    logger.info(f"  Optimizer: AdamW")
+    logger.info(f"  Weight Decay: 1e-4")
+    logger.info(f"  Scheduler: CosineAnnealingLR")
+    logger.info(f"  Scheduler Eta Min: 1e-6")
+    logger.info("")
+    
+    logger.info("--- Data Configuration ---")
+    logger.info(f"  KITTI Path: /home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI")
+    logger.info(f"  Data Split: train")
+    logger.info(f"  Num Workers: 4")
+    logger.info("")
+    
+    logger.info("--- Validation Configuration ---")
+    logger.info(f"  Dataset: {args.val_dataset_key}")
+    logger.info(f"  Dataset Tag: {args.val_dataset_tag}")
+    logger.info(f"  Scenes to Eval: {len(scene_indices) if scene_indices else args.val_scenes}")
+    if scene_indices:
+        logger.info(f"  Scene Indices: {scene_indices}")
+    logger.info("")
+    
+    logger.info("--- Pretrained & Resume ---")
+    logger.info(f"  Pretrained Checkpoint: {args.pretrained_ckpt if args.pretrained_ckpt else 'None'}")
+    logger.info(f"  Resume From: {args.resume_from if args.resume_from else 'None'}")
+    logger.info("=" * 60)
+    logger.info("")
 
+    # --------------------- Training Mode (with validation) ---------------------
     if not args.test:
-        # ---- Init real-pipeline validation (epoch = -1) ----
-        # 초기 성능을 실제 inference+eval 축소 파이프라인으로 측정하여 W&B에 기록
+        # ---- Init validation before training (epoch = -1) ----
+        logger.info("=" * 60)
+        logger.info("Running initial validation before training...")
+        logger.info("=" * 60)
+        
+        student.eval()
+        
+        # 1. KITTI Validation
+        logger.info("Running KITTI validation...")
+        kitti_val_metrics = validate_kitti_streaming(
+            model=student,
+            val_loader=kitti_val_loader,
+            device=device,
+            loss_ssi_fn=loss_ssi,
+            loss_tgm_fn=loss_tgm,
+            ratio_ssi=ratio_ssi,
+            ratio_tgm=ratio_tgm,
+            min_depth=1e-3,
+            max_depth=80.0
+        )
+        
+        kitti_val_loss = kitti_val_metrics['loss']
+        kitti_val_absrel = kitti_val_metrics['absrel']
+        kitti_val_delta1 = kitti_val_metrics['delta1']
+        
+        logger.info(f"[Init KITTI] loss={kitti_val_loss:.4f} | absrel={kitti_val_absrel:.4f} | delta1={kitti_val_delta1:.4f}")
+        
+        # 2. ScanNet Validation
+        logger.info("Running ScanNet validation...")
         init_infer_dir = os.path.join(args.val_infer_dir, "init")
         os.makedirs(init_infer_dir, exist_ok=True)
-
-        # 일시적으로 eval 모드
-        _prev_train_state = student.training
-        student.eval()
-        try:
-            init_metrics = validate_with_infer_eval_subset(
-                model=student,                          # 학생만 사용
-                json_file=args.val_json_file,                 # e.g., scannet_video_500.json
-                infer_path=init_infer_dir,                    # init 전용 폴더에 저장하여 덮어쓰기 방지
-                dataset=args.val_dataset_key,                 # 'scannet'
-                dataset_eval_tag=args.val_dataset_tag,        # 'scannet_500'
-                device='cuda' if torch.cuda.is_available() else 'cpu',
-                input_size=518,
-                scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
-                scene_indices=scene_indices,
-                fp32=True
-            )
-        finally:
-            # 원래 학습 모드 복귀
-            if _prev_train_state:
-                student.train()
-
-        init_avg = init_metrics.get("avg", {}) if isinstance(init_metrics, dict) else {}
-        init_absrel = float(init_avg.get("abs_relative_difference", float('nan')))
-        init_rmse   = float(init_avg.get("rmse_linear", float('nan')))
-        init_delta1 = float(init_avg.get("delta1_acc", float('nan')))
-
-        init_per_scene = init_metrics.get("per_scene", {}) if isinstance(init_metrics, dict) else {}
-
-        # 콘솔/파일 로그
-        logger.info(f"[Init] real-pipeline val  | absrel={init_absrel:.4f}  rmse={init_rmse:.4f}  delta1={init_delta1:.4f}")
-
+        
+        scannet_metrics = validate_with_infer_eval_subset(
+            model=student,
+            json_file=args.val_json_file,
+            infer_path=init_infer_dir,
+            dataset=args.val_dataset_key,
+            dataset_eval_tag=args.val_dataset_tag,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            input_size=518,
+            scenes_to_eval=args.val_scenes,
+            scene_indices=scene_indices,  # 명시적 scene 인덱스 전달
+            fp32=True
+        )
+        
+        # validate_with_infer_eval_subset는 {"avg": {...}, "per_scene": {...}} 형태로 반환
+        avg_metrics = scannet_metrics.get("avg", {})
+        scannet_absrel = float(avg_metrics.get("abs_relative_difference", float('nan')))
+        scannet_rmse   = float(avg_metrics.get("rmse_linear", float('nan')))
+        scannet_delta1 = float(avg_metrics.get("delta1_acc", float('nan')))
+        
+        logger.info(f"[Init ScanNet] absrel={scannet_absrel:.4f} | rmse={scannet_rmse:.4f} | delta1={scannet_delta1:.4f}")
+        
         # W&B 로깅 (epoch=-1로 표기)
         wandb.log({
-            "init/absrel": init_absrel,
-            "init/rmse":   init_rmse,
-            "init/delta1": init_delta1,
+            "init/val_kitti_loss": kitti_val_loss,
+            "init/val_kitti_absrel": kitti_val_absrel,
+            "init/val_kitti_delta1": kitti_val_delta1,
+            "init/val_real_absrel": scannet_absrel,
+            "init/val_real_rmse": scannet_rmse,
+            "init/val_real_delta1": scannet_delta1,
             "epoch": -1,
         })
-
-        for idx in sorted(init_per_scene.keys()):
-            scene_metrics = init_per_scene[idx]
-            wandb.log({f"init/{idx}": float(scene_metrics.get("delta1_acc", float('nan')))})
-
-        # 베스트 기준을 초기값으로 시작하고 싶다면(권장)
-        best_delta1 = init_delta1
+        
+        logger.info("=" * 60)
+        logger.info("Initial validation completed! Starting training...")
+        logger.info("=" * 60)
+        
+        # 베스트 기준을 KITTI val loss로 설정 (zero-shot ScanNet 성능 평가를 위함)
+        best_val_loss = kitti_val_loss
 
     # --------------------- Training ---------------------
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epoch", leave=False):
@@ -638,14 +686,32 @@ def train(args):
                 frame_pbar.set_postfix({
                     'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
                     'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
-                    'wKD':  f'{(epoch_kd_total / max(1, kd_steps)) * kd_lambda:.4f}' if kd_enabled else '0.0000'
+                    'wdis': f'{(epoch_kd_dis / max(1, kd_steps) * kd_alpha):.4e}' if kd_enabled else '0.0000',
+                    'wkld': f'{(epoch_kd_kld / max(1, kd_steps) * kd_beta):.4e}' if kd_enabled else '0.0000',
+                    'wapc': f'{(epoch_kd_apc / max(1, kd_steps) * kd_gamma):.4e}' if kd_enabled else '0.0000',
                 })
             frame_pbar.close()
         batch_pbar.close()
 
-        # --- Mini Real-pipeline Validation ---
-        # (학생만 평가, infer_stream+eval과 동일 경로 축소판)
-        val_metrics = validate_with_infer_eval_subset(
+        # --- KITTI Validation (for hyperparameter tuning) ---
+        kitti_val_metrics = validate_kitti_streaming(
+            model=student,
+            val_loader=kitti_val_loader,
+            device=device,
+            loss_ssi_fn=loss_ssi,
+            loss_tgm_fn=loss_tgm,
+            ratio_ssi=ratio_ssi,
+            ratio_tgm=ratio_tgm,
+            min_depth=1e-3,
+            max_depth=80.0
+        )
+        
+        kitti_val_loss = kitti_val_metrics['loss']
+        kitti_val_absrel = kitti_val_metrics['absrel']
+        kitti_val_delta1 = kitti_val_metrics['delta1']
+        
+        # --- ScanNet Validation (for monitoring target domain) ---
+        scannet_metrics = validate_with_infer_eval_subset(
             model=student,
             json_file=args.val_json_file,
             infer_path=args.val_infer_dir,
@@ -653,79 +719,82 @@ def train(args):
             dataset_eval_tag=args.val_dataset_tag,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             input_size=518,
-            scenes_to_eval=len(scene_indices) if scene_indices else args.val_scenes,
-            scene_indices=scene_indices,
+            scenes_to_eval=args.val_scenes,
+            scene_indices=scene_indices,  # 명시적 scene 인덱스 전달
             fp32=True
         )
 
-        val_avg = val_metrics.get("avg", {}) if isinstance(val_metrics, dict) else {}
-        val_per_scene = val_metrics.get("per_scene", {}) if isinstance(val_metrics, dict) else {}
+        # validate_with_infer_eval_subset는 {"avg": {...}, "per_scene": {...}} 형태로 반환
+        avg_metrics = scannet_metrics.get("avg", {})
+        scannet_absrel = float(avg_metrics.get("abs_relative_difference", float('nan')))
+        scannet_rmse   = float(avg_metrics.get("rmse_linear", float('nan')))
+        scannet_delta1 = float(avg_metrics.get("delta1_acc", float('nan')))
 
-        val_absrel = float(val_avg.get("abs_relative_difference", float('nan')))
-        val_rmse   = float(val_avg.get("rmse_linear", float('nan')))
-        val_delta1 = float(val_avg.get("delta1_acc", float('nan')))
-
-        # 로깅
-        log_payload = {
+        # 로깅 (Ablation: DIS, KLD, APC separately tracked)
+        wandb_log_dict = {
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
-            # "train/kv_reg": (epoch_kv_reg / max(1, kv_reg_steps)) if kv_adapters is not None else 0.0,
 
-            # KD는 스텝 평균
+            # KD는 스텝 평균 (Ablation)
             "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,
-            "train/kd_dis":   (epoch_kd_dis   / max(1, kd_steps)) if kd_enabled else 0.0,
-            "train/kd_kld":   (epoch_kd_kld   / max(1, kd_steps)) if kd_enabled else 0.0,
-            "train/kd_apc":   (epoch_kd_apc   / max(1, kd_steps)) if kd_enabled else 0.0,
             'train/kd_steps': kd_steps,
 
-            "val_real/absrel": val_absrel,
-            "val_real/rmse":   val_rmse,
-            "val_real/delta1": val_delta1,
+            # KITTI val (for best model selection)
+            "val_kitti/loss": kitti_val_loss,
+            "val_kitti/absrel": kitti_val_absrel,
+            "val_kitti/delta1": kitti_val_delta1,
+            
+            # ScanNet val (for monitoring - kept as val_real for comparison with previous experiments)
+            "val_real/absrel": scannet_absrel,
+            "val_real/rmse":   scannet_rmse,
+            "val_real/delta1": scannet_delta1,
+            
             "epoch": epoch,
         }
+        
+        # Add individual KD components only if enabled
+        if kd_enabled:
+            wandb_log_dict["train/kd_dis"] = (epoch_kd_dis / max(1, kd_steps))
+            wandb_log_dict["train/kd_dis_weighted"] = (epoch_kd_dis / max(1, kd_steps)) * kd_alpha
 
-        for idx in sorted(val_per_scene.keys()):
-            scene_metrics = val_per_scene[idx]
-            log_payload[f"val_real/{idx}"] = float(scene_metrics.get("delta1_acc", float('nan')))
+            wandb_log_dict["train/kd_kld"] = (epoch_kd_kld / max(1, kd_steps))
+            wandb_log_dict["train/kd_kld_weighted"] = (epoch_kd_kld / max(1, kd_steps)) * kd_beta
 
-        wandb.log(log_payload)
+            wandb_log_dict["train/kd_apc"] = (epoch_kd_apc / max(1, kd_steps))
+            wandb_log_dict["train/kd_apc_weighted"] = (epoch_kd_apc / max(1, kd_steps)) * kd_gamma
+        
+        wandb.log(wandb_log_dict)
 
-        # best 저장 (delta1 ↑)
-        if val_delta1 > best_delta1:
-            best_delta1 = val_delta1
+        # best 저장 (KITTI val loss 기준 ↓ - zero-shot ScanNet 성능을 보기 위함)
+        if kitti_val_loss < best_val_loss:
+            best_val_loss = kitti_val_loss
             best_epoch  = epoch
-            best_payload = {
+            save_dict = {
                 "epoch": epoch,
                 "model_state_dict": student.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_delta1": best_delta1,
-                "config": hyper_params,
                 "aux_state_dict": aux_blocks.state_dict(),
+                "best_val_loss": best_val_loss,
+                "config": hyper_params,
             }
-            # if kv_adapters is not None:
-            #     best_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
-            torch.save(best_payload, best_model_path)
-            logger.info(f"🏆 Best model saved! Epoch {epoch}, Val delta1: {best_delta1:.4f}")
+            torch.save(save_dict, best_model_path)
+            logger.info(f"🏆 Best model saved! Epoch {epoch}, KITTI val loss: {best_val_loss:.4f} | KITTI delta1: {kitti_val_delta1:.4f} | ScanNet delta1: {scannet_delta1:.4f}")
 
         # latest 저장
-        latest_payload = {
+        save_dict_latest = {
             "epoch": epoch,
             "model_state_dict": student.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "val_absrel": val_absrel,
-            "val_delta1": val_delta1,
-            "val_rmse":   val_rmse,
-            "val_per_scene": {idx: {k: float(v) for k, v in metrics.items()} for idx, metrics in val_per_scene.items()},
-            "config": hyper_params,
             "aux_state_dict": aux_blocks.state_dict(),
+            "kitti_val_delta1": kitti_val_delta1,
+            "scannet_val_delta1": scannet_delta1,
+            "config": hyper_params,
         }
-        # if kv_adapters is not None:
-        #     latest_payload["kv_adapter_state_dict"] = kv_adapters.state_dict()
-        torch.save(latest_payload, latest_model_path)
-        logger.info(f"Latest model saved to {latest_model_path}")
+        torch.save(save_dict_latest, latest_model_path)
+        logger.info(f"📁 Latest model saved | Epoch {epoch} | ScanNet delta1: {scannet_delta1:.4f} | KITTI delta1: {kitti_val_delta1:.4f}")
 
         torch.cuda.empty_cache()
         scheduler.step()
@@ -735,7 +804,7 @@ def train(args):
     logger.info("Training Completed!")
     logger.info(f"Total Epochs: {num_epochs}")
     logger.info(f"Best Epoch: {best_epoch}")
-    logger.info(f"Best Val delta1: {best_delta1:.4f}")
+    logger.info(f"Best KITTI Val Loss: {best_val_loss:.4f}")
     logger.info(f"Best model saved to: {best_model_path}")
     logger.info(f"Latest model saved to: {latest_model_path}")
     logger.info("=" * 30)

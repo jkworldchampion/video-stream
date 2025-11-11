@@ -138,6 +138,7 @@ def main():
     # --- wandb 옵션 (최소 추가) ---
     parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='depth-eval', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default='depth-finder', help='wandb entity (team or username)')
     parser.add_argument('--wandb_run_name', type=str, default='', help='wandb run name')
     parser.add_argument('--wandb_group', type=str, default='', help='wandb group')
     parser.add_argument('--wandb_mode', type=str, default='online', choices=['online','offline','disabled'], help='wandb mode')
@@ -149,6 +150,7 @@ def main():
     # --- wandb 초기화 (옵션) ---
     if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
         wandb.init(
+            entity=args.wandb_entity,
             project=args.wandb_project,
             name=(args.wandb_run_name if args.wandb_run_name else None),
             group=(args.wandb_group if args.wandb_group else None),

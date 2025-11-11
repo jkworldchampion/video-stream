@@ -23,6 +23,8 @@ if __name__ == '__main__':
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
+    parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
+                        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -34,7 +36,7 @@ if __name__ == '__main__':
 
     vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
     # checkpoint load
-    ckpt = torch.load('./outputs/experiment_23/best_model.pth', map_location='cpu', weights_only=True)
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거

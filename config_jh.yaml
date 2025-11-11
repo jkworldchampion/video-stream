@@ -3,7 +3,7 @@ hyper_parameter:
   clip_len: 32
   ratio_ssi: 1
   ratio_tgm: 10
-  epochs: 50
+  epochs: 75
   batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
 
@@ -39,9 +39,9 @@ kd_aux:
   N: 1  # APC(Autoregressive Predictive Coding) 미래 스텝 수
   
   # KD Loss weights (Ablation Study: 개별 컴포넌트 on/off 가능)
-  alpha: 0.01  # L_DIS (DistilHuBERT feature loss) 가중치 - 0으로 설정 시 DIS 비활성화
+  alpha: 0.0  # L_DIS (DistilHuBERT feature loss) 가중치 - 0으로 설정 시 DIS 비활성화
   beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치 - 0으로 설정 시 KLD 비활성화
-  gamma: 0.00  # L_APC (Autoregressive Predictive Coding) 가중치 - 0으로 설정 시 APC 비활성화
+  gamma: 0.005  # L_APC (Autoregressive Predictive Coding) 가중치 - 0으로 설정 시 APC 비활성화
   lambda_kd: 1.0  # 전체 KD loss 가중치 (최종 loss에 곱해짐)
   
   # KD Sliding Window Configuration
@@ -93,4 +93,4 @@ validation:
 # Wandb Configuration
 wandb:
   project: "3kd_checking"  # wandb 프로젝트 이름
-  entity: null  # wandb entity (organization), null이면 개인 계정 사용
+  entity: "depth-finder"  # wandb entity (organization), null이면 개인 계정 사용
