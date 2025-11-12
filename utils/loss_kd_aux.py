@@ -1,9 +1,8 @@
 # utils/loss_kd_aux.py
 # Copyright (2025)
 # Losses for KD with auxiliary non-streaming layer:
-#  - DistilHuBERT-like feature similarity
 #  - MiniLM-v2 style relation KL over Q/Q, K/K, V/V
-#  - APC future prediction loss
+# Note: DIS (feature similarity) and APC (future prediction) removed for better performance
 
 from typing import Dict, Optional
 import torch
@@ -16,41 +15,8 @@ def _safe_mean(x: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
     return (x / denom.clamp(min=1e-8)).sum()
 
 
-# -------------------------------
-# 3.3.1 Feature similarity loss
-# -------------------------------
-def distilhubert_feature_loss(
-    h: torch.Tensor,   # [B, T, C]
-    z: torch.Tensor,   # [B, T, C]
-    mask: Optional[torch.Tensor] = None,  # [B, T] in {0,1}
-) -> torch.Tensor:
-    """
-    L_DIS = sum_t ( 1/D * ||h_t - z_t||_1 - log(sigmoid(cos(h_t, z_t))) )
-    평균은 유효 프레임 마스크 기준으로 산정.
-    """
-    assert h.shape == z.shape, f"shape mismatch: {h.shape} vs {z.shape}"
-    B, T, C = h.shape
-
-    # L1 term
-    l1 = (h - z).abs().sum(dim=-1) / float(C)  # [B, T]
-
-    # cosine term
-    # F.cosine_similarity는 마지막 dim 기준. 안정성을 위해 eps 사용.
-    cos = F.cosine_similarity(h, z, dim=-1, eps=1e-8).clamp(min=-1.0, max=1.0)  # [B, T]
-    term = l1 - torch.log(torch.sigmoid(cos) + 1e-8)  # [B, T]
-
-    if mask is None:
-        return term.mean()
-
-    # mask: [B,T] -> 평균
-    mask = mask.to(term.dtype)
-    num = (term * mask).sum()
-    den = mask.sum()
-    return num / den.clamp(min=1e-8)
-
-
 # -------------------------------------
-# 3.3.2 Self-Attention relation KL loss
+# Self-Attention relation KL loss
 # -------------------------------------
 def _relation_row_from_proj(
     proj: torch.Tensor,     # [B, A, T, Dh]
@@ -178,50 +144,3 @@ def attention_relation_kl(t_qkv, s_qkv, mask=None, eps=1e-8, q_mask=None, k_mask
     Lk = _rel_kl(KT_t, KT_s, q_mask, k_mask)
     Lv = _rel_kl(VT_t, VT_s, q_mask, k_mask)
     return Lq + Lk + Lv
-
-
-# -------------------------------
-# 3.3.3 APC future prediction loss
-# -------------------------------
-def apc_loss(
-    h: torch.Tensor,   # [B, T, C]  (teacher feature sequence)
-    r: torch.Tensor,   # [B, T, C]  (student's uni-RNN outputs)
-    N: int = 2,
-    mask: Optional[torch.Tensor] = None,  # [B, T] valid frames
-) -> torch.Tensor:
-    """
-    LAPC = sum_t ( 1/D * || h_{t+N} - r_t ||_1 - log(sigmoid(cos(h_{t+N}, r_t))) )
-    - 유효 쌍 (t, t+N)만 평균
-    """
-    assert h.shape == r.shape, f"shape mismatch: {h.shape} vs {r.shape}"
-    B, T, C = h.shape
-    if N <= 0:
-        return h.new_zeros(())
-
-    # 유효한 t 범위: 0..T-1-N
-    T_eff = T - N
-    if T_eff <= 0:
-        return h.new_zeros(())
-
-    h_future = h[:, N:, :]          # [B, T-N, C]
-    r_now    = r[:, :T_eff, :]      # [B, T-N, C]
-
-    # L1
-    l1 = (h_future - r_now).abs().sum(dim=-1) / float(C)  # [B, T-N]
-
-    # cosine
-    cos = F.cosine_similarity(h_future, r_now, dim=-1, eps=1e-8).clamp(min=-1.0, max=1.0)  # [B, T-N]
-    term = l1 - torch.log(torch.sigmoid(cos) + 1e-8)
-
-    if mask is None:
-        return term.mean()
-
-    # mask 쌍: m_pair[b,t] = mask[b,t] AND mask[b,t+N]
-    m1 = mask[:, :T_eff]
-    m2 = mask[:, N:]
-    m_pair = (m1 > 0) & (m2 > 0)
-    m_pair = m_pair.to(term.dtype)
-
-    num = (term * m_pair).sum()
-    den = m_pair.sum()
-    return num / den.clamp(min=1e-8)

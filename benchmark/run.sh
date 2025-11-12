@@ -14,7 +14,7 @@ JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/dataset
 BENCHMARK_ROOT="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets"
 
 # 실험 리스트
-EXPERIMENTS=("experiment_5")
+EXPERIMENTS=("experiment_6")
 
 # 각 실험에 대해 순차적으로 실행
 for EXP in "${EXPERIMENTS[@]}"; do

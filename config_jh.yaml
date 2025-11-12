@@ -36,12 +36,10 @@ loss:
 kd_aux:
   enabled: true  # KD 활성화 여부
   layers: [0, 1, 2, 3]  # dpt_temporal에서 사용할 레이어 인덱스 (4개 temporal 지점)
-  N: 1  # APC(Autoregressive Predictive Coding) 미래 스텝 수
   
-  # KD Loss weights (Ablation Study: 개별 컴포넌트 on/off 가능)
-  alpha: 0.0  # L_DIS (DistilHuBERT feature loss) 가중치 - 0으로 설정 시 DIS 비활성화
-  beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치 - 0으로 설정 시 KLD 비활성화
-  gamma: 0.005  # L_APC (Autoregressive Predictive Coding) 가중치 - 0으로 설정 시 APC 비활성화
+  # KD Loss weights (Minimal KD: Attention Relation Only)
+  # DIS (feature similarity) 및 APC (future prediction) 제거 완료
+  beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치
   lambda_kd: 1.0  # 전체 KD loss 가중치 (최종 loss에 곱해짐)
   
   # KD Sliding Window Configuration

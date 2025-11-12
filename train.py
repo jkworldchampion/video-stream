@@ -26,9 +26,7 @@ from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoD
 from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTeacher
 from video_depth_anything.aux.aux_block import AuxBlock          # Proj -> 1L Transformer(bi, hole-mask) -> Uni-LSTM
 from utils.loss_kd_aux import (
-    distilhubert_feature_loss,   # L_DIS
     attention_relation_kl,       # L_KLD (Q/Q + K/K + V/V)
-    apc_loss                     # L_APC
 )
 
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -81,13 +79,10 @@ def train(args):
     kd_cfg = config.get("kd_aux", {})
     kd_enabled   = bool(kd_cfg.get("enabled", True))
     kd_layers    = kd_cfg.get("layers", [0, 1, 2, 3])   # dpt_temporal에서 우리가 잡은 4개 temporal 지점
-    kd_N         = int(kd_cfg.get("N", 1))              # APC 미래 스텝
-    kd_alpha     = float(kd_cfg.get("alpha", 1e-2))
+    # DIS, APC 제거 - KLD만 사용
     kd_beta      = float(kd_cfg.get("beta", 5e-4))
-    kd_gamma     = float(kd_cfg.get("gamma", 5e-3))
     kd_lambda    = float(kd_cfg.get("lambda_kd", 1.0))
     kd_attn_eps  = float(kd_cfg.get("attn_eps", 1e-8))
-    kd_pool      = kd_cfg.get("feature_pool", "mean")
 
     # 추가: 슬라이딩 KD 창 길이/보폭
     kd_window = int(kd_cfg.get("window", CLIP_LEN))  # 보통 32, 경험상 16으로 하는게 젤 나음
@@ -269,14 +264,11 @@ def train(args):
     logger.info(f"  KD Enabled: {kd_enabled}")
     if kd_enabled:
         logger.info(f"  KD Layers: {kd_layers}")
-        logger.info(f"  KD Alpha (DIS): {kd_alpha}")
+        # DIS, APC 제거 - KLD만 사용
         logger.info(f"  KD Beta (KLD): {kd_beta}")
-        logger.info(f"  KD Gamma (APC): {kd_gamma}")
         logger.info(f"  KD Lambda (Total Weight): {kd_lambda}")
         logger.info(f"  KD Window: {kd_window}")
         logger.info(f"  KD Stride: {kd_stride}")
-        logger.info(f"  KD N (APC Future Steps): {kd_N}")
-        logger.info(f"  Feature Pool: {kd_pool}")
         logger.info(f"  Attention Epsilon: {kd_attn_eps}")
     logger.info("")
     
@@ -395,11 +387,9 @@ def train(args):
         epoch_loss = epoch_frames = 0.0
         epoch_ssi = epoch_tgm = 0.0
 
-        # KD 누적(스텝 평균용)
+        # KD 누적(스텝 평균용) - DIS, APC 제거
         epoch_kd_total = 0.0
-        epoch_kd_dis   = 0.0
         epoch_kd_kld   = 0.0
-        epoch_kd_apc   = 0.0
         kd_steps = 0
 
         accum_loss = 0.0
@@ -420,8 +410,7 @@ def train(args):
             kd_executed = False
             layer_buffers = {
                 int(li): {
-                    "z": collections.deque(maxlen=kd_window),
-                    "r": collections.deque(maxlen=kd_window),
+                    # r 제거 (APC에서만 사용)
                     "q": collections.deque(maxlen=kd_window),
                     "k": collections.deque(maxlen=kd_window),
                     "v": collections.deque(maxlen=kd_window),
@@ -443,7 +432,7 @@ def train(args):
                         student, x_t, cache,
                         collect_inter=True,        # ← 내부 temporal features(intermediates)를 inter_t로 반환
                         collect_qkv=False,         # Q/K/V는 AuxBlock에서 생성
-                        feature_pool=kd_pool,      # 'mean' 등
+                        feature_pool='mean',       # mean pooling
                         return_encoder_feats=True, # ← encoder features 반환
                     )
                     pred_t_raw = to_BHW_pred(pred_t_raw).clamp(min=1e-6)
@@ -466,15 +455,13 @@ def train(args):
 
                             state = layer_buffers[li]
                             stream_cache = state["cache"]
-                            z_t, r_t, qkv_t, stream_cache = aux_blocks[str(li)].forward_stream(
+                            # r_t 제거 (APC에서만 사용)
+                            qkv_t, stream_cache = aux_blocks[str(li)].forward_stream(
                                 feat_one,
                                 cache=stream_cache,
-                                hole_mask_n=kd_N,
                                 max_len=kd_window,
                             )
                             state["cache"] = stream_cache
-                            state["z"].append(z_t.detach().unsqueeze(1))
-                            state["r"].append(r_t.detach().unsqueeze(1))
 
                             if aux_blocks[str(li)].return_qkv and qkv_t is not None:
                                 state["q"].append(qkv_t["Q"].detach())
@@ -486,8 +473,6 @@ def train(args):
                                 state["v"].append(None)
 
                             layer_step_outputs[li] = {
-                                "z": z_t.unsqueeze(1),
-                                "r": r_t.unsqueeze(1),
                                 "qkv": qkv_t,
                             }
 
@@ -519,7 +504,7 @@ def train(args):
 
                     # ----- Sliding Teacher KD at frame t -----
                     L_kd_t = pred_t_raw.new_tensor(0.0)
-                    kd_terms_step = {"dis": 0.0, "kld": 0.0, "apc": 0.0}
+                    kd_terms_step = {"kld": 0.0}  # DIS, APC 제거 - KLD만 사용
                     W_eff = min(kd_window, t + 1)
                     t0 = t - W_eff + 1
                     x_win = x[:, t0:t+1]  # [B, W_eff, 3, H, W]
@@ -579,7 +564,7 @@ def train(args):
                                 cached_hidden_state_list=None,
                                 return_intermediates=True,
                                 return_qkv=True,
-                                feature_pool=kd_pool,
+                                feature_pool='mean',
                             )
                             t_out = {"intermediates": t_intermediates}
 
@@ -587,27 +572,12 @@ def train(args):
                         for li in kd_layers:
                             li = int(li)
                             state = layer_buffers.get(li) if kd_enabled else None
-                            if state is None or len(state["z"]) == 0:
+                            if state is None or len(state["q"]) == 0:  # q 버퍼로 체크
                                 continue
 
-                            h_feat_seq = t_out["intermediates"][li]["feat"]     # [B, W_eff, Ct]
                             t_qkv_seq  = t_out["intermediates"][li].get("qkv")  # dict with [B,A,T,Dh]
 
-                            z_entries = list(state["z"])[-W_eff:]
-                            r_entries = list(state["r"])[-W_eff:]
-                            if len(z_entries) < W_eff or len(r_entries) < W_eff:
-                                continue
-
                             latest_vals = layer_step_outputs.get(li, {}) if li in layer_step_outputs else {}
-                            z_latest = latest_vals.get("z")
-                            r_latest = latest_vals.get("r")
-                            if z_latest is not None:
-                                z_entries[-1] = z_latest
-                            if r_latest is not None:
-                                r_entries[-1] = r_latest
-
-                            z_seq = torch.cat(z_entries, dim=1)
-                            r_seq = torch.cat(r_entries, dim=1)
 
                             qkv_aux_seq = None
                             if aux_blocks[str(li)].return_qkv:
@@ -626,26 +596,24 @@ def train(args):
                                         k_seq = torch.cat(k_entries, dim=2)
                                         v_seq = torch.cat(v_entries, dim=2)
                                         qkv_aux_seq = {"Q": q_seq, "K": k_seq, "V": v_seq}
-                            l_dis = distilhubert_feature_loss(h_feat_seq, z_seq, mask=mask_last)
+                            
                             l_kld = attention_relation_kl(
                                 t_qkv_seq, qkv_aux_seq,
                                 q_mask=mask_last,
                                 k_mask=frame_valid,
                                 eps=kd_attn_eps
-                            ) if (t_qkv_seq is not None and qkv_aux_seq is not None) else h_feat_seq.new_tensor(0.0)
-                            l_apc = apc_loss(h_feat_seq, r_seq, N=kd_N, mask=frame_valid)
+                            ) if (t_qkv_seq is not None and qkv_aux_seq is not None) else x.new_tensor(0.0)
 
-                            kd_terms_step["dis"] += l_dis
                             kd_terms_step["kld"] += l_kld
-                            kd_terms_step["apc"] += l_apc
                             num_used += 1
 
                         if num_used > 0:
                             for k in kd_terms_step:
                                 kd_terms_step[k] = kd_terms_step[k] / num_used
 
-                        L_kd_t = kd_alpha * kd_terms_step["dis"] + kd_beta * kd_terms_step["kld"] + kd_gamma * kd_terms_step["apc"]
-                        # print(f"  [KD @ frame {t}] L_DIS={kd_terms_step['dis']:.4f}  L_KLD={kd_terms_step['kld']:.4f}  L_APC={kd_terms_step['apc']:.4f}  →  L_KD={L_kd_t.item():.4f}")
+                        # DIS, APC 제거 - KLD만 사용
+                        L_kd_t = kd_beta * kd_terms_step["kld"]
+                        # print(f"  [KD @ frame {t}] L_KLD={kd_terms_step['kld']:.4f}  →  L_KD={L_kd_t.item():.4f}")
 
                     # ---- 최종 loss (KD 꺼져 있어도 depth 손실은 유지!)
                     loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * L_kd_t if kd_enabled else 0.0)
@@ -678,17 +646,13 @@ def train(args):
                 # KD가 실제 실행된 스텝만 에폭 누적
                 if kd_executed:
                     epoch_kd_total += float(L_kd_t.item())
-                    epoch_kd_dis   += float(kd_terms_step["dis"])
                     epoch_kd_kld   += float(kd_terms_step["kld"])
-                    epoch_kd_apc   += float(kd_terms_step["apc"])
                     kd_steps += 1
 
                 frame_pbar.set_postfix({
                     'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
                     'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
-                    'wdis': f'{(epoch_kd_dis / max(1, kd_steps) * kd_alpha):.4e}' if kd_enabled else '0.0000',
                     'wkld': f'{(epoch_kd_kld / max(1, kd_steps) * kd_beta):.4e}' if kd_enabled else '0.0000',
-                    'wapc': f'{(epoch_kd_apc / max(1, kd_steps) * kd_gamma):.4e}' if kd_enabled else '0.0000',
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -753,16 +717,11 @@ def train(args):
             "epoch": epoch,
         }
         
-        # Add individual KD components only if enabled
+        # Add individual KD components only if enabled (DIS, APC 제거)
         if kd_enabled:
-            wandb_log_dict["train/kd_dis"] = (epoch_kd_dis / max(1, kd_steps))
-            wandb_log_dict["train/kd_dis_weighted"] = (epoch_kd_dis / max(1, kd_steps)) * kd_alpha
-
+            # DIS, APC는 제거되었으므로 로깅하지 않음
             wandb_log_dict["train/kd_kld"] = (epoch_kd_kld / max(1, kd_steps))
             wandb_log_dict["train/kd_kld_weighted"] = (epoch_kd_kld / max(1, kd_steps)) * kd_beta
-
-            wandb_log_dict["train/kd_apc"] = (epoch_kd_apc / max(1, kd_steps))
-            wandb_log_dict["train/kd_apc_weighted"] = (epoch_kd_apc / max(1, kd_steps)) * kd_gamma
         
         wandb.log(wandb_log_dict)
 

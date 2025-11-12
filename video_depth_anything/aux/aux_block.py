@@ -296,11 +296,10 @@ class AuxBlock(nn.Module):
     def forward(self, s_feat: torch.Tensor, hole_mask_n: int = 0):
         """
         s_feat: [B, T, C_in]  (student temporal features pooled to [B,T,C_in])
-    hole_mask_n: for the transformer attention — block [t+1..t+N] to avoid APC leakage
+        hole_mask_n: for the transformer attention — block [t+1..t+N] to avoid APC leakage
         returns:
-          z:   [B, T, C_t]  (to match teacher feature h for feature loss)
-          r:   [B, T, C_t]  (uni-LSTM outputs, for APC to predict h_{t+N})
           qkv: dict or None; {"Q","K","V"} each [B, A, T, Dh]
+        Note: z (DIS feature) and r (APC predictor) removed for better performance
         """
         assert s_feat.dim() == 3, f"s_feat must be [B,T,C_in], got {s_feat.shape}"
         x = self.proj_in(s_feat)        # [B,T,Ct]
@@ -308,19 +307,10 @@ class AuxBlock(nn.Module):
         if self.use_pos_enc:
             x = self.pos(x)                 # [B,T,Ct]
 
-        # z: feature KD용 출력, qkv: self-attn Q/K/V
-        z, qkv = self.tr(x, hole_mask_n=hole_mask_n)  # z: [B,T,Ct] Transformer 출력, qkv: dict or None
+        # Transformer output only (no APC predictor)
+        tr_out, qkv = self.tr(x, hole_mask_n=hole_mask_n)  # tr_out: [B,T,Ct], qkv: dict or None
 
-        # Uni-LSTM over z
-        if self._pred_is_mamba:
-            # Mamba는 입력 [B,T,C] → [B,T,C] (causal)
-            r = self.predictor(z)
-        else:
-            r, _ = self.predictor(z)
-        z = self.ln_out(z)
-        r = self.ln_out(r)
-
-        return z, r, qkv
+        return qkv
 
     def forward_stream(
         self,
@@ -329,20 +319,19 @@ class AuxBlock(nn.Module):
         cache: Optional[Dict[str, torch.Tensor]] = None,
         hole_mask_n: int = 0,
         max_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
+    ) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
         """Streaming variant consuming a single timestep feature.
 
         Args:
             s_feat_one: [B,C_in] or [B,1,C_in] tensor for the current frame.
-            cache: dict holding internal streaming state (K/V cache, RNN hidden states, position index).
+            cache: dict holding internal streaming state (K/V cache, position index).
             hole_mask_n: APC hole mask horizon (kept for parity with batched path).
             max_len: optional max cache length for attention history (e.g., KD window).
 
         Returns:
-            z_t: [B,C_t]    – feature projection for KD (last frame)
-            r_t: [B,C_t]    – APC predictor output for the same frame
             qkv_t: optional dict with per-head Q/K/V [B,A,1,Dh]
             new_cache: updated cache to feed the next timestep
+        Note: z_t (DIS feature) and r_t (APC predictor) removed for better performance
         """
         if s_feat_one.dim() == 3:
             if s_feat_one.size(1) != 1:
@@ -362,7 +351,7 @@ class AuxBlock(nn.Module):
             cache["pos_idx"] = pos_idx + 1
 
         tr_cache = cache.get("tr")
-        z_raw, qkv, tr_cache = self.tr.forward_stream(
+        tr_out, qkv, tr_cache = self.tr.forward_stream(
             x,
             cache=tr_cache,
             hole_mask_n=hole_mask_n,
@@ -370,15 +359,4 @@ class AuxBlock(nn.Module):
         )
         cache["tr"] = tr_cache
 
-        if self._pred_is_mamba:
-            r_raw = self.predictor(z_raw.unsqueeze(1)).squeeze(1)
-        else:
-            lstm_state = cache.get("rnn_state")
-            r_seq, lstm_state = self.predictor(z_raw.unsqueeze(1), lstm_state)
-            cache["rnn_state"] = tuple(h.detach() for h in lstm_state)
-            r_raw = r_seq.squeeze(1)
-
-        z = self.ln_out(z_raw)
-        r = self.ln_out(r_raw)
-
-        return z, r, qkv, cache
+        return qkv, cache
