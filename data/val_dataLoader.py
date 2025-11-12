@@ -3,9 +3,10 @@ import random
 from PIL import Image
 import torch
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import glob
+import json
 
 def get_list(root_dir, data_name):
     x_path, y_path = [], []
@@ -229,4 +230,128 @@ class ValDataset(Dataset):
             Ks = K_single.unsqueeze(0).repeat(T, 1, 1)  # (T,3,3)
             return imgs, disps, poses, Ks
         else :
-            return imgs,disps
+            return imgs, disps
+
+
+class ScanNetVideoDataset(Dataset):
+    """ScanNet video dataset from JSON file (for H1 experiment)"""
+    
+    def __init__(
+        self,
+        json_file: str,
+        root_dir: str,
+        scene_ids: list = None,
+        resize_size: tuple = (518, 518),
+        rgb_mean: tuple = (0.485, 0.456, 0.406),
+        rgb_std: tuple = (0.229, 0.224, 0.225),
+    ):
+        """
+        Args:
+            json_file: Path to scannet_video_500.json
+            root_dir: Root directory (extracted from json paths)
+            scene_ids: List of scene indices to load (e.g., [0, 1])
+            resize_size: (H, W)
+            rgb_mean, rgb_std: Normalization parameters
+        """
+        self.resize_size = resize_size
+        self.rgb_mean = rgb_mean
+        self.rgb_std = rgb_std
+        self.factor = 1000.0  # ScanNet depth factor
+        
+        # Load JSON
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        
+        # Parse scenes
+        all_scenes = data["scannet"]
+        
+        if scene_ids is not None:
+            # Select specific scenes by index
+            self.scenes = [all_scenes[i] for i in scene_ids if i < len(all_scenes)]
+        else:
+            self.scenes = all_scenes
+        
+        # Extract root_dir from json path
+        # e.g., "benchmark/dataset_extract/scannet_video_500.json" → "benchmark/dataset_extract/"
+        self.root_dir = json_file.replace("scannet_video_500.json", "")
+    
+    def __len__(self):
+        return len(self.scenes)
+    
+    def __getitem__(self, idx):
+        """
+        Returns:
+            video: [T, 3, H, W]
+            depth: [T, 1, H, W]
+            scene_id: int
+        """
+        scene_dict = self.scenes[idx]
+        scene_name = list(scene_dict.keys())[0]
+        frames = scene_dict[scene_name]
+        
+        imgs = []
+        depths = []
+        
+        for frame_info in frames:
+            # Image
+            img_path = os.path.join(self.root_dir, frame_info["image"])
+            img = Image.open(img_path).convert("RGB")
+            img = TF.center_crop(img, self.resize_size)
+            img = TF.to_tensor(img)
+            img = TF.normalize(img, mean=self.rgb_mean, std=self.rgb_std)
+            imgs.append(img)
+            
+            # Depth
+            depth_path = os.path.join(self.root_dir, frame_info["gt_depth"])
+            depth = Image.open(depth_path).convert("F")
+            depth = TF.center_crop(depth, self.resize_size)
+            depth = torch.from_numpy(np.array(depth, np.float32)).unsqueeze(0)
+            depth = depth / self.factor
+            depths.append(depth)
+        
+        video = torch.stack(imgs, dim=0)  # [T, 3, H, W]
+        depth_seq = torch.stack(depths, dim=0)  # [T, 1, H, W]
+        
+        return {
+            "video": video,
+            "depth": depth_seq,
+            "scene_id": idx,
+            "scene_name": scene_name,
+        }
+
+
+def get_scannet_video_loader(
+    json_file: str,
+    scene_ids: list = None,
+    batch_size: int = 1,
+    num_workers: int = 2,
+    **kwargs
+):
+    """
+    Create DataLoader for ScanNet video dataset
+    
+    Args:
+        json_file: Path to scannet_video_500.json
+        scene_ids: List of scene indices (e.g., [0, 1])
+        batch_size: Batch size (usually 1 for video)
+        num_workers: Number of workers
+    
+    Returns:
+        DataLoader
+    """
+    dataset = ScanNetVideoDataset(
+        json_file=json_file,
+        root_dir="",  # Will be inferred from json
+        scene_ids=scene_ids,
+        **kwargs
+    )
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    
+    return loader

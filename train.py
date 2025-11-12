@@ -33,7 +33,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 6
+experiment = 7
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,

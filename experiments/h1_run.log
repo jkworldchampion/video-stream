@@ -1,0 +1,124 @@
+xFormers not available
+xFormers not available
+/home/work/juhwan/monocular_depth/stream/video-stream/experiments/h1_attention_analysis.py:481: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  sd = torch.load(checkpoint_path, map_location="cpu")
+
+Loading scene 0:   0%|          | 0/500 [00:00<?, ?it/s]
+Loading scene 0:   1%|          | 6/500 [00:00<00:09, 50.97it/s]
+Loading scene 0:   2%|▏         | 12/500 [00:00<00:09, 53.34it/s]
+Loading scene 0:   4%|▎         | 18/500 [00:00<00:08, 53.65it/s]
+Loading scene 0:   5%|▍         | 24/500 [00:00<00:08, 53.72it/s]
+Loading scene 0:   6%|▌         | 30/500 [00:00<00:08, 53.76it/s]
+Loading scene 0:   7%|▋         | 36/500 [00:00<00:08, 51.84it/s]
+Loading scene 0:   8%|▊         | 42/500 [00:00<00:08, 52.70it/s]
+Loading scene 0:  10%|▉         | 48/500 [00:00<00:08, 53.50it/s]
+Loading scene 0:  11%|█         | 54/500 [00:01<00:08, 54.16it/s]
+Loading scene 0:  12%|█▏        | 60/500 [00:01<00:08, 54.82it/s]
+Loading scene 0:  13%|█▎        | 66/500 [00:01<00:07, 55.20it/s]
+Loading scene 0:  14%|█▍        | 72/500 [00:01<00:07, 55.49it/s]
+Loading scene 0:  16%|█▌        | 78/500 [00:01<00:07, 55.78it/s]
+Loading scene 0:  17%|█▋        | 84/500 [00:01<00:08, 50.03it/s]
+Loading scene 0:  18%|█▊        | 90/500 [00:01<00:07, 51.30it/s]
+Loading scene 0:  19%|█▉        | 96/500 [00:01<00:07, 52.89it/s]
+Loading scene 0:  20%|██        | 102/500 [00:01<00:07, 54.12it/s]
+Loading scene 0:  22%|██▏       | 108/500 [00:02<00:07, 55.23it/s]
+Loading scene 0:  23%|██▎       | 114/500 [00:02<00:06, 55.91it/s]
+Loading scene 0:  24%|██▍       | 120/500 [00:02<00:06, 56.43it/s]
+Loading scene 0:  25%|██▌       | 126/500 [00:02<00:06, 56.78it/s]
+Loading scene 0:  26%|██▋       | 132/500 [00:02<00:06, 56.89it/s]
+Loading scene 0:  28%|██▊       | 138/500 [00:02<00:06, 55.36it/s]
+Loading scene 0:  29%|██▉       | 144/500 [00:02<00:06, 54.98it/s]
+Loading scene 0:  30%|███       | 150/500 [00:02<00:06, 55.27it/s]
+Loading scene 0:  31%|███       | 156/500 [00:02<00:06, 55.19it/s]
+Loading scene 0:  32%|███▏      | 162/500 [00:02<00:06, 55.53it/s]
+Loading scene 0:  34%|███▎      | 168/500 [00:03<00:06, 55.21it/s]
+Loading scene 0:  35%|███▍      | 174/500 [00:03<00:06, 51.65it/s]
+Loading scene 0:  36%|███▌      | 180/500 [00:03<00:06, 50.92it/s]
+Loading scene 0:  37%|███▋      | 186/500 [00:03<00:06, 52.31it/s]
+Loading scene 0:  38%|███▊      | 192/500 [00:03<00:06, 50.57it/s]
+Loading scene 0:  40%|███▉      | 198/500 [00:03<00:05, 52.19it/s]
+Loading scene 0:  41%|████      | 204/500 [00:03<00:05, 53.25it/s]
+Loading scene 0:  42%|████▏     | 210/500 [00:03<00:05, 54.17it/s]
+Loading scene 0:  43%|████▎     | 216/500 [00:04<00:05, 54.64it/s]
+Loading scene 0:  44%|████▍     | 222/500 [00:04<00:05, 55.44it/s]
+Loading scene 0:  46%|████▌     | 228/500 [00:04<00:04, 56.32it/s]
+Loading scene 0:  47%|████▋     | 234/500 [00:04<00:04, 57.05it/s]
+Loading scene 0:  48%|████▊     | 240/500 [00:04<00:04, 57.72it/s]
+Loading scene 0:  49%|████▉     | 246/500 [00:04<00:04, 58.13it/s]
+Loading scene 0:  50%|█████     | 252/500 [00:04<00:04, 58.56it/s]
+Loading scene 0:  52%|█████▏    | 258/500 [00:04<00:04, 58.19it/s]
+Loading scene 0:  53%|█████▎    | 264/500 [00:04<00:04, 58.45it/s]
+Loading scene 0:  54%|█████▍    | 270/500 [00:04<00:03, 58.70it/s]
+Loading scene 0:  55%|█████▌    | 276/500 [00:05<00:03, 58.87it/s]
+Loading scene 0:  56%|█████▋    | 282/500 [00:05<00:03, 55.94it/s]
+Loading scene 0:  58%|█████▊    | 288/500 [00:05<00:03, 54.06it/s]
+Loading scene 0:  59%|█████▉    | 294/500 [00:05<00:03, 55.22it/s]
+Loading scene 0:  60%|██████    | 300/500 [00:05<00:03, 55.92it/s]
+Loading scene 0:  61%|██████    | 306/500 [00:05<00:03, 55.93it/s]
+Loading scene 0:  62%|██████▏   | 312/500 [00:05<00:03, 55.99it/s]
+Loading scene 0:  64%|██████▎   | 318/500 [00:05<00:03, 56.04it/s]
+Loading scene 0:  65%|██████▍   | 324/500 [00:05<00:03, 56.27it/s]
+Loading scene 0:  66%|██████▌   | 330/500 [00:06<00:02, 56.84it/s]
+Loading scene 0:  67%|██████▋   | 336/500 [00:06<00:02, 57.24it/s]
+Loading scene 0:  68%|██████▊   | 342/500 [00:06<00:02, 57.50it/s]
+Loading scene 0:  70%|██████▉   | 348/500 [00:06<00:02, 57.82it/s]
+Loading scene 0:  71%|███████   | 354/500 [00:06<00:02, 57.91it/s]
+Loading scene 0:  72%|███████▏  | 360/500 [00:06<00:02, 57.99it/s]
+Loading scene 0:  73%|███████▎  | 366/500 [00:06<00:02, 57.99it/s]
+Loading scene 0:  74%|███████▍  | 372/500 [00:06<00:02, 56.07it/s]
+Loading scene 0:  76%|███████▌  | 378/500 [00:06<00:02, 56.19it/s]
+Loading scene 0:  77%|███████▋  | 384/500 [00:07<00:02, 41.17it/s]
+Loading scene 0:  78%|███████▊  | 389/500 [00:07<00:02, 40.02it/s]
+Loading scene 0:  79%|███████▉  | 395/500 [00:07<00:02, 43.71it/s]
+Loading scene 0:  80%|████████  | 401/500 [00:07<00:02, 46.55it/s]
+Loading scene 0:  81%|████████▏ | 407/500 [00:07<00:01, 48.67it/s]
+Loading scene 0:  83%|████████▎ | 413/500 [00:07<00:01, 50.23it/s]
+Loading scene 0:  84%|████████▍ | 419/500 [00:07<00:01, 51.35it/s]
+Loading scene 0:  85%|████████▌ | 425/500 [00:08<00:02, 35.77it/s]
+Loading scene 0:  86%|████████▌ | 430/500 [00:08<00:01, 37.87it/s]
+Loading scene 0:  87%|████████▋ | 436/500 [00:08<00:01, 41.65it/s]
+Loading scene 0:  88%|████████▊ | 442/500 [00:08<00:01, 44.69it/s]
+Loading scene 0:  90%|████████▉ | 448/500 [00:08<00:01, 47.44it/s]
+Loading scene 0:  91%|█████████ | 454/500 [00:08<00:00, 49.49it/s]
+Loading scene 0:  92%|█████████▏| 460/500 [00:08<00:00, 50.84it/s]
+Loading scene 0:  93%|█████████▎| 466/500 [00:08<00:00, 52.61it/s]
+Loading scene 0:  94%|█████████▍| 472/500 [00:08<00:00, 53.82it/s]
+Loading scene 0:  96%|█████████▌| 478/500 [00:09<00:00, 54.13it/s]
+Loading scene 0:  97%|█████████▋| 484/500 [00:09<00:00, 51.14it/s]
+Loading scene 0:  98%|█████████▊| 490/500 [00:09<00:00, 52.47it/s]
+Loading scene 0:  99%|█████████▉| 496/500 [00:09<00:00, 52.74it/s]
+Loading scene 0: 100%|██████████| 500/500 [00:09<00:00, 52.86it/s]
+Traceback (most recent call last):
+  File "/home/work/juhwan/monocular_depth/stream/video-stream/experiments/h1_attention_analysis.py", line 579, in <module>
+    main()
+  File "/home/work/juhwan/monocular_depth/stream/video-stream/experiments/h1_attention_analysis.py", line 528, in main
+    results = compare_clip_vs_stream_attention(
+  File "/home/ajou/miniconda/envs/vda/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/work/juhwan/monocular_depth/stream/video-stream/experiments/h1_attention_analysis.py", line 210, in compare_clip_vs_stream_attention
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+NameError: name 'cv2' is not defined
+
+ERROR conda.cli.main_run:execute(127): `conda run python experiments/h1_attention_analysis.py` failed. (See above for error)
+xFormers not available
+============================================================
+H1: Causal Attention Degeneracy Analysis
+============================================================
+Device: cuda
+Checkpoint: checkpoints/video_depth_anything_vits.pth
+Dataset: /home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json
+Save dir: experiments/results/h1_attention_analysis
+
+Loading model...
+Model loaded!
+
+Loading ScanNet data...
+
+Loading Scene 0: scene0019_00, 500 frames...
+
+============================================================
+Scene 0: Analyzing 500 frames
+============================================================
+Running Clip mode (bidirectional)...
+  Converting frames to numpy format...
+

@@ -131,7 +131,7 @@ class TemporalTransformer3DModel(nn.Module):
         n = (len(cached_hidden_state_list) // len(self.transformer_blocks)) if cached_hidden_state_list is not None else 0
 
         # ★ qkv 수집 용 컨테이너 (마지막 블록/어텐션 기준으로 OK)
-        q_export = k_export = v_export = None
+        q_export = k_export = v_export = attn_export = None
 
         for i, block in enumerate(self.transformer_blocks):
             sub_cache = cached_hidden_state_list[i*n:(i+1)*n] if n else None
@@ -144,8 +144,11 @@ class TemporalTransformer3DModel(nn.Module):
                     cached_hidden_state_list=sub_cache,
                     return_qkv=True,  # ★ 전달
                 )
-                if qkv_blk is not None:  # dict {"Q","K","V"} [B,H,T,Dh]
-                    q_export, k_export, v_export = qkv_blk["Q"], qkv_blk["K"], qkv_blk["V"]
+                if qkv_blk is not None:  # dict {"Q","K","V","attention"} [B,H,T,Dh]
+                    q_export = qkv_blk["Q"]
+                    k_export = qkv_blk["K"]
+                    v_export = qkv_blk["V"]
+                    attn_export = qkv_blk.get("attention", None)
             else:
                 hidden_states, hidden_state_list = block(
                     hidden_states,
@@ -164,7 +167,12 @@ class TemporalTransformer3DModel(nn.Module):
         output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
 
         if return_qkv:
-            return output, output_hidden_state_list, {"Q": q_export, "K": k_export, "V": v_export}
+            return output, output_hidden_state_list, {
+                "Q": q_export, 
+                "K": k_export, 
+                "V": v_export,
+                "attention": attn_export
+            }
         else:
             return output, output_hidden_state_list
 
@@ -208,7 +216,7 @@ class TemporalTransformerBlock(nn.Module):
         return_qkv: bool = False,    # ★ 추가
     ):
         output_hidden_state_list = []
-        q_export = k_export = v_export = None  # ★
+        q_export = k_export = v_export = attn_export = None  # ★
 
         for i, (attention_block, norm) in enumerate(zip(self.attention_blocks, self.norms)):
             norm_hidden_states = norm(hidden_states)
@@ -222,7 +230,10 @@ class TemporalTransformerBlock(nn.Module):
                     return_qkv=True,   # ★ 전달
                 )
                 if qkv_attn is not None:
-                    q_export, k_export, v_export = qkv_attn["Q"], qkv_attn["K"], qkv_attn["V"]
+                    q_export = qkv_attn["Q"]
+                    k_export = qkv_attn["K"]
+                    v_export = qkv_attn["V"]
+                    attn_export = qkv_attn.get("attention", None)
             else:
                 residual_hidden_states, output_hidden_states = attention_block(
                     norm_hidden_states,
@@ -240,7 +251,12 @@ class TemporalTransformerBlock(nn.Module):
         hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
 
         if return_qkv:
-            return hidden_states, output_hidden_state_list, {"Q": q_export, "K": k_export, "V": v_export}
+            return hidden_states, output_hidden_state_list, {
+                "Q": q_export, 
+                "K": k_export, 
+                "V": v_export,
+                "attention": attn_export
+            }
         else:
             return hidden_states, output_hidden_state_list
 
@@ -364,7 +380,7 @@ class TemporalAttention(CrossAttention):
         hidden_states = self.to_out[1](self.to_out[0](out))     # [B0, q, C]
         hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d).contiguous()
 
-        # ===== Q/K/V export =====
+        # ===== Q/K/V export + Attention weights =====
         qkv_export = None
         if return_qkv:
             # Q_all/K_all/V_all: (b*d, L, C) -> [B, H, L, Dh] by averaging over spatial tokens d
@@ -380,7 +396,19 @@ class TemporalAttention(CrossAttention):
             Q_export = _avg_over_tokens(Q_all)
             K_export = _avg_over_tokens(K_all)
             V_export = _avg_over_tokens(V_all)
-            qkv_export = {"Q": Q_export, "K": K_export, "V": V_export}
+            
+            # Attention weights: [B*H, q, k] -> [B, H, q, k]
+            # attn: [B0*H, q_len, k_len] where B0 = b*d
+            BxH, q_len, k_len = attn.shape
+            attn_reshaped = attn.view(B_est, d, Hh, q_len, k_len)  # [b, d, H, q, k]
+            attn_export = attn_reshaped.mean(dim=1)  # [b, H, q, k] - average over spatial tokens
+            
+            qkv_export = {
+                "Q": Q_export, 
+                "K": K_export, 
+                "V": V_export,
+                "attention": attn_export  # ★ 추가
+            }
 
         if return_qkv:
             return hidden_states, [], qkv_export

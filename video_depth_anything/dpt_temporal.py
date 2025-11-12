@@ -145,7 +145,8 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_0 = self._pool_feat_bcthw_to_btc(layer_3_out, mode=feature_pool)  # [B,T,C]
-            intermediates[0] = {"feat": feat_0, "qkv": qkv_0}
+            attn_0 = qkv_0.get("attention", None) if qkv_0 is not None else None
+            intermediates[0] = {"feat": feat_0, "qkv": qkv_0, "attention": attn_0}
 
         layer_3 = layer_3_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -170,7 +171,8 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_1 = self._pool_feat_bcthw_to_btc(layer_4_out, mode=feature_pool)
-            intermediates[1] = {"feat": feat_1, "qkv": qkv_1}
+            attn_1 = qkv_1.get("attention", None) if qkv_1 is not None else None
+            intermediates[1] = {"feat": feat_1, "qkv": qkv_1, "attention": attn_1}
 
         layer_4 = layer_4_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -203,7 +205,8 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_2 = self._pool_feat_bcthw_to_btc(path_4_out, mode=feature_pool)
-            intermediates[2] = {"feat": feat_2, "qkv": qkv_2}
+            attn_2 = qkv_2.get("attention", None) if qkv_2 is not None else None
+            intermediates[2] = {"feat": feat_2, "qkv": qkv_2, "attention": attn_2}
 
         path_4 = path_4_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 
@@ -230,7 +233,8 @@ class DPTHeadTemporal(DPTHead):
 
         if return_intermediates:
             feat_3 = self._pool_feat_bcthw_to_btc(path_3_out, mode=feature_pool)
-            intermediates[3] = {"feat": feat_3, "qkv": qkv_3}
+            attn_3 = qkv_3.get("attention", None) if qkv_3 is not None else None
+            intermediates[3] = {"feat": feat_3, "qkv": qkv_3, "attention": attn_3}
 
         path_3 = path_3_out.permute(0, 2, 1, 3, 4).flatten(0, 1)
 

@@ -25,6 +25,8 @@ if __name__ == '__main__':
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
     parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
                         help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
+    parser.add_argument('--scene_limit', type=int, default=0,
+                    help='Use only the first N scenes from the JSON. 0 disables the limit.')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -61,12 +63,16 @@ if __name__ == '__main__':
         path_json = json.load(fs)
     root_path = os.path.dirname(args.json_file)
 
+    # 장면 수 제한
+    if args.scene_limit and args.scene_limit > 0:
+        path_json = {k: v[:args.scene_limit] for k, v in path_json.items()}
+
     for dataset in args.datasets:
         json_data = path_json[dataset]
         for data in tqdm(json_data, desc=f"Streaming {dataset}"):
             for key in data.keys():
                 frames = data[key]  # 이 시퀀스의 프레임 리스트
-                
+
                 # 스트리밍 상태 리셋
                 reset_streaming_state(vda)
 

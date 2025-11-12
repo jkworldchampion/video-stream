@@ -18,6 +18,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vitl', choices=['vits', 'vitl'])
+    parser.add_argument('--scene_limit', type=int, default=0, help='Use only the first N scenes from the JSON. 0 disables the limit.')
 
     args = parser.parse_args()
    
@@ -39,6 +40,10 @@ if __name__ == '__main__':
         
         json_data = path_json[dataset]
         root_path = os.path.dirname(args.json_file)
+        # 장면 수 제한
+        if args.scene_limit and args.scene_limit > 0:
+            json_data = json_data[:args.scene_limit]
+
         for data in tqdm(json_data):
              for key in data.keys():
                 value = data[key]

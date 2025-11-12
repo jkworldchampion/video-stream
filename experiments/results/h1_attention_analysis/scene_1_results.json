@@ -1,0 +1,11 @@
+{
+  "scene_id": 1,
+  "num_frames": 500,
+  "layers": {},
+  "performance": {
+    "clip_delta1": 0.9176414608955383,
+    "stream_delta1": 0.6743994355201721,
+    "delta1_gap": 0.2432420253753662,
+    "delta1_gap_percent": 26.50730549358386
+  }
+}
