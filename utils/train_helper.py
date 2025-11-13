@@ -263,16 +263,60 @@ def _ls_align_disparity(infs, gts, valid_mask):
     """
     disparity 선형 정렬: (scale, shift)로 infs를 gts에 맞추되
     eval.py의 방식 그대로 numpy lstsq 사용.
+    수치적 안정성을 위한 예외 처리 추가.
     """
-    gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
-    infs = np.clip(infs, a_min=1e-3, a_max=None)
-    pred_disp_masked = infs[valid_mask].reshape((-1, 1)).astype(np.float64)
+    # 입력 데이터 검증 및 클리핑
+    infs = np.clip(infs, a_min=1e-3, a_max=1e6)
+    gts = np.clip(gts, a_min=1e-3, a_max=1e6)
+    
+    # NaN/Inf 체크
+    if not np.all(np.isfinite(infs)) or not np.all(np.isfinite(gts)):
+        warnings.warn("Non-finite values detected in disparity alignment, returning original predictions")
+        return infs
+    
+    # valid mask가 충분한지 확인
+    n_valid = np.sum(valid_mask)
+    if n_valid < 10:  # 최소 10개 이상의 유효 픽셀 필요
+        warnings.warn(f"Too few valid pixels ({n_valid}) for alignment, returning original predictions")
+        return infs
+    
+    try:
+        gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
+        pred_disp_masked = infs[valid_mask].reshape((-1, 1)).astype(np.float64)
+        
+        # 추가 클리핑으로 안정성 확보
+        gt_disp_masked = np.clip(gt_disp_masked, 1e-6, 1e6)
+        pred_disp_masked = np.clip(pred_disp_masked, 1e-6, 1e6)
+        
+        # NaN/Inf 재확인
+        if not np.all(np.isfinite(gt_disp_masked)) or not np.all(np.isfinite(pred_disp_masked)):
+            warnings.warn("Non-finite values in masked disparity, returning original predictions")
+            return infs
 
-    A = np.concatenate([pred_disp_masked, np.ones_like(pred_disp_masked)], axis=-1)  # [P,2]
-    X = np.linalg.lstsq(A, gt_disp_masked, rcond=None)[0]  # [2,1]
-    scale, shift = X[0, 0], X[1, 0]
-    aligned = np.clip(scale * infs + shift, a_min=1e-3, a_max=None)
-    return aligned
+        A = np.concatenate([pred_disp_masked, np.ones_like(pred_disp_masked)], axis=-1)  # [P,2]
+        
+        # rcond를 명시적으로 설정하여 안정성 향상
+        X = np.linalg.lstsq(A, gt_disp_masked, rcond=1e-6)[0]  # [2,1]
+        scale, shift = X[0, 0], X[1, 0]
+        
+        # scale/shift 유효성 검증
+        if not np.isfinite(scale) or not np.isfinite(shift):
+            warnings.warn("Non-finite scale/shift computed, returning original predictions")
+            return infs
+        
+        # 극단적인 scale 방지
+        scale = np.clip(scale, 1e-3, 1e3)
+        shift = np.clip(shift, -1e6, 1e6)
+        
+        aligned = np.clip(scale * infs + shift, a_min=1e-3, a_max=1e6)
+        return aligned
+        
+    except np.linalg.LinAlgError as e:
+        warnings.warn(f"LinAlgError in disparity alignment: {e}, returning original predictions")
+        return infs
+    except Exception as e:
+        warnings.warn(f"Unexpected error in disparity alignment: {e}, returning original predictions")
+        return infs
 
 def _dataset_eval_defaults(dataset_tag):
     """
