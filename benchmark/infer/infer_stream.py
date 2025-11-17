@@ -27,6 +27,8 @@ if __name__ == '__main__':
                         help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
     parser.add_argument('--scene_limit', type=int, default=0,
                     help='Use only the first N scenes from the JSON. 0 disables the limit.')
+    parser.add_argument('--cache_gap', type=int, default=None,
+                        help='Override streaming cache gap (default: internal setting, e.g., 41).')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -36,7 +38,7 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
 
-    vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
+    vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe, cache_gap=args.cache_gap)
     # checkpoint load
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적

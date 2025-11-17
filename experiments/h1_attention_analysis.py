@@ -19,10 +19,12 @@ H1: Causal Attention Degeneracy Analysis
 4. Performance correlation: Attn KL vs δ1
 """
 
+
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from video_depth_anything.motion_module.motion_module import TemporalAttention
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -165,7 +167,7 @@ def compare_clip_vs_stream_attention(
     scene_id: int,
     layers_to_analyze: List[int] = [0, 1, 2, 3],
     device: str = "cuda",
-    checkpoint_path: str = "checkpoints/video_depth_anything_vits.pth"
+    checkpoint_path: str = "../video_stream/checkpoints/video_depth_anything_vits.pth"
 ) -> Dict:
     """
     같은 가중치, 같은 입력에 대해 Clip vs Stream attention 비교
@@ -202,7 +204,19 @@ def compare_clip_vs_stream_attention(
     # Convert RGB to BGR for infer_video_depth (expects BGR like cv2.imread)
     print("  Converting RGB to BGR...")
     frames_bgr = np.stack([cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) for frame in video_frames], axis=0)
+
     
+    print("=============VDA model==============")
+    temporal_attn_modules = []
+    for name, module in model.named_modules():
+        if isinstance(module, TemporalAttention):
+            temporal_attn_modules.append((name, module))
+
+    print("temporalAttention modules 이름 : ")
+    for name, _ in temporal_attn_modules:
+        print("  ", name)
+
+        
     # Run inference with proper temporal alignment (like benchmark does)
     print("  Running infer_video_depth() with temporal alignment...")
     clip_depth_list, _ = model.infer_video_depth(
@@ -212,6 +226,28 @@ def compare_clip_vs_stream_attention(
         device=device, 
         fp32=True
     )
+
+    for name, m in temporal_attn_modules:
+        print(f"[{name}] attention_score:")
+        print(m.attention_score.shape)
+    
+    hola_dir = "attention_score/clip"
+    
+    for name, m in temporal_attn_modules:
+        attn = m.attention_score
+        attn_step_mean = attn.mean(dim=0)
+        attn_final_mean = attn_step_mean.mean(dim=0)
+    
+        plt.figure(figsize=(5,5))
+        plt.imshow(attn_final_mean.detach().cpu().numpy(), cmap='viridis')
+        plt.title(f"{name}", fontsize=6)
+        plt.colorbar()
+        plt.tight_layout()
+        plt.savefig(os.path.join(hola_dir,f"att_{name}.png"))
+    
+    print("hola~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    
+    #sys.exit()
     
     # Convert to tensor [1, T, H, W]
     clip_depth = torch.from_numpy(np.stack(clip_depth_list, axis=0)).unsqueeze(0)
@@ -220,12 +256,17 @@ def compare_clip_vs_stream_attention(
     # We prioritize correct depth estimation over attention analysis
     clip_attentions = {layer: [] for layer in layers_to_analyze}
     print(f"  Clip depth shape: {clip_depth.shape}")
-    
+
+
     # ===== 2. Stream mode (REAL streaming with frame-by-frame processing) =====
     print("Running Stream mode (real streaming, frame-by-frame)...")
     
     # Import streaming model
     from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthAnythingStream
+
+
+    stream_checkpoint_path = "/home/work/juhwan/monocular_depth/stream/video-stream/outputs/experiment_4/best_model.pth"
+    # stream_checkpoint_path = "/home/work/juhwan/monocular_depth/stream/video-stream/checkpoints/video_depth_anything_vits.pth"
     
     # Initialize streaming model
     model_stream = VideoDepthAnythingStream(
@@ -234,7 +275,7 @@ def compare_clip_vs_stream_attention(
         out_channels=[48, 96, 192, 384],
         num_frames=32
     )
-    model_stream.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+    model_stream.load_state_dict(torch.load(stream_checkpoint_path, map_location="cpu"), strict=False)
     model_stream = model_stream.to(device).eval()
     
     # Reset streaming state
@@ -244,6 +285,16 @@ def compare_clip_vs_stream_attention(
     model_stream.id = -1
     
     stream_outputs = []
+
+    print("=============STREAM model==============")
+    stream_temporal_attn_modules = []
+    for name, module in model_stream.named_modules():
+        if isinstance(module, TemporalAttention):
+            stream_temporal_attn_modules.append((name, module))
+
+    print("stream_temporalAttention modules 이름 : ")
+    for name, _ in stream_temporal_attn_modules:
+        print("  ", name)
     
     # Process frame by frame (REAL streaming)
     # video_frames is already [T, H, W, 3] uint8 RGB (infer_video_depth_one expects RGB)
@@ -262,6 +313,33 @@ def compare_clip_vs_stream_attention(
         
         # Note: Streaming model attention extraction is complex
         # We skip attention analysis for stream mode (focus on performance gap)
+
+    for name, m in stream_temporal_attn_modules:
+        print(f"[{name}] attention_score:")
+        print(m.attention_score.shape)
+    
+    streamhola_dir = "attention_score/stream_vda"
+        
+    for name, m in stream_temporal_attn_modules:
+        attn = m.attention_score 
+        attn_mean = attn.mean(dim=(0, 1,2))  
+        attn_img = attn_mean.detach().cpu().numpy()[None, :]
+    
+        plt.figure(figsize=(5, 2))
+        plt.imshow(attn_img, aspect="auto", cmap='viridis')
+        plt.yticks([]) 
+        plt.xlabel("key index (cache + current)")
+        plt.title(f"{name}", fontsize=8)
+        plt.colorbar()
+        plt.tight_layout()
+        plt.savefig(os.path.join(streamhola_dir, f"att_{name}.png"))
+        plt.close()
+    
+    print("hola~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    
+    sys.exit()
+
+
     
     # ===== 3. Performance 계산 (scale-shift alignment) =====
     print("Computing performance metrics...")
@@ -444,7 +522,7 @@ def main():
     
     # Config
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpoint_path = "checkpoints/video_depth_anything_vits.pth"
+    checkpoint_path = "/home/work/juhwan/monocular_depth/stream/video-stream/checkpoints/video_depth_anything_vits.pth"
     scannet_json = "/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
     
     save_dir = Path("experiments/results/h1_attention_analysis")

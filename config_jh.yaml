@@ -39,7 +39,7 @@ kd_aux:
   
   # KD Loss weights (Minimal KD: Attention Relation Only)
   # DIS (feature similarity) 및 APC (future prediction) 제거 완료
-  beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치
+  beta: 0.0000  # L_KLD (Attention Relation KL divergence) 가중치
   lambda_kd: 1.0  # 전체 KD loss 가중치 (최종 loss에 곱해짐)
   
   # KD Sliding Window Configuration

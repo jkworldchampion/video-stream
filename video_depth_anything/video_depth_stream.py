@@ -18,6 +18,7 @@ from torchvision.transforms import Compose
 import cv2
 import numpy as np
 import copy
+from typing import Optional
 
 from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
@@ -38,6 +39,7 @@ class VideoDepthAnything(nn.Module):
         use_clstoken=False,
         num_frames=32,
         pe='ape',
+    cache_gap: Optional[int] = None,
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -59,8 +61,21 @@ class VideoDepthAnything(nn.Module):
         self.transform = None
         self.frame_id_list = []
         self.frame_cache_list = []  # 모션 모듈 4곳 캐시 리스트(기존 포맷 유지)
-        self.gap = (INFER_LEN - OVERLAP) * 2 - 1 - (OVERLAP - INTERP_LEN)
-        assert self.gap == 41
+
+        default_gap = (INFER_LEN - OVERLAP) * 2 - 1 - (OVERLAP - INTERP_LEN)
+        if cache_gap is None:
+            self.gap = default_gap
+        else:
+            if cache_gap <= 0:
+                raise ValueError(f"cache_gap must be positive, got {cache_gap}")
+            self.gap = int(cache_gap)
+        if cache_gap is None:
+            assert self.gap == 41
+        
+        # 초기화 시 cache gap 설정 출력
+        print(f"[VideoDepthAnything Init] cache_gap={self.gap} (default={default_gap}, override={'None' if cache_gap is None else cache_gap})")
+
+        self._cache_debug_logged = False
         self.id = -1
 
     # ----------- public / core -----------
@@ -181,6 +196,10 @@ class VideoDepthAnything(nn.Module):
             self.frame_cache_list = [copy.deepcopy(cached_hidden_state_list) for _ in range(INFER_LEN)]
             self.frame_id_list.extend([0] * (INFER_LEN - 1))
 
+            if not self._cache_debug_logged:
+                cache_lengths = [len(h) if isinstance(h, (list, tuple)) else 0 for h in self.frame_cache_list]
+                print(f"[StreamCacheDebug] init gap={self.gap}, cache_len={len(self.frame_cache_list)}, per_layer={cache_lengths[0] if cache_lengths else 'n/a'}")
+
             new_depth = depth[0][0].cpu().numpy()
         else:
             frame_height, frame_width = frame.shape[:2]
@@ -236,6 +255,11 @@ class VideoDepthAnything(nn.Module):
             depth_list = [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
             new_depth = depth_list[-1]
 
+            if not self._cache_debug_logged:
+                concat_sizes = [t.shape[1] for t in per_layer] if cur_cache is not None else []
+                print(f"[StreamCacheDebug] frame_id={self.id}, gap={self.gap}, total_cache_list_len={len(self.frame_cache_list)}, cur_list_window={len(cur_list)}, concat_temporal_sizes={concat_sizes}")
+                self._cache_debug_logged = True
+
             # --- 캐시 push (불량 캐시는 마지막 정상값으로 보정) ---
             if new_cache is None or (isinstance(new_cache, (list, tuple)) and any(t is None for t in new_cache)):
                 # 마지막 캐시가 존재하면 복제, 아니면 그냥 현재 new_cache(=None) 넣지 않음
@@ -248,10 +272,13 @@ class VideoDepthAnything(nn.Module):
 
         # adjust the sliding window
         self.frame_id_list.append(self.id)
+        trim_before = len(self.frame_cache_list)
         if self.id + INFER_LEN > self.gap + 1:
             if len(self.frame_id_list) > 1:
                 del self.frame_id_list[1]
             if len(self.frame_cache_list) > 1:
                 del self.frame_cache_list[1]
+            if self.id < 50:  # 처음 50 프레임만 출력 (디버깅용)
+                print(f"[StreamCacheDebug] frame_id={self.id}, trim_triggered: gap={self.gap}, cache_len: {trim_before} -> {len(self.frame_cache_list)}")
 
         return new_depth
