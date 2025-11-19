@@ -38,6 +38,7 @@ class VideoDepthAnything(nn.Module):
         use_clstoken=False,
         num_frames=32,
         pe='ape',
+        stream_cache_len: int | None = 31,  # streaming 캐시 길이 (기본 31)
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -46,7 +47,7 @@ class VideoDepthAnything(nn.Module):
             "vitb": [2, 5, 8, 11],
             'vitl': [4, 11, 17, 23]
         }
-        
+
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
@@ -55,13 +56,15 @@ class VideoDepthAnything(nn.Module):
             out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe
         )
 
-        # --- 스트리밍 관련 런타임 상태 ---
-        self.transform = None
-        self.frame_id_list = []
-        self.frame_cache_list = []  # 모션 모듈 4곳 캐시 리스트(기존 포맷 유지)
-        self.gap = (INFER_LEN - OVERLAP) * 2 - 1 - (OVERLAP - INTERP_LEN)
-        assert self.gap == 41
-        self.id = -1
+        if stream_cache_len is not None:
+            stream_cache_len = INFER_LEN - 1
+        assert stream_cache_len >= 3, "stream_cache_len must be at least 3"
+        self.stream_cache_len = int(stream_cache_len)
+        self.max_cache_keep = self.stream_cache_len
+
+        self.transform = None  # 첫 프레임에 초기화
+        self.frame_cache_list = []  # 프레임별 캐시 저장
+        self.id = -1  # 프레임 인덱스
 
     # ----------- public / core -----------
     def forward(
@@ -177,9 +180,11 @@ class VideoDepthAnything(nn.Module):
             depth = depth.to(cur_input.dtype)
             depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
 
-            # 초기 캐시 복제(윈도우 시뮬레이션)
-            self.frame_cache_list = [copy.deepcopy(cached_hidden_state_list) for _ in range(INFER_LEN)]
-            self.frame_id_list.extend([0] * (INFER_LEN - 1))
+            # initialize the frame cache list
+            self.frame_cache_list = [
+                copy.deepcopy(cached_hidden_state_list)
+                for _ in range(self.max_cache_keep)
+            ]
 
             new_depth = depth[0][0].cpu().numpy()
         else:
@@ -196,9 +201,15 @@ class VideoDepthAnything(nn.Module):
 
             # 과거 캐시 묶기 (기존 포맷 그대로 유지)
             # --- 기존 캐시 윈도우 구성 ---
-            cur_list = self.frame_cache_list[0:2] + self.frame_cache_list[-INFER_LEN + 3:]
-            # 기대 길이 확인
-            assert len(cur_list) == INFER_LEN - 1, f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
+            assert len(self.frame_cache_list) >= self.stream_cache_len, \
+                f"frame_cache_list 길이({len(self.frame_cache_list)})가 stream_cache_len({self.stream_cache_len})보다 작습니다."
+
+            num_recent = self.stream_cache_len - 2
+            recent_list = self.frame_cache_list[-num_recent:] if num_recent > 0 else []
+
+            cur_list = self.frame_cache_list[0:2] + recent_list
+            assert len(cur_list) == self.stream_cache_len, \
+                f"cur_list 길이({len(cur_list)})가 stream_cache_len({self.stream_cache_len})과 다릅니다."
 
             # --- 안전한 캐시 병합 (None 방지) ---
             def _valid_frame_cache(fc):
@@ -246,12 +257,12 @@ class VideoDepthAnything(nn.Module):
             else:
                 self.frame_cache_list.append(new_cache)
 
-        # adjust the sliding window
-        self.frame_id_list.append(self.id)
-        if self.id + INFER_LEN > self.gap + 1:
-            if len(self.frame_id_list) > 1:
-                del self.frame_id_list[1]
-            if len(self.frame_cache_list) > 1:
-                del self.frame_cache_list[1]
+        while len(self.frame_cache_list) > self.max_cache_keep:
+            # 2번 인덱스가 "가장 오래된 recent frame"이 되도록 관리
+            if len(self.frame_cache_list) > 2:
+                del self.frame_cache_list[2]
+            else:
+                # anchor만 남은 비정상 케이스 보호
+                break
 
         return new_depth
