@@ -85,6 +85,11 @@ def eval_depthcrafter(infer_paths, depth_gt_paths, factors, args):
         infer = get_infer(infer_paths[i], args, target_size=depth_gt.shape)
         gts.append(depth_gt)
         infs.append(infer)
+
+    # ★ 추가: 유효한 프레임이 하나도 없으면 None 리턴 → 상위에서 건너뜀
+    if len(gts) == 0:
+        return None
+
     gts = np.stack(gts, axis=0)
     
     infs = np.stack(infs, axis=0)
@@ -287,8 +292,13 @@ def main():
                 depth_gt_paths = depth_gt_paths[:args.max_eval_len]
                 factors = factors[:args.max_eval_len]
                 results_single = eval_depthcrafter(infer_paths, depth_gt_paths, factors, args)
+
+                # ★ 추가: 이 시퀀스는 평가할 프레임이 없으면 스킵
+                if results_single is None:
+                    continue
+
                 results_all.append(results_single)
-                
+
                 # --- wandb: 시퀀스별 로그 (최소 추가) ---
                 if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
                     log_dict = {

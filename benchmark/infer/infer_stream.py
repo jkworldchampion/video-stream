@@ -12,7 +12,7 @@ def reset_streaming_state(model):
     """스트리밍 상태를 초기화합니다."""
     model.transform = None
     model.frame_cache_list = []
-    model.frame_id_list = []
+    # model.frame_id_list = []
     model.id = -1
 
 if __name__ == '__main__':
@@ -26,7 +26,9 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
                         help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
     parser.add_argument('--scene_limit', type=int, default=0,
-                    help='Use only the first N scenes from the JSON. 0 disables the limit.')
+                        help='Use only the first N scenes from the JSON. 0 disables the limit.')
+    parser.add_argument('--stream_cache_len', type=int, default=31,
+                        help='Streaming cache length n (0,1 anchor + n-2 recent frames). None → default (31).')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -36,11 +38,14 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
 
-    vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
+    vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe, stream_cache_len=args.stream_cache_len)
     # checkpoint load
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
     
+    # debug
+    print(f"[DEBUG] stream_cache_len from args = {args.stream_cache_len}, model.stream_cache_len = {vda.stream_cache_len}")
+
     # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거
     from collections import OrderedDict
     clean_state = OrderedDict()
