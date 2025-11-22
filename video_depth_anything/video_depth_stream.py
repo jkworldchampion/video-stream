@@ -56,10 +56,12 @@ class VideoDepthAnything(nn.Module):
             out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe
         )
 
-        if stream_cache_len is not None:
+        if stream_cache_len is None:
             stream_cache_len = INFER_LEN - 1
+        else:
+            stream_cache_len = int(stream_cache_len)
         assert stream_cache_len >= 3, "stream_cache_len must be at least 3"
-        self.stream_cache_len = int(stream_cache_len)
+        self.stream_cache_len = stream_cache_len
         self.max_cache_keep = self.stream_cache_len
 
         self.transform = None  # 첫 프레임에 초기화
