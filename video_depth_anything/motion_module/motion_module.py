@@ -385,6 +385,6 @@ class TemporalAttention(CrossAttention):
             qkv_export = {"Q": Q_export, "K": K_export, "V": V_export}
 
         if return_qkv:
-            return hidden_states, input_hidden_states, qkv_export
+            return hidden_states, [], qkv_export
         else:
-            return hidden_states, input_hidden_states
+            return hidden_states, []

@@ -33,7 +33,17 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 10
+# Load experiment id from config_jh.yaml (fallback to 1)
+experiment = 0
+try:
+    with open("config_jh.yaml", "r") as _cf:
+        _cfg_tmp = yaml.safe_load(_cf)
+        if isinstance(_cfg_tmp, dict) and "experiment" in _cfg_tmp:
+            experiment = int(_cfg_tmp.get("experiment", experiment))
+except Exception:
+    # keep default if config missing or malformed
+    pass
+
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +81,7 @@ def train(args):
     lr         = hyper_params["learning_rate"]
     ratio_ssi  = hyper_params["ratio_ssi"]          # Depth(SSI)
     ratio_tgm  = hyper_params["ratio_tgm"]          # Depth(TGM)
+    ratio_sem = float(hyper_params.get("ratio_sem", 0.0))  # Segmentation
     num_epochs = hyper_params["epochs"]             # e.g., 25
     batch_size = hyper_params["batch_size"]
     CLIP_LEN   = hyper_params["clip_len"]           # W=32
@@ -189,6 +200,11 @@ def train(args):
     # Loss
     loss_tgm = LossTGMVector(diff_depth_th=0.05)
     loss_ssi = Loss_ssi_basic()
+    loss_sem = SemanticGuidedSmoothLoss(   # 새 semantic-guided smooth loss
+        tau=1.0,
+        dead_band=0.02,
+        max_penalty=0.5,
+    )
     scaler = GradScaler()
 
     # ----- Resume (optional) -----
@@ -385,7 +401,7 @@ def train(args):
         student.train()
         aux_blocks.train()
         epoch_loss = epoch_frames = 0.0
-        epoch_ssi = epoch_tgm = 0.0
+        epoch_ssi = epoch_tgm = epoch_sem = 0.0
 
         # KD 누적(스텝 평균용) - DIS, APC 제거
         epoch_kd_total = 0.0
@@ -408,6 +424,7 @@ def train(args):
             cache = None
             prev_pred_raw = prev_mask = prev_y = None
             kd_executed = False
+            prev_sem_feat = None   # semantic-guided smooth 위해 이전 프레임 feature 저장
             layer_buffers = {
                 int(li): {
                     # r 제거 (APC에서만 사용)
@@ -430,6 +447,7 @@ def train(args):
                     # pred_t_raw, cache = model_stream_step(student, x_t, cache)
                     pred_t_raw, cache, inter_t, student_enc_feats = model_stream_step(
                         student, x_t, cache,
+                        # student, x_t, None,
                         collect_inter=True,        # ← 내부 temporal features(intermediates)를 inter_t로 반환
                         collect_qkv=False,         # Q/K/V는 AuxBlock에서 생성
                         feature_pool='mean',       # mean pooling
@@ -476,6 +494,16 @@ def train(args):
                                 "qkv": qkv_t,
                             }
 
+                    # --- Semantic feature (for semantic-guided smooth loss) ---
+                    sem_feat_curr = None
+                    if inter_t is not None:
+                        SEM_LAYER_ID = 2   # path_4 temporal (intermediates[2])를 semantic anchor로 사용
+                        info_sem = inter_t.get(SEM_LAYER_ID)
+                        if info_sem is not None:
+                            sem_feat_curr = info_sem.get("feat_one")   # [B,1,C]
+                            if sem_feat_curr is not None and sem_feat_curr.dim() == 3 and sem_feat_curr.size(1) == 1:
+                                sem_feat_curr = sem_feat_curr[:, 0, :]  # [B,C]로 변환
+
                     # ----- Scale-Shift & Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
                     if pred_t_raw.shape[0] != gt_disp_t.shape[0]:
@@ -501,6 +529,24 @@ def train(args):
                         tgm_loss  = loss_tgm(pred_pair, y_pair, m_pair.squeeze(2))
                     else:
                         tgm_loss  = pred_t_raw.new_tensor(0.0)
+                    
+                    # ----- Semantic-guided temporal smoothness Loss -----
+                    if t > 0 and sem_feat_curr is not None and prev_sem_feat is not None:
+                        # depth pair는 TGM에서 만든 걸 그대로 사용
+                        # pred_pair: [B,2,H,W], m_pair: [B,2,1,H,W]
+                        depth_pair = pred_pair                        # [B,2,H,W]
+                        mask_pair  = m_pair.squeeze(2)                # [B,2,H,W]
+
+                        # semantic feature pair: [B,2,C]
+                        feat_pair = torch.stack(
+                            [prev_sem_feat.detach(), sem_feat_curr.detach()],
+                            dim=1
+                        )  # [B,2,C], feature는 gradient 막고 depth만 업데이트
+
+                        sem_loss_t = loss_sem(feat_pair, depth_pair, mask_pair)
+                    else:
+                        sem_loss_t = pred_t_raw.new_tensor(0.0)
+
 
                     # ----- Sliding Teacher KD at frame t -----
                     L_kd_t = pred_t_raw.new_tensor(0.0)
@@ -616,7 +662,12 @@ def train(args):
                         # print(f"  [KD @ frame {t}] L_KLD={kd_terms_step['kld']:.4f}  →  L_KD={L_kd_t.item():.4f}")
 
                     # ---- 최종 loss (KD 꺼져 있어도 depth 손실은 유지!)
-                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * L_kd_t if kd_enabled else 0.0)
+                    loss = (
+                        ratio_ssi * ssi_loss_t +
+                        ratio_tgm * tgm_loss +
+                        ratio_sem * sem_loss_t +
+                        (kd_lambda * L_kd_t if kd_enabled else 0.0)
+                    )
 
                 # 누적/업데이트
                 accum_loss += loss / update_frequency
@@ -636,12 +687,14 @@ def train(args):
                 prev_pred_raw = pred_t_raw.detach()
                 prev_mask = mask_t
                 prev_y    = y[:, t:t+1]
+                prev_sem_feat = sem_feat_curr.detach() if sem_feat_curr is not None else prev_sem_feat
 
                 # 통계
                 B_eff = pred_t_raw.shape[0]
                 epoch_frames += B_eff
                 epoch_ssi    += ssi_loss_t.item() * B_eff
                 epoch_tgm    += tgm_loss.item()  * B_eff
+                epoch_sem    += sem_loss_t.item() * B_eff
 
                 # KD가 실제 실행된 스텝만 에폭 누적
                 if kd_executed:
@@ -652,6 +705,7 @@ def train(args):
                 frame_pbar.set_postfix({
                     'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
                     'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
+                    'wSEM': f'{epoch_sem / max(1, epoch_frames) * ratio_sem:.4f}',
                     'wkld': f'{(epoch_kd_kld / max(1, kd_steps) * kd_beta):.4e}' if kd_enabled else '0.0000',
                 })
             frame_pbar.close()
@@ -699,6 +753,7 @@ def train(args):
             "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
             "train/ssi":  epoch_ssi  / max(1, epoch_frames),
             "train/tgm":  epoch_tgm  / max(1, epoch_frames),
+            "train/sem":  epoch_sem  / max(1, epoch_frames),
 
             # KD는 스텝 평균 (Ablation)
             "train/kd_total": (epoch_kd_total / max(1, kd_steps)) if kd_enabled else 0.0,

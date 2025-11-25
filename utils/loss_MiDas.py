@@ -216,95 +216,292 @@ class Loss_ssi(nn.Module):
 
 
 
+# class LossTGMVector(nn.Module):
+#     """
+#     pred_disp : [B, T, H, W]  predicted disparity
+#     gt_depth  : [B, T, H, W]  ground-truth depth (m)
+#     mask      : [B, T, H, W]  valid mask (bool)
+#     """
+#     def __init__(self, diff_depth_th=0.05, trim_ratio=0.2, eps=1e-6):
+#         super().__init__()
+#         self.diff_depth_th  = diff_depth_th
+#         self.trim_ratio = trim_ratio
+#         self.eps        = eps
+
+#     def forward(self, pred_disp, gt_depth, mask):
+#         # remove channel=1 dimension if present
+#         if pred_disp.dim() == 5 and pred_disp.size(2) == 1:
+#             pred_disp = pred_disp.squeeze(2)   # [B,T,H,W]
+#         if gt_depth.dim() == 5 and gt_depth.size(2) == 1:
+#             gt_depth = gt_depth.squeeze(2)
+#         if mask.dim() == 5 and mask.size(2) == 1:
+#             mask = mask.squeeze(2)
+        
+#         B, T, H, W = pred_disp.shape
+#         if T < 2:
+#             return torch.tensor(0., device=pred_disp.device)
+
+#         # 1) raw pred disparity & gt disparity
+#         raw_pred_disp = pred_disp.clamp(min=self.eps)               # [B,T,H,W]
+#         gt_disp       = 1.0 / gt_depth.clamp(min=self.eps)         # [B,T,H,W]
+
+#         # 2) batch-wise scale & shift in disparity domain
+#         P = T * H * W
+#         raw_flat = raw_pred_disp.view(B, -1)                       # [B, P]
+#         gt_flat  = gt_disp.view(B, -1)                             # [B, P]
+#         m_flat   = mask.view(B, -1).float()                        # [B, P]
+
+#         count    = m_flat.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
+#         mean_raw = (raw_flat * m_flat).sum(dim=1, keepdim=True) / count
+#         mean_gt  = (gt_flat  * m_flat).sum(dim=1, keepdim=True) / count
+
+#         d_c = (raw_flat - mean_raw) * m_flat                       # [B, P]
+#         g_c = (gt_flat  - mean_gt ) * m_flat
+
+#         cov = (d_c * g_c).sum(dim=1, keepdim=True)                 # [B,1]
+#         var = (d_c * d_c).sum(dim=1, keepdim=True).clamp_min(self.eps)
+
+#         s = cov / var                                              # [B,1]
+#         t = mean_gt - s * mean_raw                                 # [B,1]
+
+#         aligned_flat      = raw_flat * s + t                       # [B, P]
+#         aligned_pred_disp = aligned_flat.view(B, T, H, W)          # [B, T, H, W]
+
+#         # 3) disparity differences
+#         d_diff = (aligned_pred_disp[:,1:] - aligned_pred_disp[:,:-1]).abs()  # [B,T-1,H,W]
+#         g_diff = (gt_disp[:,1:]            - gt_disp[:,:-1]).abs()           # [B,T-1,H,W]
+
+#         # 4) static & valid mask
+#         valid_pair = mask[:,1:] & mask[:,:-1]                     # [B,T-1,H,W]
+#         # depth_diff  = (gt_depth[:,1:] - gt_depth[:,:-1]).abs()    # [B,T-1,H,W]
+#         # static      = valid_pair & (depth_diff < self.static_th)   # [B,T-1,H,W]
+#         ## 저자의 방식을 빌려 disparity의 max-min에 th 곱해서 사용
+#         min_d = torch.where(mask, gt_disp, torch.inf).amin(dim=(1,2,3))
+#         max_d = torch.where(mask, gt_disp, -torch.inf).amax(dim=(1,2,3))
+#         target_th = ((max_d - min_d) * self.diff_depth_th).view(-1, 1, 1, 1)  # [B,1,1,1]
+#         static = valid_pair & (g_diff < target_th)
+
+#         # 5) error map
+#         err = (d_diff - g_diff).abs()                             # [B,T-1,H,W]
+
+#         # 6) flatten to [N, Q]
+#         N = B * (T-1)
+#         Q = H * W
+#         err2    = err.view(N, Q)
+#         static2 = static.view(N, Q)
+
+#         # mask non-static as NaN for quantile
+#         err2_nan = err2.masked_fill(~static2, float('nan'))
+
+#         # 7) threshold per frame
+#         thresh = torch.nanquantile(err2_nan, 1 - self.trim_ratio, dim=1)  # [N]
+
+#         # 8) keep under threshold
+#         keep = static2 & (err2 <= thresh.unsqueeze(1))           # [N,Q]
+
+#         # 9) trimmed MAE per frame
+#         sum_err      = (err2 * keep).sum(dim=1)                  # [N]
+#         count_pixels = keep.sum(dim=1).clamp_min(1.0)            # [N]
+#         loss_frame   = sum_err / count_pixels                    # [N]
+
+#         # 10) final mean
+#         loss_tgm = loss_frame.mean()
+#         # print("TGM Loss per batch:", loss_tgm.item())
+#         return loss_tgm
+
 class LossTGMVector(nn.Module):
     """
-    pred_disp : [B, T, H, W]  predicted disparity
-    gt_depth  : [B, T, H, W]  ground-truth depth (m)
-    mask      : [B, T, H, W]  valid mask (bool)
+    pred_depth : [B, T, H, W]  predicted depth (m)
+    gt_depth   : [B, T, H, W]  ground-truth depth (m)
+    mask       : [B, T, H, W]  valid mask (bool)
     """
     def __init__(self, diff_depth_th=0.05, trim_ratio=0.2, eps=1e-6):
         super().__init__()
         self.diff_depth_th  = diff_depth_th
-        self.trim_ratio = trim_ratio
-        self.eps        = eps
+        self.trim_ratio     = trim_ratio
+        self.eps            = eps
 
-    def forward(self, pred_disp, gt_depth, mask):
-        # remove channel=1 dimension if present
-        if pred_disp.dim() == 5 and pred_disp.size(2) == 1:
-            pred_disp = pred_disp.squeeze(2)   # [B,T,H,W]
+    def forward(self, pred_depth, gt_depth, mask):
+        # ----- 0) 채널 차원(=1) 있으면 제거 -----
+        if pred_depth.dim() == 5 and pred_depth.size(2) == 1:
+            pred_depth = pred_depth.squeeze(2)   # [B,T,H,W]
         if gt_depth.dim() == 5 and gt_depth.size(2) == 1:
             gt_depth = gt_depth.squeeze(2)
         if mask.dim() == 5 and mask.size(2) == 1:
             mask = mask.squeeze(2)
         
-        B, T, H, W = pred_disp.shape
+        B, T, H, W = pred_depth.shape
         if T < 2:
-            return torch.tensor(0., device=pred_disp.device)
+            # pred_depth와 동일 device/type으로 0 반환
+            return pred_depth.new_tensor(0.0)
 
-        # 1) raw pred disparity & gt disparity
-        raw_pred_disp = pred_disp.clamp(min=self.eps)               # [B,T,H,W]
-        gt_disp       = 1.0 / gt_depth.clamp(min=self.eps)         # [B,T,H,W]
+        # ================================
+        # 1) depth → disparity 변환
+        # ================================
+        pred_depth_clamped = pred_depth.clamp(min=self.eps)   # [B,T,H,W]
+        gt_depth_clamped   = gt_depth.clamp(min=self.eps)     # [B,T,H,W]
 
-        # 2) batch-wise scale & shift in disparity domain
+        raw_pred_disp = 1.0 / pred_depth_clamped              # [B,T,H,W]
+        gt_disp       = 1.0 / gt_depth_clamped                # [B,T,H,W]
+
+        # ================================
+        # 2) batch-wise scale & shift (disparity domain)
+        # ================================
         P = T * H * W
-        raw_flat = raw_pred_disp.view(B, -1)                       # [B, P]
-        gt_flat  = gt_disp.view(B, -1)                             # [B, P]
-        m_flat   = mask.view(B, -1).float()                        # [B, P]
+        raw_flat = raw_pred_disp.view(B, -1)                  # [B, P]
+        gt_flat  = gt_disp.view(B, -1)                        # [B, P]
+        m_flat   = mask.view(B, -1).float()                   # [B, P]
 
         count    = m_flat.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
         mean_raw = (raw_flat * m_flat).sum(dim=1, keepdim=True) / count
         mean_gt  = (gt_flat  * m_flat).sum(dim=1, keepdim=True) / count
 
-        d_c = (raw_flat - mean_raw) * m_flat                       # [B, P]
+        d_c = (raw_flat - mean_raw) * m_flat                  # [B, P]
         g_c = (gt_flat  - mean_gt ) * m_flat
 
-        cov = (d_c * g_c).sum(dim=1, keepdim=True)                 # [B,1]
+        cov = (d_c * g_c).sum(dim=1, keepdim=True)            # [B,1]
         var = (d_c * d_c).sum(dim=1, keepdim=True).clamp_min(self.eps)
 
-        s = cov / var                                              # [B,1]
-        t = mean_gt - s * mean_raw                                 # [B,1]
+        s = cov / var                                         # [B,1]
+        t = mean_gt - s * mean_raw                            # [B,1]
 
-        aligned_flat      = raw_flat * s + t                       # [B, P]
-        aligned_pred_disp = aligned_flat.view(B, T, H, W)          # [B, T, H, W]
+        aligned_flat      = raw_flat * s + t                  # [B, P]
+        aligned_pred_disp = aligned_flat.view(B, T, H, W)     # [B, T, H, W]
 
-        # 3) disparity differences
+        # ================================
+        # 3) temporal disparity diff
+        # ================================
         d_diff = (aligned_pred_disp[:,1:] - aligned_pred_disp[:,:-1]).abs()  # [B,T-1,H,W]
         g_diff = (gt_disp[:,1:]            - gt_disp[:,:-1]).abs()           # [B,T-1,H,W]
 
-        # 4) static & valid mask
-        valid_pair = mask[:,1:] & mask[:,:-1]                     # [B,T-1,H,W]
-        # depth_diff  = (gt_depth[:,1:] - gt_depth[:,:-1]).abs()    # [B,T-1,H,W]
-        # static      = valid_pair & (depth_diff < self.static_th)   # [B,T-1,H,W]
-        ## 저자의 방식을 빌려 disparity의 max-min에 th 곱해서 사용
-        min_d = torch.where(mask, gt_disp, torch.inf).amin(dim=(1,2,3))
-        max_d = torch.where(mask, gt_disp, -torch.inf).amax(dim=(1,2,3))
+        # ================================
+        # 4) static & valid mask (GT 기반)
+        # ================================
+        valid_pair = mask[:,1:] & mask[:,:-1]                 # [B,T-1,H,W]
+
+        # 저자 방식: scene별 disparity range 기반 threshold
+        min_d = torch.where(mask, gt_disp, torch.inf).amin(dim=(1,2,3))   # [B]
+        max_d = torch.where(mask, gt_disp, -torch.inf).amax(dim=(1,2,3))  # [B]
         target_th = ((max_d - min_d) * self.diff_depth_th).view(-1, 1, 1, 1)  # [B,1,1,1]
-        static = valid_pair & (g_diff < target_th)
 
+        static = valid_pair & (g_diff < target_th)            # [B,T-1,H,W]
+
+        # ================================
         # 5) error map
-        err = (d_diff - g_diff).abs()                             # [B,T-1,H,W]
+        # ================================
+        err = (d_diff - g_diff).abs()                         # [B,T-1,H,W]
 
+        # ================================
         # 6) flatten to [N, Q]
+        # ================================
         N = B * (T-1)
         Q = H * W
-        err2    = err.view(N, Q)
-        static2 = static.view(N, Q)
+        err2    = err.view(N, Q)                              # [N,Q]
+        static2 = static.view(N, Q)                           # [N,Q]
 
-        # mask non-static as NaN for quantile
+        # non-static은 NaN으로 채워 quantile에서 자동 제외
         err2_nan = err2.masked_fill(~static2, float('nan'))
 
-        # 7) threshold per frame
+        # ================================
+        # 7) per-frame trimmed quantile
+        # ================================
         thresh = torch.nanquantile(err2_nan, 1 - self.trim_ratio, dim=1)  # [N]
 
+        # ================================
         # 8) keep under threshold
-        keep = static2 & (err2 <= thresh.unsqueeze(1))           # [N,Q]
+        # ================================
+        keep = static2 & (err2 <= thresh.unsqueeze(1))        # [N,Q]
 
+        # ================================
         # 9) trimmed MAE per frame
-        sum_err      = (err2 * keep).sum(dim=1)                  # [N]
-        count_pixels = keep.sum(dim=1).clamp_min(1.0)            # [N]
-        loss_frame   = sum_err / count_pixels                    # [N]
+        # ================================
+        sum_err      = (err2 * keep).sum(dim=1)               # [N]
+        count_pixels = keep.sum(dim=1).clamp_min(1.0)         # [N]
+        loss_frame   = sum_err / count_pixels                 # [N]
 
+        # ================================
         # 10) final mean
+        # ================================
         loss_tgm = loss_frame.mean()
-        # print("TGM Loss per batch:", loss_tgm.item())
         return loss_tgm
+
+class SemanticGuidedSmoothLoss(nn.Module):
+    """
+    Semantic-guided temporal smoothness
+
+    - feat_pair : [B, 2, C]   (prev_sem_feat, curr_sem_feat)  — 보통 DPT temporal의 path_4 / path_3 pooled feature
+    - depth_pair: [B, 2, H, W] (prev_depth, curr_depth)
+    - mask_pair : [B, 2, H, W] or [B, 2, 1, H, W]
+
+    아이디어:
+      - frame semantic feature 차이가 작으면 (장면/객체 비슷) → depth 변화가 flicker처럼 튀는 걸 강하게 제어
+      - semantic 차이가 크면 (카메라 큰 이동, 장면 전환) → smooth 제약을 느슨하게
+    """
+    def __init__(self,
+                 tau: float = 1.0,
+                 dead_band: float = 0.02,
+                 max_penalty: float = 0.5):
+        super().__init__()
+        self.tau = tau
+        self.dead_band = dead_band
+        self.max_penalty = max_penalty
+
+    def forward(self, feat_pair, depth_pair, mask_pair):
+        """
+        feat_pair : [B, 2, C]
+        depth_pair: [B, 2, H, W]
+        mask_pair : [B, 2, H, W] or [B, 2, 1, H, W]
+        """
+        # --- 정리 ---
+        if mask_pair.dim() == 5:
+            # [B,2,1,H,W] -> [B,2,H,W]
+            mask_pair = mask_pair.squeeze(2)
+
+        B, two, H, W = depth_pair.shape
+        assert two == 2, "depth_pair는 [B,2,H,W] 이어야 합니다."
+        assert feat_pair.shape[1] == 2, "feat_pair는 [B,2,C] 이어야 합니다."
+
+        d_prev = depth_pair[:, 0]  # [B,H,W]
+        d_curr = depth_pair[:, 1]  # [B,H,W]
+
+        m_prev = mask_pair[:, 0]   # [B,H,W]
+        m_curr = mask_pair[:, 1]   # [B,H,W]
+        valid = (m_prev > 0.5) & (m_curr > 0.5)   # [B,H,W]
+
+        # --- 1) semantic distance (frame-level) ---
+        f_prev = feat_pair[:, 0]   # [B,C]
+        f_curr = feat_pair[:, 1]   # [B,C]
+
+        # L2 distance per frame, normalized by sqrt(C)
+        C = f_prev.shape[-1]
+        diff = f_curr - f_prev
+        sem_dist = torch.norm(diff, dim=-1) / (C ** 0.5)   # [B]
+
+        # weight: semantics 비슷할수록 1에 가깝게, 다르면 0에 가깝게
+        # w = exp(-dist / tau)
+        w = torch.exp(- sem_dist / max(self.tau, 1e-6))    # [B]
+        w = w.clamp(min=0.0)                               # 안전용
+        # [B,1]로 reshape 해서 나중에 곱해줌
+        w_b = w.view(B, 1)
+
+        # --- 2) depth flicker term (semantic gating) ---
+        delta = d_curr - d_prev            # [B,H,W]
+        abs_delta = torch.abs(delta)
+
+        # dead-band 이내의 변화는 허용
+        excess = torch.clamp(abs_delta - self.dead_band, min=0.0)
+        excess = torch.clamp(excess, max=self.max_penalty)
+
+        valid_f = valid.float()
+        # [B, H*W]
+        excess_flat = (excess * valid_f).view(B, -1)
+        cnt_flat    = valid_f.view(B, -1).sum(dim=1) + 1e-6
+
+        # frame별 flicker loss L_b
+        L_b = excess_flat.sum(dim=1) / cnt_flat      # [B]
+
+        # semantic weight로 frame별 가중합
+        weighted = (w * L_b)                         # [B]
+        loss = weighted.sum() / (w.sum() + 1e-6)
+
+        return loss

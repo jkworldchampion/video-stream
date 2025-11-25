@@ -1,8 +1,12 @@
+# Top-level experiment identifier used by training scripts for logs/outputs
+experiment: 5
+
 hyper_parameter:
   learning_rate: 0.0001  # 1e-4 -> 1.0e-4 for float representation
   clip_len: 32
   ratio_ssi: 1
   ratio_tgm: 10
+  ratio_sem: 0.0
   epochs: 75
   batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
   update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
@@ -34,12 +38,12 @@ loss:
 
 # Knowledge Distillation (KD) Configuration
 kd_aux:
-  enabled: true  # KD 활성화 여부
+  enabled: false  # KD 활성화 여부
   layers: [0, 1, 2, 3]  # dpt_temporal에서 사용할 레이어 인덱스 (4개 temporal 지점)
   
   # KD Loss weights (Minimal KD: Attention Relation Only)
   # DIS (feature similarity) 및 APC (future prediction) 제거 완료
-  beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치
+  beta: 0.05  # L_KLD (Attention Relation KL divergence) 가중치
   lambda_kd: 1.0  # 전체 KD loss 가중치 (최종 loss에 곱해짐)
   
   # KD Sliding Window Configuration
@@ -90,5 +94,5 @@ validation:
 
 # Wandb Configuration
 wandb:
-  project: "3kd_checking"  # wandb 프로젝트 이름
+  project: "loss_new"  # wandb 프로젝트 이름
   entity: "depth-finder"  # wandb entity (organization), null이면 개인 계정 사용

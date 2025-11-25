@@ -14,7 +14,7 @@ JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/dataset
 BENCHMARK_ROOT="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets"
 
 # 실험 / 캐시 길이 리스트
-EXPERIMENTS=("experiment_4")
+EXPERIMENTS=("experiment_11")
 CACHE_LENS=(5 10 20 31)   # ← 5부터 순서대로 돌게 됨
 
 for EXP in "${EXPERIMENTS[@]}"; do
@@ -51,7 +51,7 @@ for EXP in "${EXPERIMENTS[@]}"; do
       --datasets scannet \
       --checkpoint "${CHECKPOINT_PATH}" \
       --stream_cache_len "${CACHE}"  \
-      --scene_limit 1
+      --scene_limit 20
 
     echo
     echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
@@ -59,7 +59,7 @@ for EXP in "${EXPERIMENTS[@]}"; do
       --infer_path "${INFER_PATH}" \
       --benchmark_path "${BENCHMARK_ROOT}" \
       --datasets scannet_500 \
-      --scene_limit 1 \
+      --scene_limit 20 \
       --wandb \
       --wandb_entity depth-finder \
       --wandb_project cache_len \
