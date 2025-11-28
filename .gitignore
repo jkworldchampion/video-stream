@@ -12,3 +12,4 @@ wandb/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 /dataset
+/cache_experiments

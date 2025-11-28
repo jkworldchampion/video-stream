@@ -96,17 +96,17 @@ def model_stream_step(
     collect_inter: bool = False,
     collect_qkv: bool = False,
     feature_pool: str = "mean",
-    return_encoder_feats: bool = False,  # ← 새 플래그
+    return_encoder_feats: bool = False,
+    accumulate_qkv: bool = False,
 ):
     """
-    Streaming 1-step forward (학생용).
-    - collect_inter=True면 레이어별 temporal feature/QKV(현재 프레임 것만)를 inter_t로 반환.
-    - return_encoder_feats=True면 encoder 출력(feats)도 함께 반환.
-    - 반환 형식:
-        pred_t:   [B,H,W]
-        new_cache: any
-        inter_t:  dict[layer_id] -> {"feat_one":[B,1,C], "qkv":Optional dict(Q/K/V:[B,A,1,Dh])}
-        feats:    list of encoder features (return_encoder_feats=True일 때만)
+    Streaming 1-step forward (for student model).
+    Returns:
+        tuple: (pred_t, new_cache, inter_t, feats)
+            - pred_t: [B,H,W] depth prediction
+            - new_cache: hidden states for next step
+            - inter_t: dict or None (collect_inter=True)
+            - feats: encoder features or None (return_encoder_feats=True)
     """
     m = model.module if hasattr(model, "module") else model
 
@@ -119,6 +119,7 @@ def model_stream_step(
         return_intermediates=collect_inter,
         return_qkv=collect_qkv,
         feature_pool=feature_pool,
+        accumulate_qkv=accumulate_qkv,
     )
 
     # 2) 반환 파싱 (pred, new_cache, extra)
@@ -131,44 +132,43 @@ def model_stream_step(
         else:
             raise RuntimeError(f"Unexpected forward_depth return len={len(out)}")
     else:
-        # 모델 구현에 따라 단일 객체를 반환하지 않는다고 가정(낙관적 경로)
         pred_t, new_cache, extra = out
 
     # 3) [B,1,H,W] -> [B,H,W]
     if hasattr(pred_t, "dim") and pred_t.dim() == 4 and pred_t.size(1) == 1:
         pred_t = pred_t[:, 0]
 
-    # 4) 인터미디엇 정리
-    if not collect_inter:
-        if return_encoder_feats:
-            return pred_t, new_cache, feats
-        return pred_t, new_cache
+    # 4) inter_t parsing
+    inter_t = None
+    if collect_inter and extra is not None:
+        # forward_depth에서는 그냥 intermediates(dict)를 바로 리턴하니까 사실상 extra 자체가 intermediates야
+        raw_inter = extra.get("intermediates", extra)
+        inter_t = {}
+        
+        for k, v in raw_inter.items():
+            feat = v.get("feat_one", v.get("feat", None))
+            qkv = v.get("qkv", None)
+            qkv_hist = v.get("qkv_history", None)   # ✅ forward_depth에서 넣어준 history
+            
+            if feat is None:
+                continue
+            
+            if feat.dim() == 2:
+                feat = feat.unsqueeze(1)  # [B,1,C]
+            elif feat.dim() == 3 and feat.size(1) != 1:
+                feat = feat[:, -1:, :]
 
-    # 기대 포맷: extra["intermediates"][li] -> {"feat":[B,1,C] or [B,T,C], "qkv":dict or None}
-    raw_inter = extra.get("intermediates", extra)
-    inter_t = {}
+            inter_t[int(k)] = {
+                "feat_one": feat,
+                "qkv": qkv if collect_qkv else None,
+                # ✅ accumulate_qkv=True일 때 history도 그대로 넘겨주기
+                "qkv_history": qkv_hist if accumulate_qkv else None,
+            }
+    # 5) feats 처리
+    encoder_feats = feats if return_encoder_feats else None
 
-    for k, v in raw_inter.items():
-        feat = v.get("feat_one", v.get("feat", None))  # 'feat_one'을 우선 사용, 없으면 'feat'
-        qkv  = v.get("qkv", None)
-
-        if feat is None:
-            continue
-
-        # 보정: [B,C] -> [B,1,C], [B,T,C] -> 마지막 타임스텝 [B,1,C] 로 맞춤
-        if feat.dim() == 2:
-            feat = feat.unsqueeze(1)                 # [B,1,C]
-        elif feat.dim() == 3 and feat.size(1) != 1:
-            feat = feat[:, -1:, :]                   # [B,1,C] (스트리밍 1-step이면 보통 이미 1임)
-
-        inter_t[int(k)] = {
-            "feat_one": feat,
-            "qkv": qkv if collect_qkv else None
-        }
-
-    if return_encoder_feats:
-        return pred_t, new_cache, inter_t, feats
-    return pred_t, new_cache, inter_t
+    # 항상 4개 반환
+    return pred_t, new_cache, inter_t, encoder_feats
 
 def batch_ls_scale_shift(pred_disp, gt_disp, mask):
     """
@@ -263,16 +263,60 @@ def _ls_align_disparity(infs, gts, valid_mask):
     """
     disparity 선형 정렬: (scale, shift)로 infs를 gts에 맞추되
     eval.py의 방식 그대로 numpy lstsq 사용.
+    수치적 안정성을 위한 예외 처리 추가.
     """
-    gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
-    infs = np.clip(infs, a_min=1e-3, a_max=None)
-    pred_disp_masked = infs[valid_mask].reshape((-1, 1)).astype(np.float64)
+    # 입력 데이터 검증 및 클리핑
+    infs = np.clip(infs, a_min=1e-3, a_max=1e6)
+    gts = np.clip(gts, a_min=1e-3, a_max=1e6)
+    
+    # NaN/Inf 체크
+    if not np.all(np.isfinite(infs)) or not np.all(np.isfinite(gts)):
+        warnings.warn("Non-finite values detected in disparity alignment, returning original predictions")
+        return infs
+    
+    # valid mask가 충분한지 확인
+    n_valid = np.sum(valid_mask)
+    if n_valid < 10:  # 최소 10개 이상의 유효 픽셀 필요
+        warnings.warn(f"Too few valid pixels ({n_valid}) for alignment, returning original predictions")
+        return infs
+    
+    try:
+        gt_disp_masked = 1.0 / (gts[valid_mask].reshape((-1, 1)).astype(np.float64) + 1e-8)
+        pred_disp_masked = infs[valid_mask].reshape((-1, 1)).astype(np.float64)
+        
+        # 추가 클리핑으로 안정성 확보
+        gt_disp_masked = np.clip(gt_disp_masked, 1e-6, 1e6)
+        pred_disp_masked = np.clip(pred_disp_masked, 1e-6, 1e6)
+        
+        # NaN/Inf 재확인
+        if not np.all(np.isfinite(gt_disp_masked)) or not np.all(np.isfinite(pred_disp_masked)):
+            warnings.warn("Non-finite values in masked disparity, returning original predictions")
+            return infs
 
-    A = np.concatenate([pred_disp_masked, np.ones_like(pred_disp_masked)], axis=-1)  # [P,2]
-    X = np.linalg.lstsq(A, gt_disp_masked, rcond=None)[0]  # [2,1]
-    scale, shift = X[0, 0], X[1, 0]
-    aligned = np.clip(scale * infs + shift, a_min=1e-3, a_max=None)
-    return aligned
+        A = np.concatenate([pred_disp_masked, np.ones_like(pred_disp_masked)], axis=-1)  # [P,2]
+        
+        # rcond를 명시적으로 설정하여 안정성 향상
+        X = np.linalg.lstsq(A, gt_disp_masked, rcond=1e-6)[0]  # [2,1]
+        scale, shift = X[0, 0], X[1, 0]
+        
+        # scale/shift 유효성 검증
+        if not np.isfinite(scale) or not np.isfinite(shift):
+            warnings.warn("Non-finite scale/shift computed, returning original predictions")
+            return infs
+        
+        # 극단적인 scale 방지
+        scale = np.clip(scale, 1e-3, 1e3)
+        shift = np.clip(shift, -1e6, 1e6)
+        
+        aligned = np.clip(scale * infs + shift, a_min=1e-3, a_max=1e6)
+        return aligned
+        
+    except np.linalg.LinAlgError as e:
+        warnings.warn(f"LinAlgError in disparity alignment: {e}, returning original predictions")
+        return infs
+    except Exception as e:
+        warnings.warn(f"Unexpected error in disparity alignment: {e}, returning original predictions")
+        return infs
 
 def _dataset_eval_defaults(dataset_tag):
     """
@@ -531,7 +575,7 @@ def validate_kitti_streaming(
             x_t = x[:, t:t+1]  # [B, 1, 3, H, W]
             
             # Streaming inference
-            pred_t, cache = model_stream_step(model, x_t, cache, collect_inter=False)
+            pred_t, cache, _, _ = model_stream_step(model, x_t, cache, collect_inter=False)
             pred_t = to_BHW_pred(pred_t).clamp(min=1e-6)  # [B, H, W]
             pred_list.append(pred_t)
         

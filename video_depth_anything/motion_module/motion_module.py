@@ -234,7 +234,7 @@ class TemporalTransformerBlock(nn.Module):
                 )
 
             hidden_states = residual_hidden_states + hidden_states
-            if output_hidden_states:
+            if output_hidden_states is not None:
                 output_hidden_state_list.append(output_hidden_states)
 
         hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
@@ -300,12 +300,14 @@ class TemporalAttention(CrossAttention):
             past = None
             B_tokens = now.shape[0]  # == b*d
             T_seq = now.shape[1]     # == f
+            input_hidden_states = now
         else:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=1)
             now = hidden_states
             past = cached_hidden_states
             B_tokens = now.shape[0]  # == b*d
             T_seq = now.shape[1]     # == 1
+            input_hidden_states = now
 
         # Positional
         if self.pos_encoder is not None:
@@ -383,6 +385,6 @@ class TemporalAttention(CrossAttention):
             qkv_export = {"Q": Q_export, "K": K_export, "V": V_export}
 
         if return_qkv:
-            return hidden_states, [], qkv_export
+            return hidden_states, input_hidden_states, qkv_export
         else:
-            return hidden_states, []
+            return hidden_states, input_hidden_states

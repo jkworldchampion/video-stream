@@ -34,7 +34,7 @@ loss:
 
 # Knowledge Distillation (KD) Configuration
 kd_aux:
-  enabled: true  # KD 활성화 여부
+  enabled: false  # KD 활성화 여부
   layers: [0, 1, 2, 3]  # dpt_temporal에서 사용할 레이어 인덱스 (4개 temporal 지점)
   N: 1  # APC(Autoregressive Predictive Coding) 미래 스텝 수
   
@@ -92,5 +92,5 @@ validation:
 
 # Wandb Configuration
 wandb:
-  project: "3kd_checking"  # wandb 프로젝트 이름
+  project: "loss_new"  # wandb 프로젝트 이름
   entity: "depth-finder"  # wandb entity (organization), null이면 개인 계정 사용

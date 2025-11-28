@@ -62,6 +62,17 @@ class VideoDepthAnything(nn.Module):
         self.gap = (INFER_LEN - OVERLAP) * 2 - 1 - (OVERLAP - INTERP_LEN)
         assert self.gap == 41
         self.id = -1
+        self.qkv_history = {}
+        self.max_qkv_length = 32
+
+
+    def reset_streaming_state(self):
+        """Reset all streaming buffers."""
+        self.id = -1
+        self.frame_id_list = []
+        self.frame_cache_list = []
+        self.qkv_history = {}
+        self.transform = None
 
     # ----------- public / core -----------
     def forward(
@@ -98,7 +109,7 @@ class VideoDepthAnything(nn.Module):
         )
         return features
 
-    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean"):
+    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean", accumulate_qkv: bool=False):
         """
         features: encoder intermediate features of current clip
         cached_hidden_state_list: (옵션) 과거 hidden state (모션 모듈 4곳의 리스트)
@@ -108,6 +119,9 @@ class VideoDepthAnything(nn.Module):
         """
         B, T, C, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
+
+        # if cached_hidden_state_list is None:
+        #     cached_hidden_state_list = getattr(self, "frame_cache_list", None)
 
         if return_intermediates or return_qkv:
             depth_raw = self.head(
@@ -123,6 +137,49 @@ class VideoDepthAnything(nn.Module):
                 features, patch_h, patch_w, T,
                 cached_hidden_state_list=cached_hidden_state_list,
             )
+            intermediates = None
+
+        # self.frame_cache_list = cur_cache
+
+        # QKV 누적 로직
+        if accumulate_qkv and intermediates is not None:
+            for layer_id, layer_data in intermediates.items():
+                qkv = layer_data.get("qkv")
+                if qkv is None:
+                    continue
+                
+                # Initialize buffer for this layer
+                if layer_id not in self.qkv_history:
+                    self.qkv_history[layer_id] = {"Q": [], "K": [], "V": []}
+                
+                # Extract current frame (last time step)
+                # qkv["Q"]: [B, A, T, Dh] where T=1 or 2
+                q_current = qkv["Q"][:, :, -1:, :].detach()  # [B, A, 1, Dh]
+                k_current = qkv["K"][:, :, -1:, :].detach()
+                v_current = qkv["V"][:, :, -1:, :].detach()
+                
+                # Append to history
+                self.qkv_history[layer_id]["Q"].append(q_current)
+                self.qkv_history[layer_id]["K"].append(k_current)
+                self.qkv_history[layer_id]["V"].append(v_current)
+                
+                # Sliding window: keep only recent frames
+                if len(self.qkv_history[layer_id]["Q"]) > self.max_qkv_length:
+                    self.qkv_history[layer_id]["Q"].pop(0)
+                    self.qkv_history[layer_id]["K"].pop(0)
+                    self.qkv_history[layer_id]["V"].pop(0)
+            
+            # Add accumulated history to intermediates
+            for layer_id in intermediates.keys():
+                if layer_id in self.qkv_history:
+                    hist = self.qkv_history[layer_id]
+                    if len(hist["Q"]) > 0:
+                        # Concatenate history: [B, A, seq_len, Dh]
+                        intermediates[layer_id]["qkv_history"] = {
+                            "Q": torch.cat(hist["Q"], dim=2),
+                            "K": torch.cat(hist["K"], dim=2),
+                            "V": torch.cat(hist["V"], dim=2),
+                        }
 
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
@@ -196,6 +253,7 @@ class VideoDepthAnything(nn.Module):
 
             # 과거 캐시 묶기 (기존 포맷 그대로 유지)
             # --- 기존 캐시 윈도우 구성 ---
+            print(f"[infer] id={self.id}, cache_len={len(self.frame_cache_list)}")
             cur_list = self.frame_cache_list[0:2] + self.frame_cache_list[-INFER_LEN + 3:]
             # 기대 길이 확인
             assert len(cur_list) == INFER_LEN - 1, f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
