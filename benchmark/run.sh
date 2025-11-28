@@ -14,7 +14,7 @@ JSON_FILE="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/dataset
 BENCHMARK_ROOT="/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets"
 
 # 실험 리스트
-EXPERIMENTS=("experiment_5")
+EXPERIMENTS=("experiment_0")
 
 # 각 실험에 대해 순차적으로 실행
 for EXP in "${EXPERIMENTS[@]}"; do
@@ -24,7 +24,8 @@ for EXP in "${EXPERIMENTS[@]}"; do
   
   # 1) streaming inference 결과 디렉토리
   INFER_PATH="${ROOT}/benchmark/output/kd_ablation/${EXP}"
-  CHECKPOINT_PATH="${ROOT}/outputs/${EXP}/best_model.pth"
+  # CHECKPOINT_PATH="${ROOT}/outputs/${EXP}/best_model.pth"
+  CHECKPOINT_PATH="${ROOT}/checkpoints/video_depth_anything_vits.pth"
   
   # 체크포인트 존재 확인
   if [ ! -f "${CHECKPOINT_PATH}" ]; then

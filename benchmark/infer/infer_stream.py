@@ -5,15 +5,26 @@ import json
 import torch
 from tqdm import tqdm
 import numpy as np
+from collections import OrderedDict
 
 from video_depth_anything.video_depth_stream import VideoDepthAnything
 
+
 def reset_streaming_state(model):
-    """스트리밍 상태를 초기화합니다."""
-    model.transform = None
-    model.frame_cache_list = []
-    model.frame_id_list = []
-    model.id = -1
+    """
+    VideoDepthAnything 스트리밍 상태 초기화.
+    DataParallel 여부와 상관없이 내부 state를 리셋한다.
+    """
+    m = model.module if hasattr(model, "module") else model
+    if hasattr(m, "transform"):
+        m.transform = None
+    if hasattr(m, "frame_cache_list"):
+        m.frame_cache_list = []
+    if hasattr(m, "frame_id_list"):
+        m.frame_id_list = []
+    if hasattr(m, "id"):
+        m.id = -1
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -23,8 +34,12 @@ if __name__ == '__main__':
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
-    parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
-                        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default='./outputs/experiment_2/best_model.pth',
+        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)'
+    )
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -34,39 +49,51 @@ if __name__ == '__main__':
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     }
 
+    # ───────────────── 모델 생성 ─────────────────
     vda = VideoDepthAnything(**model_configs[args.encoder], pe=args.pe)
-    # checkpoint load
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt  # 방어적
-    
-    # DataParallel로 저장된 경우 'module.' 프리픽스 제거, 혹시 'student.' 프리픽스도 제거
-    from collections import OrderedDict
+
+    # checkpoint 로드 (train.py 에서 저장한 형식과 호환)
+    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    state = ckpt.get('model_state_dict', ckpt)  # 방어적
+
     clean_state = OrderedDict()
     for k, v in state.items():
         nk = k
         if nk.startswith('module.'):
             nk = nk[len('module.'):]
-        if nk.startswith('student.'):   # 혹시 모를 프리픽스 방어
+        if nk.startswith('student.'):
             nk = nk[len('student.'):]
         clean_state[nk] = v
 
-    # 버전/이름 차이가 조금이라도 있으면 strict=False 권장
-    missing, unexpected = vda.load_state_dict(clean_state, strict=True)
-    print('missing:', missing)
-    print('unexpected:', unexpected)
-    
+    # strict=True로 맞추되, missing/unexpected는 안전하게 출력
+    load_res = vda.load_state_dict(clean_state, strict=True)
+    # PyTorch 버전에 따라 반환 타입이 다를 수 있어, hasattr 체크
+    if hasattr(load_res, "missing_keys") and hasattr(load_res, "unexpected_keys"):
+        print('missing keys:', load_res.missing_keys)
+        print('unexpected keys:', load_res.unexpected_keys)
+    else:
+        # 구버전 호환용 (tuple 형태로 오는 경우)
+        try:
+            missing, unexpected = load_res
+            print('missing keys:', missing)
+            print('unexpected keys:', unexpected)
+        except Exception:
+            pass
+
     vda = vda.to(DEVICE).eval()
 
+    # ───────────────── JSON 로드 ─────────────────
     with open(args.json_file, 'r') as fs:
         path_json = json.load(fs)
     root_path = os.path.dirname(args.json_file)
 
+    # ───────────────── 스트리밍 추론 ─────────────────
     for dataset in args.datasets:
         json_data = path_json[dataset]
         for data in tqdm(json_data, desc=f"Streaming {dataset}"):
             for key in data.keys():
                 frames = data[key]  # 이 시퀀스의 프레임 리스트
-                
+
                 # 스트리밍 상태 리셋
                 reset_streaming_state(vda)
 
@@ -78,15 +105,18 @@ if __name__ == '__main__':
                         out_path = os.path.join(args.infer_path, dataset, base + '.npy')
                         os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-                        # BGR -> RGB (저자 릴리스 버그 보정)
-                        img = cv2.cvtColor(cv2.imread(img_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-                        if img is None:
+                        # 안전한 BGR -> RGB 변환
+                        bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+                        if bgr is None:
                             raise FileNotFoundError(img_path)
+                        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
                         # --- 핵심: 프레임을 1장씩 넣어 캐시 재사용 ---
                         depth_np = vda.infer_video_depth_one(
-                            img, input_size=args.input_size, device=DEVICE, fp32=True,
+                            img,
+                            input_size=args.input_size,
+                            device=DEVICE,
+                            fp32=True,
                         )
-                        # infer_video_depth_one이 이미 numpy array를 반환하므로 바로 저장
+                        # infer_video_depth_one 이 numpy array 반환 → 바로 저장
                         np.save(out_path, depth_np)
-

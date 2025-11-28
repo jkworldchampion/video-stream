@@ -28,6 +28,7 @@ from data.dataLoader import KITTIVideoDataset, get_data_list
 
 # 모델
 from video_depth_anything.video_depth_stream import VideoDepthAnything as VideoDepthStudent
+from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTeacher
 
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
@@ -50,7 +51,7 @@ if torch.cuda.is_available():
 
 # ================ 학습 루프 ================
 def train(args):
-    OUTPUT_DIR = f"outputs/experiment_{experiment}"
+    OUTPUT_DIR = f"outputs/new/experiment_{experiment}"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 설정 로드
@@ -63,6 +64,11 @@ def train(args):
     num_epochs = hyper_params["epochs"]
     batch_size = hyper_params["batch_size"]
     CLIP_LEN   = hyper_params["clip_len"]
+
+    # KD 설정 (output KD용 최소 설정)
+    kd_cfg     = config.get("kd_aux", {})
+    kd_enabled = bool(kd_cfg.get("enabled", False))
+    kd_lambda  = float(kd_cfg.get("lambda_kd", 1.0))
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
@@ -88,7 +94,7 @@ def train(args):
             entity=wandb_entity,
             project=wandb_project,
             config=hyper_params,
-            name=f"experiment_{experiment}_ssi_tgm_baseline"
+            name=f"experiment_{experiment}_kd_output"
         )
 
     # ================== 데이터 ==================
@@ -125,7 +131,7 @@ def train(args):
         kitti_val, batch_size=1, shuffle=False, num_workers=2, pin_memory=True
     )
 
-    # ================== 모델 (학생만 사용) ==================
+    # ================== 모델 (Student / Teacher) ==================
     student = VideoDepthStudent(
         encoder="vits",
         features=64,
@@ -133,12 +139,27 @@ def train(args):
         num_frames=CLIP_LEN,
     ).to(device)
 
-    # Pretrained ckpt 로드 (Student만)
+    teacher = None
+    if kd_enabled:
+        teacher = VideoDepthTeacher(
+            encoder="vits",
+            features=64,
+            out_channels=[48, 96, 192, 384],
+            num_frames=CLIP_LEN,
+        ).to(device)
+
+    # Pretrained ckpt 로드
     if args.pretrained_ckpt:
         logger.info(f"Loading Student weights from {args.pretrained_ckpt}")
         student_sd = torch.load(args.pretrained_ckpt, map_location="cpu")
         student.load_state_dict(student_sd, strict=True)
         logger.info("✅ Student pretrained weights loaded successfully!")
+
+        if kd_enabled and teacher is not None:
+            logger.info(f"Loading Teacher weights from {args.pretrained_ckpt}")
+            teacher_sd = torch.load(args.pretrained_ckpt, map_location="cpu")
+            teacher.load_state_dict(teacher_sd, strict=True)
+            logger.info("✅ Teacher pretrained weights loaded successfully!")
 
     # Freeze 정책: encoder freeze, head만 학습
     for p in student.pretrained.parameters():
@@ -146,6 +167,11 @@ def train(args):
     for p in student.head.parameters():
         p.requires_grad = True
     student.train()
+
+    if kd_enabled and teacher is not None:
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
 
     # Optim/Sch
     student_params = [p for p in student.parameters() if p.requires_grad]
@@ -355,12 +381,15 @@ def train(args):
             cache_state = None
             prev_pred_raw = prev_mask = prev_y = None
 
-            frame_pbar = tqdm(
-                range(T),
-                desc=f"Batch {batch_idx+1} - Frames",
-                leave=False,
-                disable=T < 10,
-            )
+            # ----- Teacher clip prediction (KD용) -----
+            teacher_disp_clip = None
+            if kd_enabled and teacher is not None:
+                with torch.no_grad():
+                    with autocast(enabled=torch.cuda.is_available()):
+                        teacher_depth_clip = teacher(x)                                   # [B,T,H,W] depth
+                        teacher_disp_clip  = 1.0 / teacher_depth_clip.clamp(min=1e-6) 
+
+            frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
                 x_t = x[:, t:t+1]  # [B,1,3,H,W]
                 mask_t = get_mask(y[:, t:t+1], 1e-3, 80.0).to(device)
@@ -370,52 +399,45 @@ def train(args):
                     pred_t_net, cache_state = m.stream_step_train(x_t, cache_state)
                     pred_t_raw = to_BHW_pred(pred_t_net).clamp(min=1e-6)  # [B,H,W]
 
-                    # ----- Scale-Shift & Losses -----
+                    # ----- Scale-Shift & Depth Losses -----
                     gt_disp_t = (1.0 / y[:, t:t+1].clamp(min=1e-6)).squeeze(2)  # [B,1,H,W]
                     assert pred_t_raw.shape[0] == gt_disp_t.shape[0]
 
                     with torch.no_grad():
                         a_star, b_star = batch_ls_scale_shift(pred_t_raw, gt_disp_t, mask_t)
 
-                    pred_t_aligned_disp = (
-                        a_star.detach() * pred_t_raw.unsqueeze(1) + b_star.detach()
-                    ).squeeze(1)
+                    pred_t_aligned_disp = (a_star.detach() * pred_t_raw.unsqueeze(1) + b_star.detach()).squeeze(1)
                     pred_t_aligned_depth = 1.0 / pred_t_aligned_disp.clamp(min=1e-6)
 
                     disp_normed_t = norm_ssi(y[:, t:t+1], mask_t).squeeze(2)
-                    ssi_loss_t = loss_ssi(
-                        pred_t_aligned_disp.unsqueeze(1),
-                        disp_normed_t,
-                        mask_t.squeeze(2),
-                    )
+                    ssi_loss_t = loss_ssi(pred_t_aligned_disp.unsqueeze(1), disp_normed_t, mask_t.squeeze(2))
 
                     if t > 0:
-                        prev_aligned_disp = (
-                            a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()
-                        ).squeeze(1)
+                        prev_aligned_disp = (a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()).squeeze(1)
                         prev_aligned_depth = 1.0 / prev_aligned_disp.clamp(min=1e-6)
                         curr_aligned_depth = pred_t_aligned_depth
 
-                        pred_pair = torch.stack(
-                            [prev_aligned_depth, curr_aligned_depth], dim=1
-                        )  # [B,2,H,W]
-                        y_pair = torch.cat(
-                            [prev_y, y[:, t:t+1]], dim=1
-                        )  # [B,2,1,H,W]
-                        m_pair = torch.cat(
-                            [prev_mask, mask_t], dim=1
-                        )  # [B,2,1,H,W]
-
-                        tgm_loss = loss_tgm(
-                            pred_pair,
-                            y_pair,
-                            m_pair.squeeze(2),
-                        )
+                        pred_pair = torch.stack([prev_aligned_depth, curr_aligned_depth], dim=1)  # [B,2,H,W]
+                        y_pair = torch.cat([prev_y, y[:, t:t+1]], dim=1)  # [B,2,1,H,W]
+                        m_pair = torch.cat([prev_mask, mask_t], dim=1)    # [B,2,1,H,W]
+                        tgm_loss = loss_tgm(pred_pair, y_pair, m_pair.squeeze(2))
                     else:
                         tgm_loss = pred_t_raw.new_tensor(0.0)
 
-                    # ★ KD 완전 제거: depth loss만
-                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss
+                    # ----- (NEW) KD loss: Teacher clip disparity vs Student stream disparity -----
+                    kd_loss_t = pred_t_raw.new_tensor(0.0)
+                    if kd_enabled and teacher_disp_clip is not None:
+                        teacher_disp_t = teacher_disp_clip[:, t]                       # [B,H,W]
+                        # 마스크 적용한 L1 KD (disparity space)
+                        kd_mask = mask_t.squeeze(2).squeeze(1)                         # [B,H,W]
+                        if kd_mask.any():
+                            diff = (pred_t_raw - teacher_disp_t).abs() * kd_mask
+                            kd_loss_t = diff.sum() / kd_mask.sum().clamp(min=1.0)
+                        else:
+                            kd_loss_t = pred_t_raw.new_tensor(0.0)
+
+                    # 최종 loss: depth + KD
+                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * kd_loss_t if kd_enabled else 0.0)
 
                 # 1) grad accumulation
                 scaled_loss = loss / update_frequency
@@ -432,17 +454,20 @@ def train(args):
                 # 상태 업데이트 (TGM용)
                 prev_pred_raw = pred_t_raw.detach()
                 prev_mask = mask_t
-                prev_y    = y[:, t:t+1]
+                prev_y = y[:, t:t+1]
 
                 # 통계
                 B_eff = pred_t_raw.shape[0]
                 epoch_frames += B_eff
-                epoch_ssi    += ssi_loss_t.item() * B_eff
-                epoch_tgm    += tgm_loss.item()  * B_eff
+                epoch_ssi += ssi_loss_t.item() * B_eff
+                epoch_tgm += tgm_loss.item() * B_eff
+                if kd_enabled:
+                    epoch_kd_dis += kd_loss_t.item() * B_eff  # 이름은 kd_dis 그대로 재활용 (output KD)
 
                 frame_pbar.set_postfix({
                     'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
                     'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
+                    'wKD':  f'{(epoch_kd_dis / max(1, epoch_frames) * kd_lambda):.4e}' if kd_enabled else '0.0000',
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -488,12 +513,16 @@ def train(args):
         scannet_rmse   = float(avg_metrics.get("rmse_linear", float('nan')))
         scannet_delta1 = float(avg_metrics.get("delta1_acc", float('nan')))
 
+        # KD 평균 (프레임당)
+        mean_kd = (epoch_kd_dis / max(1, epoch_frames)) if kd_enabled else 0.0
+
         # W&B 로깅
         if not args.test:
             wandb.log({
                 "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
                 "train/ssi":  epoch_ssi  / max(1, epoch_frames),
                 "train/tgm":  epoch_tgm  / max(1, epoch_frames),
+                "train/kd":   mean_kd * kd_lambda if kd_enabled else 0.0,
 
                 "val_kitti/loss":   kitti_val_loss,
                 "val_kitti/absrel": kitti_val_absrel,
