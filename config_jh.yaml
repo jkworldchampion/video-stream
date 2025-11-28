@@ -92,5 +92,5 @@ validation:
 
 # Wandb Configuration
 wandb:
-  project: "loss_new"  # wandb 프로젝트 이름
+  project: "new_base"  # wandb 프로젝트 이름
   entity: "depth-finder"  # wandb entity (organization), null이면 개인 계정 사용

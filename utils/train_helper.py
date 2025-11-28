@@ -88,88 +88,6 @@ def _detach_cache(cache):
         return cache.detach()
     return cache  # unknown type as-is
 
-def model_stream_step(
-    model,
-    x_t,
-    cache=None,
-    *,
-    collect_inter: bool = False,
-    collect_qkv: bool = False,
-    feature_pool: str = "mean",
-    return_encoder_feats: bool = False,
-    accumulate_qkv: bool = False,
-):
-    """
-    Streaming 1-step forward (for student model).
-    Returns:
-        tuple: (pred_t, new_cache, inter_t, feats)
-            - pred_t: [B,H,W] depth prediction
-            - new_cache: hidden states for next step
-            - inter_t: dict or None (collect_inter=True)
-            - feats: encoder features or None (return_encoder_feats=True)
-    """
-    m = model.module if hasattr(model, "module") else model
-
-    # 1) 스트리밍 경로
-    feats = m.forward_features(x_t)
-    out = m.forward_depth(
-        feats,
-        x_t.shape,
-        cached_hidden_state_list=cache,
-        return_intermediates=collect_inter,
-        return_qkv=collect_qkv,
-        feature_pool=feature_pool,
-        accumulate_qkv=accumulate_qkv,
-    )
-
-    # 2) 반환 파싱 (pred, new_cache, extra)
-    if isinstance(out, (list, tuple)):
-        if len(out) == 3:
-            pred_t, new_cache, extra = out
-        elif len(out) == 2:
-            pred_t, new_cache = out
-            extra = None
-        else:
-            raise RuntimeError(f"Unexpected forward_depth return len={len(out)}")
-    else:
-        pred_t, new_cache, extra = out
-
-    # 3) [B,1,H,W] -> [B,H,W]
-    if hasattr(pred_t, "dim") and pred_t.dim() == 4 and pred_t.size(1) == 1:
-        pred_t = pred_t[:, 0]
-
-    # 4) inter_t parsing
-    inter_t = None
-    if collect_inter and extra is not None:
-        # forward_depth에서는 그냥 intermediates(dict)를 바로 리턴하니까 사실상 extra 자체가 intermediates야
-        raw_inter = extra.get("intermediates", extra)
-        inter_t = {}
-        
-        for k, v in raw_inter.items():
-            feat = v.get("feat_one", v.get("feat", None))
-            qkv = v.get("qkv", None)
-            qkv_hist = v.get("qkv_history", None)   # ✅ forward_depth에서 넣어준 history
-            
-            if feat is None:
-                continue
-            
-            if feat.dim() == 2:
-                feat = feat.unsqueeze(1)  # [B,1,C]
-            elif feat.dim() == 3 and feat.size(1) != 1:
-                feat = feat[:, -1:, :]
-
-            inter_t[int(k)] = {
-                "feat_one": feat,
-                "qkv": qkv if collect_qkv else None,
-                # ✅ accumulate_qkv=True일 때 history도 그대로 넘겨주기
-                "qkv_history": qkv_hist if accumulate_qkv else None,
-            }
-    # 5) feats 처리
-    encoder_feats = feats if return_encoder_feats else None
-
-    # 항상 4개 반환
-    return pred_t, new_cache, inter_t, encoder_feats
-
 def batch_ls_scale_shift(pred_disp, gt_disp, mask):
     """
     pred_disp: [B, H, W] or [B,1,H,W] disparity (>= 1e-6)
@@ -515,9 +433,6 @@ def validate_with_infer_eval_subset(
     return {"avg": avg, "per_scene": per_scene}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# KITTI Validation (Stream mode with SSI+TGM losses + depth metrics)
-# ──────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def validate_kitti_streaming(
     model,
@@ -528,132 +443,120 @@ def validate_kitti_streaming(
     ratio_ssi=1.0,
     ratio_tgm=10.0,
     min_depth=1e-3,
-    max_depth=80.0
+    max_depth=80.0,
 ):
     """
-    KITTI validation with streaming inference.
-    
-    Returns:
-        dict: {
-            'loss': average validation loss,
-            'ssi': average SSI loss,
-            'tgm': average TGM loss,
-            'absrel': average absolute relative error,
-            'delta1': average delta1 accuracy
-        }
+    KITTI validation in STRICT streaming mode.
+
+    - train 과 동일하게: frame-by-frame, cache_state 로만 스트리밍
+    - infer_video_depth_one / self.frame_cache_list 는 전혀 쓰지 않음
+    - SSI + TGM + depth metric (AbsRel, δ1) 계산
     """
+    from torch.cuda.amp import autocast  # 혹시 상단 import 안 되어 있으면
+
     model_was_training = model.training
     model.eval()
-    
-    total_loss = 0.0
-    total_ssi = 0.0
-    total_tgm = 0.0
+
+    total_loss   = 0.0
+    total_ssi    = 0.0
+    total_tgm    = 0.0
     total_absrel = 0.0
     total_delta1 = 0.0
     total_samples = 0
-    
+
+    m = model.module if hasattr(model, "module") else model
+
     for batch_idx, batch_data in enumerate(tqdm(val_loader, desc="KITTI Val", leave=False)):
-        # KITTI val returns multiple values, we only need x and y
-        # Unpack first two regardless of total length
-        x = batch_data[0]
-        y = batch_data[1]
-        # Ignore extrinsics, intrinsics, cam_ids if present
-        
-        x = x.to(device)  # [B, T, 3, H, W]
-        y = y.to(device)  # [B, T, 1, H, W]
-        
+        # KITTI val loader는 (x, y, ...) 형태로 여러 값을 줄 수 있으니 앞의 두 개만 사용
+        x = batch_data[0].to(device)  # [B, T, 3, H, W]
+        y = batch_data[1].to(device)  # [B, T, 1, H, W]
         B, T = x.shape[:2]
-        
-        # Reset streaming state
-        _reset_streaming_state(model)
-        
+
+        # === streaming state (train과 동일하게 cache_state 로만 관리) ===
+        cache_state = None
         pred_list = []
-        cache = None
-        
-        # Frame-by-frame streaming
+
         for t in range(T):
-            x_t = x[:, t:t+1]  # [B, 1, 3, H, W]
-            
-            # Streaming inference
-            pred_t, cache, _, _ = model_stream_step(model, x_t, cache, collect_inter=False)
-            pred_t = to_BHW_pred(pred_t).clamp(min=1e-6)  # [B, H, W]
+            x_t = x[:, t:t+1]  # [B,1,3,H,W]
+
+            # train 과 동일 경로: stream_step_train
+            with autocast(enabled=torch.cuda.is_available()):
+                pred_t_net, cache_state = m.stream_step_train(x_t, cache_state)
+
+            pred_t = to_BHW_pred(pred_t_net).clamp(min=1e-6)  # [B,H,W]
             pred_list.append(pred_t)
-        
-        # Stack predictions: [B, T, H, W]
+
+        # [B,T,H,W]
         pred_clip = torch.stack(pred_list, dim=1)
-        
-        # Compute mask
-        mask = get_mask(y, min_depth, max_depth).squeeze(2)  # [B, T, H, W]
-        
-        # Convert to disparity for loss computation
-        gt_disp = (1.0 / y.clamp(min=1e-6)).squeeze(2)  # [B, T, H, W]
-        pred_disp = pred_clip  # Already disparity from model
-        
-        # Scale-shift alignment per clip (batch-wise)
-        pred_disp_flat = pred_disp.view(B, -1)  # [B, T*H*W]
-        gt_disp_flat = gt_disp.view(B, -1)
-        mask_flat = mask.view(B, -1).float()
-        
-        # Compute scale & shift
+
+        # --- Mask 및 disparity 변환 ---
+        mask = get_mask(y, min_depth, max_depth).squeeze(2)       # [B,T,H,W]
+        gt_disp = (1.0 / y.clamp(min=1e-6)).squeeze(2)            # [B,T,H,W]
+        pred_disp = pred_clip                                     # 모델 출력이 disparity라고 가정
+
+        # --- clip 단위 scale/shift 정렬 (LS) ---
+        pred_disp_flat = pred_disp.view(B, -1)                    # [B,THW]
+        gt_disp_flat   = gt_disp.view(B, -1)                      # [B,THW]
+        mask_flat      = mask.view(B, -1).float()                 # [B,THW]
+
         count = mask_flat.sum(dim=1, keepdim=True).clamp_min(1.0)
         mean_pred = (pred_disp_flat * mask_flat).sum(dim=1, keepdim=True) / count
-        mean_gt = (gt_disp_flat * mask_flat).sum(dim=1, keepdim=True) / count
-        
+        mean_gt   = (gt_disp_flat   * mask_flat).sum(dim=1, keepdim=True) / count
+
         pred_centered = (pred_disp_flat - mean_pred) * mask_flat
-        gt_centered = (gt_disp_flat - mean_gt) * mask_flat
-        
+        gt_centered   = (gt_disp_flat   - mean_gt)   * mask_flat
+
         cov = (pred_centered * gt_centered).sum(dim=1, keepdim=True)
         var = (pred_centered ** 2).sum(dim=1, keepdim=True).clamp_min(1e-6)
-        
+
         scale = cov / var
         shift = mean_gt - scale * mean_pred
-        
-        # Aligned prediction
+
         pred_aligned_flat = pred_disp_flat * scale + shift
         pred_aligned = pred_aligned_flat.view(B, T, pred_clip.shape[-2], pred_clip.shape[-1])
-        
-        # SSI loss (normalized)
-        disp_normed = norm_ssi(y, mask.unsqueeze(2)).squeeze(2)  # [B, T, H, W]
-        ssi_loss = loss_ssi_fn(pred_aligned.unsqueeze(2), disp_normed.unsqueeze(2), mask)
-        
-        # TGM loss (temporal consistency)
+
+        # --- SSI loss ---
+        disp_normed = norm_ssi(y, mask.unsqueeze(2)).squeeze(2)   # [B,T,H,W]
+        ssi_loss = loss_ssi_fn(
+            pred_aligned.unsqueeze(2),      # [B,T,1,H,W]
+            disp_normed.unsqueeze(2),       # [B,T,1,H,W]
+            mask,                           # [B,T,H,W]
+        )
+
+        # --- TGM loss (temporal consistency) ---
         if T >= 2:
-            pred_depth = 1.0 / pred_aligned.clamp(min=1e-6)
-            gt_depth = y.squeeze(2)
-            tgm_loss = loss_tgm_fn(pred_aligned, gt_depth, mask)
+            pred_depth = 1.0 / pred_aligned.clamp(min=1e-6)       # [B,T,H,W]
+            gt_depth   = y.squeeze(2)                             # [B,T,H,W]
+            tgm_loss   = loss_tgm_fn(pred_depth, gt_depth, mask)  # LossTGMVector api에 맞게
         else:
             tgm_loss = torch.tensor(0.0, device=device)
-        
-        # Total loss
+
         loss = ratio_ssi * ssi_loss + ratio_tgm * tgm_loss
-        
-        # Depth metrics (convert back to depth domain)
+
+        # --- depth metrics (AbsRel, δ1) ---
         pred_depth_aligned = 1.0 / pred_aligned.clamp(min=1e-6)
         gt_depth = y.squeeze(2)
-        
-        # Per-clip metrics
+
         absrel = abs_relative_difference(pred_depth_aligned, gt_depth, mask).item()
         delta1 = delta1_acc(pred_depth_aligned, gt_depth, mask).item()
-        
-        # Accumulate
-        total_loss += loss.item() * B
-        total_ssi += ssi_loss.item() * B
-        total_tgm += tgm_loss.item() * B
+
+        # accumulate
+        total_loss   += loss.item()   * B
+        total_ssi    += ssi_loss.item() * B
+        total_tgm    += tgm_loss.item() * B
         total_absrel += absrel * B
         total_delta1 += delta1 * B
         total_samples += B
-    
-    # Average
+
     avg_metrics = {
-        'loss': total_loss / max(1, total_samples),
-        'ssi': total_ssi / max(1, total_samples),
-        'tgm': total_tgm / max(1, total_samples),
-        'absrel': total_absrel / max(1, total_samples),
-        'delta1': total_delta1 / max(1, total_samples)
+        "loss":   total_loss   / max(1, total_samples),
+        "ssi":    total_ssi    / max(1, total_samples),
+        "tgm":    total_tgm    / max(1, total_samples),
+        "absrel": total_absrel / max(1, total_samples),
+        "delta1": total_delta1 / max(1, total_samples),
     }
-    
-    # Restore model mode
+
     if model_was_training:
         model.train()
-    
+
     return avg_metrics

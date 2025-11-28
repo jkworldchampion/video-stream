@@ -17,11 +17,12 @@ import torch.nn as nn
 from torchvision.transforms import Compose
 import cv2
 import numpy as np
-import copy
 
 from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
 from .util.transform import Resize, NormalizeImage, PrepareForNet
+
+from utils.util import compute_scale_and_shift, get_interpolate_frames
 
 # infer settings, do not change
 INFER_LEN = 32
@@ -37,7 +38,7 @@ class VideoDepthAnything(nn.Module):
         use_bn=False, 
         use_clstoken=False,
         num_frames=32,
-        pe='ape',
+        pe='ape'
     ):
         super(VideoDepthAnything, self).__init__()
 
@@ -51,159 +52,169 @@ class VideoDepthAnything(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
 
         self.head = DPTHeadTemporal(
-            self.pretrained.embed_dim, features, use_bn,
-            out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe
+            self.pretrained.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            use_clstoken=use_clstoken,
+            num_frames=num_frames,
+            pe=pe,
         )
 
-        # --- 스트리밍 관련 런타임 상태 ---
+        # streaming inference용 state
         self.transform = None
         self.frame_id_list = []
-        self.frame_cache_list = []  # 모션 모듈 4곳 캐시 리스트(기존 포맷 유지)
+        self.frame_cache_list = []
         self.gap = (INFER_LEN - OVERLAP) * 2 - 1 - (OVERLAP - INTERP_LEN)
         assert self.gap == 41
         self.id = -1
-        self.qkv_history = {}
-        self.max_qkv_length = 32
 
-
-    def reset_streaming_state(self):
-        """Reset all streaming buffers."""
-        self.id = -1
-        self.frame_id_list = []
-        self.frame_cache_list = []
-        self.qkv_history = {}
-        self.transform = None
-
-    # ----------- public / core -----------
-    def forward(
-        self,
-        x,
-        *,
-        return_intermediates: bool = False,
-        return_qkv: bool = False,
-        feature_pool: str = "mean",
-    ):
-        """
-        학습(풀클립) 경로:
-          - 기본: [B,T,H,W]
-          - return_intermediates=True: {"pred": [B,T,H,W], "intermediates": dict}
-        """
-        features = self.forward_features(x)
-        out = self.forward_depth(
-            features, x.shape,
-            cached_hidden_state_list=None,  # 학습 풀클립에선 캐시 사용 X
-            return_intermediates=return_intermediates,
-            return_qkv=return_qkv,
-            feature_pool=feature_pool,
-        )
-        if return_intermediates or return_qkv:
-            depth_bt, _cache, intermediates = out
-            return {"pred": depth_bt, "intermediates": intermediates}
-        depth_bt, _cache = out
-        return depth_bt
+    def forward(self, x):
+        return self.forward_depth(self.forward_features(x), x.shape)[0]
 
     def forward_features(self, x):
-        # x: [B, T, C, H, W]
+        # x: [B,T,3,H,W] 또는 [B,1,3,H,W]
         features = self.pretrained.get_intermediate_layers(
-            x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True
+            x.flatten(0, 1),
+            self.intermediate_layer_idx[self.encoder],
+            return_class_token=True,
         )
         return features
 
-    def forward_depth(self, features, x_shape, cached_hidden_state_list=None, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean", accumulate_qkv: bool=False):
-        """
-        features: encoder intermediate features of current clip
-        cached_hidden_state_list: (옵션) 과거 hidden state (모션 모듈 4곳의 리스트)
-        반환:
-          - 기본: (depth_bt, cache)
-          - return_intermediates=True: (depth_bt, cache, intermediates)
-        """
+    def forward_depth(self, features, x_shape, cached_hidden_state_list=None):
         B, T, C, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
-
-        # if cached_hidden_state_list is None:
-        #     cached_hidden_state_list = getattr(self, "frame_cache_list", None)
-
-        if return_intermediates or return_qkv:
-            depth_raw = self.head(
-                features, patch_h, patch_w, T,
-                cached_hidden_state_list=cached_hidden_state_list,
-                return_intermediates=True,
-                return_qkv=return_qkv,
-                feature_pool=feature_pool,
-            )
-            depth, cur_cache, intermediates = depth_raw
-        else:
-            depth, cur_cache = self.head(
-                features, patch_h, patch_w, T,
-                cached_hidden_state_list=cached_hidden_state_list,
-            )
-            intermediates = None
-
-        # self.frame_cache_list = cur_cache
-
-        # QKV 누적 로직
-        if accumulate_qkv and intermediates is not None:
-            for layer_id, layer_data in intermediates.items():
-                qkv = layer_data.get("qkv")
-                if qkv is None:
-                    continue
-                
-                # Initialize buffer for this layer
-                if layer_id not in self.qkv_history:
-                    self.qkv_history[layer_id] = {"Q": [], "K": [], "V": []}
-                
-                # Extract current frame (last time step)
-                # qkv["Q"]: [B, A, T, Dh] where T=1 or 2
-                q_current = qkv["Q"][:, :, -1:, :].detach()  # [B, A, 1, Dh]
-                k_current = qkv["K"][:, :, -1:, :].detach()
-                v_current = qkv["V"][:, :, -1:, :].detach()
-                
-                # Append to history
-                self.qkv_history[layer_id]["Q"].append(q_current)
-                self.qkv_history[layer_id]["K"].append(k_current)
-                self.qkv_history[layer_id]["V"].append(v_current)
-                
-                # Sliding window: keep only recent frames
-                if len(self.qkv_history[layer_id]["Q"]) > self.max_qkv_length:
-                    self.qkv_history[layer_id]["Q"].pop(0)
-                    self.qkv_history[layer_id]["K"].pop(0)
-                    self.qkv_history[layer_id]["V"].pop(0)
-            
-            # Add accumulated history to intermediates
-            for layer_id in intermediates.keys():
-                if layer_id in self.qkv_history:
-                    hist = self.qkv_history[layer_id]
-                    if len(hist["Q"]) > 0:
-                        # Concatenate history: [B, A, seq_len, Dh]
-                        intermediates[layer_id]["qkv_history"] = {
-                            "Q": torch.cat(hist["Q"], dim=2),
-                            "K": torch.cat(hist["K"], dim=2),
-                            "V": torch.cat(hist["V"], dim=2),
-                        }
-
+        depth, cur_cached_hidden_state_list = self.head(
+            features,
+            patch_h,
+            patch_w,
+            T,
+            cached_hidden_state_list=cached_hidden_state_list,
+        )
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
-        depth_bt = depth.squeeze(1).unflatten(0, (B, T))  # [B,T,H,W]
+        # depth: [B*T,1,H,W] → [B,T,H,W]
+        return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list
 
-        if return_intermediates or return_qkv:
-            return depth_bt, cur_cache, intermediates
-        return depth_bt, cur_cache
-    
-    @torch.no_grad()
+    def stream_step_train(self, x_t, cache_state=None):
+        """
+        x_t: [B,1,3,H,W]
+        cache_state: None이면 새 시퀀스 시작, 아니면 이전 step에서 받은 dict
+        return:
+            pred_t: [B,H,W]
+            cache_state: 업데이트된 dict
+        """
+        if cache_state is None:
+            cache_state = {
+                "frame_cache_list": [],
+                "frame_id_list": [],
+                "id": -1,
+            }
+
+        cache_state["id"] += 1
+
+        feats = self.forward_features(x_t)   # [B,1,...]
+        x_shape = x_t.shape                  # [B,1,3,H,W]
+
+        # train: detach_past=True
+        pred_t_net, cache_state = self._stream_step_core(
+            feats,
+            x_shape,
+            cache_state=cache_state,
+            detach_past=True,
+        )
+        # pred_t_net: [B,H,W]
+        return pred_t_net, cache_state
+
+    def _stream_step_core(self, cur_feature, x_shape, cache_state, detach_past: bool):
+        """
+        cur_feature: [B, 1, ...] 한 프레임에 해당하는 encoder feature
+        x_shape:     [B, 1, 3, H, W]
+        cache_state: {
+            "frame_cache_list": list[hidden_state_list],
+            "frame_id_list":    list[int],
+            "id":               int,  # 현재 frame index
+        }
+        detach_past:
+            - train: True  (과거 cache는 detach 해서 그래프 끊기)
+            - infer: False (어차피 no_grad)
+        """
+        frame_cache_list = cache_state["frame_cache_list"]
+        frame_id_list    = cache_state["frame_id_list"]
+        cur_id           = cache_state["id"]
+
+        B, T, C, H, W = x_shape
+        assert T == 1, f"stream step expects T=1, got T={T}"
+
+        # 1) 첫 프레임: cache 없음
+        if len(frame_cache_list) == 0:
+            depth, cached_hidden_state_list = self.forward_depth(
+                cur_feature, x_shape, cached_hidden_state_list=None
+            )  # depth: [B,1,H,W]
+
+            if detach_past:
+                cached_hidden_state_list = [
+                    h.detach() for h in cached_hidden_state_list
+                ]
+
+            # INFER_LEN 길이의 window로 초기화
+            frame_cache_list = [cached_hidden_state_list for _ in range(INFER_LEN)]
+            frame_id_list = [cur_id for _ in range(INFER_LEN)]
+
+            new_depth = depth[:, 0]  # [B,H,W]
+
+            cache_state["frame_cache_list"] = frame_cache_list
+            cache_state["frame_id_list"]    = frame_id_list
+            return new_depth, cache_state
+
+        # 2) 이후 프레임: 기존 infer_video_depth_one과 동일한 window 규칙
+        cur_list = frame_cache_list[0:2] + frame_cache_list[-INFER_LEN + 3:]
+        assert len(cur_list) == INFER_LEN - 1, \
+            f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
+
+        # 레이어별 cat
+        cur_cache = [
+            torch.cat([h[i] for h in cur_list], dim=1)
+            for i in range(len(cur_list[0]))
+        ]
+
+        depth, new_cache = self.forward_depth(
+            cur_feature, x_shape, cached_hidden_state_list=cur_cache
+        )  # depth: [B,1,H,W]
+
+        if detach_past:
+            new_cache = [h.detach() for h in new_cache]
+
+        frame_cache_list.append(new_cache)
+        frame_id_list.append(cur_id)
+
+        # sliding window 규칙 그대로 사용
+        if cur_id + INFER_LEN > self.gap + 1:
+            del frame_cache_list[1]
+            del frame_id_list[1]
+
+        cache_state["frame_cache_list"] = frame_cache_list
+        cache_state["frame_id_list"]    = frame_id_list
+
+        new_depth = depth[:, 0]  # [B,H,W]
+        return new_depth, cache_state
+
     def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False):
         """
-        스트리밍 추론: 프레임을 1장씩 넣고, hidden-state 캐시를 누적 재사용.
-        (기존 파이프라인과 동일한 캐시 포맷 유지)
+        frame: H,W,3 (numpy, BGR or RGB 상관 없이 transform에서 처리)
+        return: depth (H_orig,W_orig) numpy
         """
         self.id += 1
 
-        if self.transform is None:  # first frame
-            # Initialize the transform
+        # 1) transform 초기화 (첫 프레임에서만)
+        if self.transform is None:
             frame_height, frame_width = frame.shape[:2]
             self.frame_height = frame_height
             self.frame_width = frame_width
+
             ratio = max(frame_height, frame_width) / min(frame_height, frame_width)
-            if ratio > 1.78:  # we recommend to process video with ratio smaller than 16:9 due to memory limitation
+            # we recommend to process video with ratio smaller than 16:9 due to memory limitation
+            if ratio > 1.78:
                 input_size = int(input_size * 1.777 / ratio)
                 input_size = round(input_size / 14) * 14
 
@@ -217,99 +228,54 @@ class VideoDepthAnything(nn.Module):
                     resize_method='lower_bound',
                     image_interpolation_method=cv2.INTER_CUBIC,
                 ),
-                NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                NormalizeImage(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
                 PrepareForNet(),
             ])
 
-            # Inference the first frame
-            cur_list = [torch.from_numpy(self.transform({'image': frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0)]
-            cur_input = torch.cat(cur_list, dim=1).to(device)
-            
-            with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
-                    cur_feature = self.forward_features(cur_input)
-                    x_shape = cur_input.shape
-                    depth, cached_hidden_state_list = self.forward_depth(cur_feature, x_shape)
+        # 2) 입력 크기 일관성 체크
+        frame_height, frame_width = frame.shape[:2]
+        assert frame_height == self.frame_height
+        assert frame_width == self.frame_width
 
-            depth = depth.to(cur_input.dtype)
-            depth = F.interpolate(depth.flatten(0,1).unsqueeze(1), size=(frame_height, frame_width), mode='bilinear', align_corners=True)
+        # 3) 현재 프레임 전처리 → [1,1,3,H,W]
+        cur_input = torch.from_numpy(
+            self.transform({'image': frame.astype(np.float32) / 255.0})['image']
+        ).unsqueeze(0).unsqueeze(0).to(device)
 
-            # 초기 캐시 복제(윈도우 시뮬레이션)
-            self.frame_cache_list = [copy.deepcopy(cached_hidden_state_list) for _ in range(INFER_LEN)]
-            self.frame_id_list.extend([0] * (INFER_LEN - 1))
+        with torch.no_grad():
+            with torch.autocast(device_type=device, enabled=(not fp32)):
+                cur_feature = self.forward_features(cur_input)
+                x_shape = cur_input.shape  # [1,1,3,H,W]
 
-            new_depth = depth[0][0].cpu().numpy()
-        else:
-            frame_height, frame_width = frame.shape[:2]
-            assert frame_height == self.frame_height
-            assert frame_width == self.frame_width
+                cache_state = {
+                    "frame_cache_list": self.frame_cache_list,
+                    "frame_id_list": self.frame_id_list,
+                    "id": self.id,
+                }
 
-            # infer feature
-            cur_input = torch.from_numpy(self.transform({'image': frame.astype(np.float32) / 255.0})['image']).unsqueeze(0).unsqueeze(0).to(device)
-            with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
-                    cur_feature = self.forward_features(cur_input)
-                    x_shape = cur_input.shape
+                # infer: detach_past=False
+                depth_net, cache_state = self._stream_step_core(
+                    cur_feature,
+                    x_shape,
+                    cache_state=cache_state,
+                    detach_past=False,
+                )
 
-            # 과거 캐시 묶기 (기존 포맷 그대로 유지)
-            # --- 기존 캐시 윈도우 구성 ---
-            print(f"[infer] id={self.id}, cache_len={len(self.frame_cache_list)}")
-            cur_list = self.frame_cache_list[0:2] + self.frame_cache_list[-INFER_LEN + 3:]
-            # 기대 길이 확인
-            assert len(cur_list) == INFER_LEN - 1, f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
+        # 4) 내부 state 업데이트
+        self.frame_cache_list = cache_state["frame_cache_list"]
+        self.frame_id_list    = cache_state["frame_id_list"]
 
-            # --- 안전한 캐시 병합 (None 방지) ---
-            def _valid_frame_cache(fc):
-                # 각 프레임 캐시는 list/tuple 이고, 모든 엔트리가 Tensor 이어야 함
-                return isinstance(fc, (list, tuple)) and all((t is None) or torch.is_tensor(t) for t in fc)
+        # 5) network 해상도 → 원본 해상도로 업샘플
+        depth_net = depth_net.to(cur_input.dtype)              # [1,H,W]
+        depth_up  = F.interpolate(
+            depth_net.unsqueeze(1),                            # [1,1,H,W]
+            size=(frame_height, frame_width),
+            mode='bilinear',
+            align_corners=True,
+        )
 
-            # 하나라도 형식이 이상하면 캐시 사용 포기
-            if not all(_valid_frame_cache(h) for h in cur_list):
-                cur_cache = None
-            else:
-                L = min(len(h) for h in cur_list)  # 레이어 수(혹시 불일치 대비)
-                per_layer = []
-                cache_ok = True
-                for i in range(L):
-                    elems = [h[i] for h in cur_list]
-                    # 레이어 i에 None이 섞여 있으면 전체 캐시 사용 포기(모델 내부 n 분배가 깨질 수 있음)
-                    if any(e is None for e in elems):
-                        cache_ok = False
-                        break
-                    try:
-                        per_layer.append(torch.cat(elems, dim=1))  # 시간축 concat
-                    except Exception:
-                        cache_ok = False
-                        break
-                cur_cache = per_layer if cache_ok and len(per_layer) == L else None
-
-            # infer depth
-            with torch.no_grad():
-                with torch.autocast(device_type=device, enabled=(not fp32)):
-                    depth, new_cache = self.forward_depth(cur_feature, x_shape, cached_hidden_state_list=cur_cache)
-
-            depth = depth.to(cur_input.dtype)
-            depth = F.interpolate(depth.flatten(0, 1).unsqueeze(1), size=(frame_height, frame_width),
-                                  mode='bilinear', align_corners=True)
-            depth_list = [depth[i][0].cpu().numpy() for i in range(depth.shape[0])]
-            new_depth = depth_list[-1]
-
-            # --- 캐시 push (불량 캐시는 마지막 정상값으로 보정) ---
-            if new_cache is None or (isinstance(new_cache, (list, tuple)) and any(t is None for t in new_cache)):
-                # 마지막 캐시가 존재하면 복제, 아니면 그냥 현재 new_cache(=None) 넣지 않음
-                if len(self.frame_cache_list) > 0 and self.frame_cache_list[-1] is not None:
-                    self.frame_cache_list.append(self.frame_cache_list[-1])
-                else:
-                    self.frame_cache_list.append(new_cache)  # 초기 단계 보호
-            else:
-                self.frame_cache_list.append(new_cache)
-
-        # adjust the sliding window
-        self.frame_id_list.append(self.id)
-        if self.id + INFER_LEN > self.gap + 1:
-            if len(self.frame_id_list) > 1:
-                del self.frame_id_list[1]
-            if len(self.frame_cache_list) > 1:
-                del self.frame_cache_list[1]
-
+        new_depth = depth_up[0, 0].cpu().numpy()               # [H,W]
         return new_depth
