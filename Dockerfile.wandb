@@ -1,5 +1,11 @@
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tzdata && \
+    rm -rf /var/lib/apt/lists/*
+
 # 기본 유틸 설치
 RUN apt update && apt install -y python3-dev python3-pip git ffmpeg libsm6 libxext6
 
