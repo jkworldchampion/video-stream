@@ -25,7 +25,7 @@ for EXP in "${EXPERIMENTS[@]}"; do
   # 1) streaming inference 결과 디렉토리
   INFER_PATH="${ROOT}/benchmark/output/kd_ablation/${EXP}"
   # CHECKPOINT_PATH="${ROOT}/outputs/${EXP}/best_model.pth"
-  CHECKPOINT_PATH="${ROOT}/checkpoints/video_depth_anything_vits.pth"
+  CHECKPOINT_PATH="${ROOT}/outputs/new/${EXP}/latest_model.pth"
   
   # 체크포인트 존재 확인
   if [ ! -f "${CHECKPOINT_PATH}" ]; then

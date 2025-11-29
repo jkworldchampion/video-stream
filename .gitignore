@@ -13,3 +13,4 @@ wandb/
 */.ipynb_checkpoints/
 /dataset
 /cache_experiments
+*.pdf

@@ -98,7 +98,11 @@ def train(args):
         )
 
     # ================== 데이터 ==================
-    kitti_path = "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
+    data_cfg  = config.get("data", {})
+    kitti_path = data_cfg.get(
+        "kitti_path",
+        "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
+    )
 
     # Train set
     rgb_clips, depth_clips = get_data_list(
@@ -350,7 +354,8 @@ def train(args):
     logger.info("Initial validation completed! Starting training...")
     logger.info("=" * 60)
 
-    best_val_loss = kitti_val_loss  # 기준
+    # best_val_loss = kitti_val_loss  # 기준
+    best_delta1 = 0.0
 
     # --------------------- Training ---------------------
     update_frequency = hyper_params.get("update_frequency", 6)
@@ -361,6 +366,7 @@ def train(args):
         epoch_frames = 0.0
         epoch_ssi    = 0.0
         epoch_tgm    = 0.0
+        epoch_kd_dis = 0.0
 
         step_in_window = 0
 
@@ -534,8 +540,8 @@ def train(args):
             })
 
         # best 저장 (KITTI val loss 기준)
-        if kitti_val_loss < best_val_loss:
-            best_val_loss = kitti_val_loss
+        if best_delta1 < scannet_delta1:
+            best_delta1 = scannet_delta1
             best_epoch = epoch
             save_dict = {
                 "epoch": epoch,
@@ -548,7 +554,7 @@ def train(args):
             torch.save(save_dict, best_model_path)
             logger.info(
                 f"🏆 Best model saved! Epoch {epoch}, "
-                f"KITTI val loss: {best_val_loss:.4f} | "
+                f"KITTI val loss: {best_delta1:.4f} | "
                 f"KITTI delta1: {kitti_val_delta1:.4f} | "
                 f"ScanNet delta1: {scannet_delta1:.4f}"
             )

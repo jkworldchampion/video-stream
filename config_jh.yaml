@@ -1,78 +1,37 @@
 hyper_parameter:
-  learning_rate: 0.0001  # 1e-4 -> 1.0e-4 for float representation
+  learning_rate: 1.0e-4
   clip_len: 32
-  ratio_ssi: 1
-  ratio_tgm: 10
+  ratio_ssi: 1.0
+  ratio_tgm: 10.0
   epochs: 75
-  batch_size: 4  # 4 -> 2로 줄여서 메모리 사용량 감소
-  update_frequency: 6  # N 프레임마다 가중치 업데이트 (스트리밍용)
+  batch_size: 4
+  update_frequency: 6
 
-# Model Architecture Configuration
 model:
-  encoder: "vits"  # Vision Transformer size: vits, vitb, vitl
+  encoder: "vits"
   features: 64
   out_channels: [48, 96, 192, 384]
-  num_frames: 32  # Should match clip_len
+  num_frames: 32
   resize_size: 518
 
-# Optimizer Configuration
 optimizer:
   type: "AdamW"
-  weight_decay: 0.0001  # 1e-4
-  
-# Scheduler Configuration
+  weight_decay: 1.0e-4
+
 scheduler:
   type: "CosineAnnealingLR"
-  eta_min: 0.000001  # 1e-6
+  eta_min: 1.0e-6
 
-# Loss Configuration
 loss:
   tgm:
-    diff_depth_th: 0.05  # Temporal Geometric Consistency threshold
+    diff_depth_th: 0.05
   ssi:
-    type: "basic"  # Scale-Shift Invariant loss type
+    type: "basic"
 
-# Knowledge Distillation (KD) Configuration
 kd_aux:
-  enabled: false  # KD 활성화 여부
-  layers: [0, 1, 2, 3]  # dpt_temporal에서 사용할 레이어 인덱스 (4개 temporal 지점)
-  N: 1  # APC(Autoregressive Predictive Coding) 미래 스텝 수
-  
-  # KD Loss weights (Ablation Study: 개별 컴포넌트 on/off 가능)
-  alpha: 0.0  # L_DIS (DistilHuBERT feature loss) 가중치 - 0으로 설정 시 DIS 비활성화
-  beta: 0.0005  # L_KLD (Attention Relation KL divergence) 가중치 - 0으로 설정 시 KLD 비활성화
-  gamma: 0.005  # L_APC (Autoregressive Predictive Coding) 가중치 - 0으로 설정 시 APC 비활성화
-  lambda_kd: 1.0  # 전체 KD loss 가중치 (최종 loss에 곱해짐)
-  
-  # KD Sliding Window Configuration
-  window: 32  # KD 슬라이딩 윈도우 길이 (보통 clip_len과 동일, 16으로 하면 성능 향상)
-  stride: 1  # KD 실행 보폭 (매 프레임=1, 비용 절감=2/4)
-  
-  # Feature Processing
-  feature_pool: "mean"  # Feature pooling 방식: mean, max, etc.
-  attn_eps: 0.00000001  # 1e-8, Attention 계산 시 안정성을 위한 epsilon
+  enabled: true         # baseline에서는 OFF
+  lambda_kd: 0.1         # 나중에 output KD 켤 때 사용할 예정 값
 
-# AuxBlock Configuration (Student → Teacher feature projection)
-aux_block:
-  nhead: 8  # Multi-head attention의 head 수
-  dropout: 0.0  # Dropout rate
-  return_attn: false  # Attention weights 반환 여부
-  return_qkv: true  # Query/Key/Value 반환 여부 (KD에 필요)
-  
-  # RNN Configuration
-  rnn_type: "lstm"  # RNN 타입: lstm 또는 mamba
-  
-  # Mamba Configuration (rnn_type="mamba"일 때 사용)
-  mamba_d_state: 16  # Mamba state dimension
-  mamba_d_conv: 4  # Mamba convolution dimension
-  mamba_expand: 2  # Mamba expansion factor
-
-# Teacher-Student Dimension Mapping
-dimensions:
-  teacher: [192, 384, 64, 64]  # teacher out_channels[2], out_channels[3], features, features
-  student: [192, 384, 64, 64]  # student out_channels[2], out_channels[3], features, features
-
-# Data Configuration
 data:
   kitti_path: "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
   data_name: "kitti"
@@ -80,17 +39,15 @@ data:
   num_workers: 4
   pin_memory: true
 
-# Validation Configuration
 validation:
   json_file: "/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
   infer_dir: "benchmark/output/scannet_stream_valmini"
   dataset_key: "scannet"
   dataset_tag: "scannet_500"
   scenes: 2
-  scene_indices: [0, 1]  # 검증에 사용할 씬 인덱스
-  fp32: true  # FP32 모드로 검증
+  scene_indices: [0, 1]
+  fp32: true
 
-# Wandb Configuration
 wandb:
-  project: "new_base"  # wandb 프로젝트 이름
-  entity: "depth-finder"  # wandb entity (organization), null이면 개인 계정 사용
+  project: "new_base"
+  entity: "depth-finder"
