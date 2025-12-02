@@ -34,12 +34,12 @@ if __name__ == '__main__':
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
-    parser.add_argument(
-        '--checkpoint',
-        type=str,
-        default='./outputs/experiment_2/best_model.pth',
-        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)'
-    )
+    parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
+                        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
+    parser.add_argument('--scene_limit', type=int, default=0,
+                        help='Use only the first N scenes from the JSON. 0 disables the limit.')
+    parser.add_argument('--stream_cache_len', type=int, default=31,
+                        help='Streaming cache length n (0,1 anchor + n-2 recent frames). None → default (31).')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -86,6 +86,10 @@ if __name__ == '__main__':
     with open(args.json_file, 'r') as fs:
         path_json = json.load(fs)
     root_path = os.path.dirname(args.json_file)
+
+    # ───────────────── 장면 수 제한 ─────────────────
+    if args.scene_limit and args.scene_limit > 0:
+        path_json = {k: v[:args.scene_limit] for k, v in path_json.items()}
 
     # ───────────────── 스트리밍 추론 ─────────────────
     for dataset in args.datasets:

@@ -1,8 +1,3 @@
-# This file is originally from AnimateDiff/animatediff/models/motion_module.py at main · guoyww/AnimateDiff
-# SPDX-License-Identifier: Apache-2.0 license
-#
-# This file may have been modified by ByteDance Ltd. and/or its affiliates on [date of modification]
-# Original file was released under [ Apache-2.0 license], with the full license text available at [https://github.com/guoyww/AnimateDiff?tab=Apache-2.0-1-ov-file#readme].
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -57,12 +52,36 @@ class TemporalModule(nn.Module):
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
 
-    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None):
+    def forward(
+        self,
+        input_tensor,
+        encoder_hidden_states,
+        attention_mask=None,
+        cached_hidden_state_list=None,
+        return_qkv: bool = False,   # NEW: KD용 QKV 반환 플래그
+    ):
         hidden_states = input_tensor
-        hidden_states, output_hidden_state_list = self.temporal_transformer(hidden_states, encoder_hidden_states, attention_mask, cached_hidden_state_list)
 
-        output = hidden_states
-        return output, output_hidden_state_list  # list of hidden states
+        if return_qkv:
+            hidden_states, output_hidden_state_list, qkv = self.temporal_transformer(
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                cached_hidden_state_list,
+                return_qkv=True,
+            )
+            # output: [B,C,F,H,W], output_hidden_state_list: 기존과 동일
+            # qkv: {"q": [B*N, heads, F', Dh], "k": ..., "v": ...}
+            return hidden_states, output_hidden_state_list, qkv
+        else:
+            hidden_states, output_hidden_state_list = self.temporal_transformer(
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                cached_hidden_state_list,
+                return_qkv=False,
+            )
+            return hidden_states, output_hidden_state_list  # list of hidden states
 
 
 class TemporalTransformer3DModel(nn.Module):
@@ -99,11 +118,18 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, cached_hidden_state_list=None):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        cached_hidden_state_list=None,
+        return_qkv: bool = False,   # NEW
+    ):
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         output_hidden_state_list = []
 
-        video_length = hidden_states.shape[2]
+        video_length = hidden_states.shape[2]  # T
         hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
 
         batch, channel, height, width = hidden_states.shape
@@ -119,9 +145,28 @@ class TemporalTransformer3DModel(nn.Module):
             n = len(cached_hidden_state_list) // len(self.transformer_blocks)
         else:
             n = 0
+
+        qkv_last = None  # NEW: 마지막 block의 QKV만 사용
         for i, block in enumerate(self.transformer_blocks):
-            hidden_states, hidden_state_list = block(hidden_states, encoder_hidden_states=encoder_hidden_states, video_length=video_length, attention_mask=attention_mask,
-                                                     cached_hidden_state_list=cached_hidden_state_list[i*n:(i+1)*n] if n else None)
+            if return_qkv:
+                hidden_states, hidden_state_list, qkv = block(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    video_length=video_length,
+                    cached_hidden_state_list=cached_hidden_state_list[i * n:(i + 1) * n] if n else None,
+                    return_qkv=True,
+                )
+                qkv_last = qkv  # 가장 마지막 block에서 계산된 qkv 사용
+            else:
+                hidden_states, hidden_state_list = block(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    video_length=video_length,
+                    cached_hidden_state_list=cached_hidden_state_list[i * n:(i + 1) * n] if n else None,
+                    return_qkv=False,
+                )
             output_hidden_state_list.extend(hidden_state_list)
 
         # output
@@ -130,6 +175,10 @@ class TemporalTransformer3DModel(nn.Module):
 
         output = hidden_states + residual
         output = rearrange(output, "(b f) c h w -> b c f h w", f=video_length)
+
+        if return_qkv:
+            # qkv_last: {"q": [B*N, heads, F', Dh], "k": ..., "v": ...}
+            return output, output_hidden_state_list, qkv_last
 
         return output, output_hidden_state_list
 
@@ -149,11 +198,11 @@ class TemporalTransformerBlock(nn.Module):
         self.attention_blocks = nn.ModuleList(
             [
                 TemporalAttention(
-                        query_dim=dim,
-                        heads=num_attention_heads,
-                        dim_head=attention_head_dim,
-                        temporal_max_len=temporal_max_len,
-                        pos_embedding_type=pos_embedding_type,
+                    query_dim=dim,
+                    heads=num_attention_heads,
+                    dim_head=attention_head_dim,
+                    temporal_max_len=temporal_max_len,
+                    pos_embedding_type=pos_embedding_type,
                 )
                 for i in range(num_attention_blocks)
             ]
@@ -168,24 +217,50 @@ class TemporalTransformerBlock(nn.Module):
         self.ff = FeedForward(dim, dropout=0.0, activation_fn="geglu")
         self.ff_norm = nn.LayerNorm(dim)
 
-
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_state_list=None):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        video_length=None,
+        cached_hidden_state_list=None,
+        return_qkv: bool = False,  # NEW
+    ):
         output_hidden_state_list = []
+        qkv_last = None  # NEW
+
         for i, (attention_block, norm) in enumerate(zip(self.attention_blocks, self.norms)):
             norm_hidden_states = norm(hidden_states)
-            residual_hidden_states, output_hidden_states = attention_block(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                video_length=video_length,
-                attention_mask=attention_mask,
-                cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
-            )
+            if return_qkv:
+                residual_hidden_states, output_hidden_states, qkv = attention_block(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    video_length=video_length,
+                    attention_mask=attention_mask,
+                    cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
+                    return_qkv=True,
+                )
+                qkv_last = qkv  # 마지막 attention block의 qkv 사용
+            else:
+                residual_hidden_states, output_hidden_states = attention_block(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    video_length=video_length,
+                    attention_mask=attention_mask,
+                    cached_hidden_states=cached_hidden_state_list[i] if cached_hidden_state_list is not None else None,
+                    return_qkv=False,
+                )
+
             hidden_states = residual_hidden_states + hidden_states
             output_hidden_state_list.append(output_hidden_states)
 
         hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
 
         output = hidden_states
+        if return_qkv:
+            # qkv_last: {"q": [B*N, heads, F', Dh], "k": ..., "v": ...}
+            return output, output_hidden_state_list, qkv_last
+
         return output, output_hidden_state_list
 
 
@@ -208,6 +283,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         x = x + self.pe[:, :x.size(1)].to(x.dtype)
         return self.dropout(x)
+
 
 class TemporalAttention(CrossAttention):
     def __init__(
@@ -239,12 +315,22 @@ class TemporalAttention(CrossAttention):
         else:
             raise NotImplementedError
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        video_length=None,
+        cached_hidden_states=None,
+        return_qkv: bool = False,   # NEW
+    ):
         # TODO: support cache for these
         assert encoder_hidden_states is None
         assert attention_mask is None
 
-        d = hidden_states.shape[1]
+        # hidden_states: [BT, N, C] (BT = b*f, N = tokens per frame)
+        d_tokens = hidden_states.shape[1]
+
         d_in = 0
         if cached_hidden_states is None:
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
@@ -258,7 +344,7 @@ class TemporalAttention(CrossAttention):
         if self.pos_encoder is not None:
             hidden_states = self.pos_encoder(hidden_states)
 
-        encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d) if encoder_hidden_states is not None else encoder_hidden_states
+        encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d_tokens) if encoder_hidden_states is not None else encoder_hidden_states
 
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -284,31 +370,43 @@ class TemporalAttention(CrossAttention):
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
-
         use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
         if use_memory_efficient and (dim // self.heads) % 8 != 0:
             # print('Warning: the dim {} cannot be divided by 8. Fall into normal attention'.format(dim // self.heads))
             use_memory_efficient = False
 
+        # ----- Q/K/V 4D 저장 (KD용) -----
+        qkv = None
+        if return_qkv:
+            # reshape_heads_to_4d: (batch, seq, dim) -> (batch, heads, seq, head_dim)
+            q_4d = self.reshape_heads_to_4d(query)
+            k_4d = self.reshape_heads_to_4d(key)
+            v_4d = self.reshape_heads_to_4d(value)
+            # q_4d: [(B * d_tokens), heads, F', Dh]
+            qkv = {"q": q_4d, "k": k_4d, "v": v_4d}
+
         # attention, what we cannot get enough of
         if use_memory_efficient:
-            query = self.reshape_heads_to_4d(query)
-            key = self.reshape_heads_to_4d(key)
-            value = self.reshape_heads_to_4d(value)
-
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
+            # xFormers path는 4D 입력 사용
+            if return_qkv:
+                hidden_states = self._memory_efficient_attention_xformers(q_4d, k_4d, v_4d, attention_mask)
+            else:
+                query_4d = self.reshape_heads_to_4d(query)
+                key_4d = self.reshape_heads_to_4d(key)
+                value_4d = self.reshape_heads_to_4d(value)
+                hidden_states = self._memory_efficient_attention_xformers(query_4d, key_4d, value_4d, attention_mask)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
-            query = self.reshape_heads_to_batch_dim(query)
-            key = self.reshape_heads_to_batch_dim(key)
-            value = self.reshape_heads_to_batch_dim(value)
+            # 일반 attention path: 3D -> batch_dim
+            query_bd = self.reshape_heads_to_batch_dim(query)
+            key_bd = self.reshape_heads_to_batch_dim(key)
+            value_bd = self.reshape_heads_to_batch_dim(value)
 
-            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value, attention_mask)
+            if self._slice_size is None or query_bd.shape[0] // self._slice_size == 1:
+                hidden_states = self._attention(query_bd, key_bd, value_bd, attention_mask)
             else:
                 raise NotImplementedError
-                # hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -316,6 +414,10 @@ class TemporalAttention(CrossAttention):
         # dropout
         hidden_states = self.to_out[1](hidden_states)
 
-        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d_tokens)
+
+        if return_qkv:
+            # (hidden_states, input_hidden_states, qkv) 반환
+            return hidden_states, input_hidden_states, qkv
 
         return hidden_states, input_hidden_states

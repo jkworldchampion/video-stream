@@ -1,7 +1,22 @@
- *.pth
+*.pth
 *.pt
 __pycache__/
 outputs/
 logs/
 *.npy
-benchmark/
+.vscode/
+outputs
+checkpoints
+__pycache__
+*/__pycache__
+*.pyc
+gradio*
+.env
+/benchmark/output
+logs
+wandb/
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+/dataset
+/cache_experiments
+*.pdf

@@ -29,6 +29,7 @@ INFER_LEN = 32
 OVERLAP = 10
 INTERP_LEN = 8
 
+
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
@@ -69,6 +70,7 @@ class VideoDepthAnything(nn.Module):
         assert self.gap == 41
         self.id = -1
 
+    # ----------------------- basic forward (clip) -----------------------
     def forward(self, x):
         return self.forward_depth(self.forward_features(x), x.shape)[0]
 
@@ -81,28 +83,67 @@ class VideoDepthAnything(nn.Module):
         )
         return features
 
-    def forward_depth(self, features, x_shape, cached_hidden_state_list=None):
+    def forward_depth(
+        self,
+        features,
+        x_shape,
+        cached_hidden_state_list=None,
+        return_intermediates: bool = False,
+        return_qkv: bool = False,
+        kd_layers=None,
+    ):
+        """
+        head 래핑:
+          - depth_bt: [B,T,H,W]
+          - cur_cached_hidden_state_list: motion hidden state 리스트
+          - intermediates: {"qkv": {layer_id: {"q": [BN,Hh,F,D], ...}}}
+        """
         B, T, C, H, W = x_shape
         patch_h, patch_w = H // 14, W // 14
-        depth, cur_cached_hidden_state_list = self.head(
-            features,
-            patch_h,
-            patch_w,
-            T,
-            cached_hidden_state_list=cached_hidden_state_list,
-        )
+
+        if return_intermediates or return_qkv:
+            depth, cur_cached_hidden_state_list, intermediates = self.head(
+                features,
+                patch_h,
+                patch_w,
+                T,
+                cached_hidden_state_list=cached_hidden_state_list,
+                return_intermediates=True,
+                return_qkv=return_qkv,
+                kd_layers=kd_layers,
+            )
+        else:
+            depth, cur_cached_hidden_state_list = self.head(
+                features,
+                patch_h,
+                patch_w,
+                T,
+                cached_hidden_state_list=cached_hidden_state_list,
+            )
+            intermediates = None
+
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         # depth: [B*T,1,H,W] → [B,T,H,W]
-        return depth.squeeze(1).unflatten(0, (B, T)), cur_cached_hidden_state_list
+        depth_bt = depth.squeeze(1).unflatten(0, (B, T))
+        return depth_bt, cur_cached_hidden_state_list, intermediates
 
-    def stream_step_train(self, x_t, cache_state=None):
+    # ----------------------- streaming (train) -----------------------
+    def stream_step_train(
+        self,
+        x_t,
+        cache_state=None,
+        return_kd: bool = False,
+        kd_layers=None,
+    ):
         """
-        x_t: [B,1,3,H,W]
-        cache_state: None이면 새 시퀀스 시작, 아니면 이전 step에서 받은 dict
+        x_t      : [B,1,3,H,W]
+        cache_state:
+            - None이면 새 시퀀스 시작
+            - dict이면 이전 step 상태 이어받기
         return:
-            pred_t: [B,H,W]
-            cache_state: 업데이트된 dict
+            - return_kd=False → pred_t_net, cache_state
+            - return_kd=True  → pred_t_net, cache_state, student_kd_t
         """
         if cache_state is None:
             cache_state = {
@@ -113,31 +154,38 @@ class VideoDepthAnything(nn.Module):
 
         cache_state["id"] += 1
 
-        feats = self.forward_features(x_t)   # [B,1,...]
-        x_shape = x_t.shape                  # [B,1,3,H,W]
+        feats   = self.forward_features(x_t)  # [B,1,...]
+        x_shape = x_t.shape                   # [B,1,3,H,W]
 
-        # train: detach_past=True
-        pred_t_net, cache_state = self._stream_step_core(
+        pred_t_net, cache_state, student_kd_t = self._stream_step_core(
             feats,
             x_shape,
             cache_state=cache_state,
-            detach_past=True,
+            detach_past=True,          # train 모드에서는 과거 cache detach
+            return_kd=return_kd,
+            kd_layers=kd_layers,
         )
-        # pred_t_net: [B,H,W]
-        return pred_t_net, cache_state
 
-    def _stream_step_core(self, cur_feature, x_shape, cache_state, detach_past: bool):
+        if return_kd:
+            return pred_t_net, cache_state, student_kd_t
+        else:
+            return pred_t_net, cache_state
+
+    def _stream_step_core(
+        self,
+        cur_feature,
+        x_shape,
+        cache_state,
+        detach_past: bool,
+        return_kd: bool = False,
+        kd_layers=None,
+    ):
         """
-        cur_feature: [B, 1, ...] 한 프레임에 해당하는 encoder feature
-        x_shape:     [B, 1, 3, H, W]
-        cache_state: {
-            "frame_cache_list": list[hidden_state_list],
-            "frame_id_list":    list[int],
-            "id":               int,  # 현재 frame index
-        }
-        detach_past:
-            - train: True  (과거 cache는 detach 해서 그래프 끊기)
-            - infer: False (어차피 no_grad)
+        내부 streaming step 핵심 로직.
+
+        return_kd=False → (new_depth, cache_state, None)
+        return_kd=True  → (new_depth, cache_state, student_kd_t)
+            student_kd_t["qkv"][lid]["q"]: [B, heads, N, D]
         """
         frame_cache_list = cache_state["frame_cache_list"]
         frame_id_list    = cache_state["frame_id_list"]
@@ -146,28 +194,43 @@ class VideoDepthAnything(nn.Module):
         B, T, C, H, W = x_shape
         assert T == 1, f"stream step expects T=1, got T={T}"
 
-        # 1) 첫 프레임: cache 없음
-        if len(frame_cache_list) == 0:
-            depth, cached_hidden_state_list = self.forward_depth(
-                cur_feature, x_shape, cached_hidden_state_list=None
-            )  # depth: [B,1,H,W]
+        student_kd_t = None  # 기본값
 
-            if detach_past:
-                cached_hidden_state_list = [
-                    h.detach() for h in cached_hidden_state_list
-                ]
+        # -------------------- 1) 첫 프레임: cache 없음 --------------------
+        if len(frame_cache_list) == 0:
+            depth_bt, cached_hidden_state_list, intermediates = self.forward_depth(
+                cur_feature,
+                x_shape,
+                cached_hidden_state_list=None,
+                return_intermediates=return_kd,
+                return_qkv=return_kd,
+                kd_layers=kd_layers,
+            )
+
+            if detach_past and cached_hidden_state_list is not None:
+                cached_hidden_state_list = [h.detach() for h in cached_hidden_state_list]
 
             # INFER_LEN 길이의 window로 초기화
             frame_cache_list = [cached_hidden_state_list for _ in range(INFER_LEN)]
-            frame_id_list = [cur_id for _ in range(INFER_LEN)]
+            frame_id_list    = [cur_id for _ in range(INFER_LEN)]
 
-            new_depth = depth[:, 0]  # [B,H,W]
+            # 현재 프레임 depth
+            new_depth = depth_bt[:, 0]  # [B,H,W]
+
+            # KD 추출 (T=1)
+            if return_kd:
+                student_kd_t = self._extract_kd_from_intermediates(
+                    intermediates,
+                    B=B,
+                    kd_layers=kd_layers,
+                )
 
             cache_state["frame_cache_list"] = frame_cache_list
             cache_state["frame_id_list"]    = frame_id_list
-            return new_depth, cache_state
+            return new_depth, cache_state, student_kd_t
 
-        # 2) 이후 프레임: 기존 infer_video_depth_one과 동일한 window 규칙
+        # -------------------- 2) 이후 프레임: 기존 streaming window --------------------
+        # 과거 cache window 구성 (infer_video_depth_one 과 동일 규칙)
         cur_list = frame_cache_list[0:2] + frame_cache_list[-INFER_LEN + 3:]
         assert len(cur_list) == INFER_LEN - 1, \
             f"cache window mismatch: {len(cur_list)} vs {INFER_LEN-1}"
@@ -178,17 +241,22 @@ class VideoDepthAnything(nn.Module):
             for i in range(len(cur_list[0]))
         ]
 
-        depth, new_cache = self.forward_depth(
-            cur_feature, x_shape, cached_hidden_state_list=cur_cache
-        )  # depth: [B,1,H,W]
+        depth_bt, new_cache, intermediates = self.forward_depth(
+            cur_feature,
+            x_shape,
+            cached_hidden_state_list=cur_cache,
+            return_intermediates=return_kd,
+            return_qkv=return_kd,
+            kd_layers=kd_layers,
+        )
 
-        if detach_past:
+        if detach_past and new_cache is not None:
             new_cache = [h.detach() for h in new_cache]
 
         frame_cache_list.append(new_cache)
         frame_id_list.append(cur_id)
 
-        # sliding window 규칙 그대로 사용
+        # sliding window 규칙 유지
         if cur_id + INFER_LEN > self.gap + 1:
             del frame_cache_list[1]
             del frame_id_list[1]
@@ -196,9 +264,108 @@ class VideoDepthAnything(nn.Module):
         cache_state["frame_cache_list"] = frame_cache_list
         cache_state["frame_id_list"]    = frame_id_list
 
-        new_depth = depth[:, 0]  # [B,H,W]
-        return new_depth, cache_state
+        # 현재 프레임 depth
+        new_depth = depth_bt[:, 0]  # [B,H,W]
 
+        # KD 추출 (현재 step)
+        if return_kd:
+            student_kd_t = self._extract_kd_from_intermediates(
+                intermediates,
+                B=B,
+                kd_layers=kd_layers,
+            )
+
+        return new_depth, cache_state, student_kd_t
+
+    def _extract_kd_from_intermediates(self, intermediates, B: int, kd_layers=None):
+        """
+        DPTHeadTemporal 가 넘겨준 intermediates["qkv"] 에서
+        현재 step(t)에 해당하는 Q/K/V를 [B, heads, N, D] 로 변환.
+
+        DPTHeadTemporal 이 저장하는 포맷은 다음과 같이 가정한다:
+          q, k, v : [BN, F, Hh, D]
+            - BN = B * N_tokens_per_frame
+            - F  = temporal window length (cache 포함)
+            - Hh = num_heads
+            - D  = head_dim
+
+        여기서는 마지막 time-step(F-1)을 "현재 프레임 t" 로 보고,
+        그 위치의 Q/K/V를 꺼내서 KD 용도로 사용한다.
+
+        반환:
+          {"qkv": { layer_id: {"q": [B,Hh,N,D], "k": [...], "v": [...] } } }
+        """
+        if intermediates is None or "qkv" not in intermediates:
+            return None
+
+        qkv_src = intermediates["qkv"]
+        if not qkv_src:
+            return None
+
+        if kd_layers is None:
+            kd_layers = sorted(qkv_src.keys())
+
+        qkv_out = {}
+
+        for lid in kd_layers:
+            if lid not in qkv_src:
+                continue
+
+            q = qkv_src[lid]["q"]
+            k = qkv_src[lid]["k"]
+            v = qkv_src[lid]["v"]
+
+            # ----- 기본 shape 체크 -----
+            if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+                raise ValueError(
+                    f"[student] Unexpected q/k/v dim at layer {lid}: "
+                    f"q={q.shape}, k={k.shape}, v={v.shape}"
+                )
+
+            # q, k, v 모두 [BN, F, Hh, D] 포맷으로 가정
+            BN, Fq, Hh, D = q.shape
+            BNk, Fk, Hhk, Dk = k.shape
+            BNv, Fv, Hhv, Dv = v.shape
+
+            # k, v가 q와 일관된지 확인
+            if not (BNk == BN and BNv == BN and
+                    Hhk == Hh and Hhv == Hh and
+                    Dk == D and Dv == D):
+                raise ValueError(
+                    f"[student] K/V shape mismatch at layer {lid}: "
+                    f"q={q.shape}, k={k.shape}, v={v.shape}"
+                )
+
+            if BN % B != 0:
+                raise ValueError(
+                    f"[student] BN ({BN}) not divisible by B ({B}) at layer {lid}"
+                )
+            N = BN // B  # 토큰 수
+
+            # ----- 마지막 time-step(F-1)을 현재 프레임으로 사용 -----
+            # q_last: [BN, Hh, D]
+            q_last = q[:, -1, :, :]
+            k_last = k[:, -1, :, :]
+            v_last = v[:, -1, :, :]
+
+            # [BN, Hh, D] → [B, N, Hh, D] → [B, Hh, N, D]
+            q_last = q_last.view(B, N, Hh, D).permute(0, 2, 1, 3).contiguous()
+            k_last = k_last.view(B, N, Hh, D).permute(0, 2, 1, 3).contiguous()
+            v_last = v_last.view(B, N, Hh, D).permute(0, 2, 1, 3).contiguous()
+
+            qkv_out[lid] = {
+                "q": q_last.detach(),
+                "k": k_last.detach(),
+                "v": v_last.detach(),
+            }
+
+        if not qkv_out:
+            return None
+
+        return {"qkv": qkv_out}
+
+
+    # ----------------------- streaming (inference, one frame) -----------------------
     def infer_video_depth_one(self, frame, input_size=518, device='cuda', fp32=False):
         """
         frame: H,W,3 (numpy, BGR or RGB 상관 없이 transform에서 처리)
@@ -256,12 +423,14 @@ class VideoDepthAnything(nn.Module):
                     "id": self.id,
                 }
 
-                # infer: detach_past=False
-                depth_net, cache_state = self._stream_step_core(
+                # infer: detach_past=False, KD 필요 없음
+                depth_net, cache_state, _ = self._stream_step_core(
                     cur_feature,
                     x_shape,
                     cache_state=cache_state,
                     detach_past=False,
+                    return_kd=False,   # 명시적으로 KD off
+                    kd_layers=None,
                 )
 
         # 4) 내부 state 업데이트

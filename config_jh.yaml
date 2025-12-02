@@ -29,8 +29,10 @@ loss:
     type: "basic"
 
 kd_aux:
-  enabled: true         # baseline에서는 OFF
-  lambda_kd: 0.1         # 나중에 output KD 켤 때 사용할 예정 값
+  enabled: true
+  layers: [0, 1, 2, 3]
+  lambda_out: 1.0e-3
+  lambda_qkv: 1.0e-4
 
 data:
   kitti_path: "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"

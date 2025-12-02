@@ -10,6 +10,13 @@ import gc
 import time
 import torch
 
+# --- wandb (옵션) 추가 시작 ---
+try:
+    import wandb
+except Exception:
+    wandb = None
+# --- wandb (옵션) 추가 끝 ---
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def compute_errors_torch(gt, pred):
@@ -132,6 +139,10 @@ def eval_TAE(infer_paths, depth_gt_paths, factors, masks, Ks, poses, args):
         poses_cur.append(poses[i])
         if args.mask:
             masks_cur.append(masks[i])
+
+    if len(gts) <= 1:
+        # 프레임이 1개 이하이면 TAE 정의가 안 되므로 0 리턴 (또는 None으로 처리해도 됨)
+        return None
     
     gts = np.stack(gts, axis=0)
     infs = np.stack(infs, axis=0)
@@ -228,15 +239,47 @@ if __name__ == '__main__':
     parser.add_argument('--eval_scenes_num', type=int, default=20)
     parser.add_argument('--hard_crop', action='store_true', default=False)
 
+    # --- wandb 옵션 추가 (eval.py와 동일 스타일) ---
+    parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='tae-eval', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default='depth-finder', help='wandb entity (team or username)')
+    parser.add_argument('--wandb_run_name', type=str, default='', help='wandb run name')
+    parser.add_argument('--wandb_group', type=str, default='', help='wandb group')
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                        choices=['online', 'offline', 'disabled'], help='wandb mode')
+
     args = parser.parse_args()
 
     results_save_path = os.path.join(args.infer_path, 'results.txt')
+
+    # --- wandb 초기화 ---
+    if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+        wandb.init(
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+            name=(args.wandb_run_name if args.wandb_run_name else None),
+            group=(args.wandb_group if args.wandb_group else None),
+            mode=args.wandb_mode,
+            config={
+                'infer_path': args.infer_path,
+                'benchmark_path': args.benchmark_path,
+                'datasets': args.datasets,
+                'metric': 'tae',
+                'start_idx': args.start_idx,
+                'end_idx': args.end_idx,
+                'eval_scenes_num': args.eval_scenes_num,
+                'hard_crop': args.hard_crop,
+            }
+        )
+        global_step = 0
+    else:
+        global_step = 0  # 안전하게 기본값
 
     for dataset in args.datasets:
 
         file = open(results_save_path, 'a')
         if dataset == 'scannet':
-            args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video.json')
+            args.json_file = os.path.join(args.benchmark_path,'scannet/scannet_video_tae.json')
             args.root_path = os.path.join(args.benchmark_path, 'scannet/')
             args.max_depth_eval = 10.0
             args.min_depth_eval = 0.1
@@ -288,8 +331,28 @@ if __name__ == '__main__':
             results_all += error
             count += 1
 
-        print(dataset,': ','tae ', results_all / count)
-        file.write(f'{dataset}: {results_all / count}\n')
+            # --- wandb: scene별 TAE 로그 ---
+            if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+                wandb.log(
+                    {
+                        'dataset': dataset,
+                        'scene': str(scene_name),
+                        'tae': float(error),
+                    },
+                    step=global_step
+                )
+                global_step += 1
+        mean_tae = results_all / max(count, 1)
+        print(dataset, ': ', 'tae ', mean_tae)
+        file.write(f'{dataset}: {mean_tae}\n')
         file.write(f'<{line} {dataset} finish {line}>\n')
 
+        # --- wandb: dataset 평균 로그 ---
+        if args.wandb and wandb is not None and args.wandb_mode != 'disabled':
+            wandb.log(
+                {
+                    f'{dataset}_mean/tae': float(mean_tae),
+                },
+                step=global_step
+            )
 

@@ -32,6 +32,7 @@ OVERLAP = 10
 KEYFRAMES = [0,12,24,25,26,27,28,29,30,31]
 INTERP_LEN = 8
 
+
 class VideoDepthAnything(nn.Module):
     def __init__(
         self,
@@ -53,34 +54,114 @@ class VideoDepthAnything(nn.Module):
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
-        self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
+        self.head = DPTHeadTemporal(
+            self.pretrained.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            use_clstoken=use_clstoken,
+            num_frames=num_frames,
+            pe=pe,
+        )
 
-    def forward(self, x, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean"):
-        """
-        기본: [B,T,H,W] depth 반환
-        return_intermediates=True: {"pred": [B,T,H,W], "intermediates": dict} 반환
-        """
+    def forward(
+        self,
+        x,
+        *,
+        return_intermediates: bool = False,
+        return_qkv: bool = False,
+        return_kd: bool = False,
+        kd_layers=None,
+    ):
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
-        features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        if return_intermediates or return_qkv:
-            depth_raw = self.head(
-                features, patch_h, patch_w, T,
-                return_intermediates=True,
-                return_qkv=return_qkv,
-                feature_pool=feature_pool,
-            )
-            depth, _cache, intermediates = depth_raw
-        else:
-            depth, _cache = self.head(features, patch_h, patch_w, T)
 
+        # DINOv2 feature
+        features = self.pretrained.get_intermediate_layers(
+            x.flatten(0, 1),
+            self.intermediate_layer_idx[self.encoder],
+            return_class_token=True,
+        )
+
+        need_inter = return_intermediates or return_qkv or return_kd
+
+        if need_inter:
+            depth, _cache, intermediates = self.head(
+                features,
+                patch_h,
+                patch_w,
+                T,
+                return_intermediates=True,
+                return_qkv=True,   # KD/QKV면 무조건 켠다
+                kd_layers=kd_layers,
+            )
+        else:
+            depth, _cache = self.head(
+                features,
+                patch_h,
+                patch_w,
+                T,
+            )
+            intermediates = None
+
+        # [BT,1,h',w'] → [B,T,H,W]
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
         depth_bt = depth.squeeze(1).unflatten(0, (B, T))  # [B,T,H,W]
 
+        # ----- KD 모드: (depth, kd_dict) 반환 -----
+        if return_kd:
+            kd = {}
+            qkv_src = intermediates.get("qkv", {}) if intermediates is not None else {}
+
+            if kd_layers is None:
+                kd_layers = sorted(qkv_src.keys())
+
+            qkv_out = {}
+
+            for lid in kd_layers:
+                if lid not in qkv_src:
+                    continue
+
+                q = qkv_src[lid]["q"]   # [B*N, Hh, Fq, D] 가정
+                k = qkv_src[lid]["k"]
+                v = qkv_src[lid]["v"]
+
+                if q.dim() != 4:
+                    raise ValueError(f"[teacher] Unexpected Q dim at layer {lid}: {q.shape}")
+
+                BN, Hh, Fq, D = q.shape
+
+                # 더 이상 Fq == T 라고 가정하지 않는다.
+                if BN % B != 0:
+                    raise ValueError(
+                        f"[teacher] Q batch mismatch at layer {lid}: BN={BN}, B={B}"
+                    )
+
+                N = BN // B  # spatial tokens per frame
+
+                # [B*N,Hh,Fq,D] → [B,N,Hh,Fq,D] → [B,Fq,Hh,N,D]
+                q = q.view(B, N, Hh, Fq, D).permute(0, 3, 2, 1, 4).contiguous()
+                k = k.view(B, N, Hh, Fq, D).permute(0, 3, 2, 1, 4).contiguous()
+                v = v.view(B, N, Hh, Fq, D).permute(0, 3, 2, 1, 4).contiguous()
+
+                # 이제 teacher_kd["qkv"][lid]["q"] 의 time 길이는 Fq 이다.
+                # (train.py 에서 time축은 q.shape[1] 로 사용하면 됨)
+                qkv_out[lid] = {
+                    "q": q.detach(),  # [B,Fq,Hh,N,D]
+                    "k": k.detach(),
+                    "v": v.detach(),
+                }
+
+            kd["qkv"] = qkv_out
+            return depth_bt, kd
+
+        # ----- 기존 동작 유지 -----
         if return_intermediates or return_qkv:
             return {"pred": depth_bt, "intermediates": intermediates}
+
         return depth_bt
+
 
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
         frame_height, frame_width = frames[0].shape[:2]
@@ -171,4 +252,3 @@ class VideoDepthAnything(nn.Module):
         depth_list = depth_list_aligned
 
         return np.stack(depth_list[:org_video_len], axis=0), target_fps
-

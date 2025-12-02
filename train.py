@@ -34,7 +34,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 0
+experiment = 3
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -65,10 +65,15 @@ def train(args):
     batch_size = hyper_params["batch_size"]
     CLIP_LEN   = hyper_params["clip_len"]
 
-    # KD 설정 (output KD용 최소 설정)
-    kd_cfg     = config.get("kd_aux", {})
-    kd_enabled = bool(kd_cfg.get("enabled", False))
-    kd_lambda  = float(kd_cfg.get("lambda_kd", 1.0))
+    # KD 설정 (output + QKV)
+    kd_cfg      = config.get("kd_aux", {})
+    kd_layers   = kd_cfg.get("layers", [0, 1, 2, 3])   # temporal block index list
+
+    # 기존 lambda_kd는 lambda_out 기본값으로 재사용
+    lambda_out  = float(kd_cfg.get("lambda_out", kd_cfg.get("lambda_kd", 0.0)))
+    lambda_qkv  = float(kd_cfg.get("lambda_qkv", 0.0))
+
+    kd_enabled  = bool(kd_cfg.get("enabled", False) and (lambda_out > 0.0 or lambda_qkv > 0.0))
 
     if args.epochs is not None:
         num_epochs = int(args.epochs)
@@ -259,6 +264,11 @@ def train(args):
     logger.info(f"  Update Frequency: {hyper_params.get('update_frequency', 6)}")
     logger.info(f"  SSI Loss Weight: {ratio_ssi}")
     logger.info(f"  TGM Loss Weight: {ratio_tgm}")
+    logger.info("--- KD Configuration ---")
+    logger.info(f"  KD Enabled: {kd_enabled}")
+    logger.info(f"  KD Layers: {kd_layers}")
+    logger.info(f"  Lambda (output): {lambda_out}")
+    logger.info(f"  Lambda (QKV):    {lambda_qkv}")
     logger.info("")
     logger.info("--- Model Architecture (Student) ---")
     logger.info(f"  Encoder: {student.encoder}")
@@ -366,7 +376,9 @@ def train(args):
         epoch_frames = 0.0
         epoch_ssi    = 0.0
         epoch_tgm    = 0.0
-        epoch_kd_dis = 0.0
+        epoch_kd_out  = 0.0   # output KD만
+        epoch_kd_qkv  = 0.0   # Q/K/V KD
+        epoch_kd_dis  = 0.0   # (lambda_out * out + lambda_qkv * qkv)의 총합
 
         step_in_window = 0
 
@@ -386,14 +398,22 @@ def train(args):
 
             cache_state = None
             prev_pred_raw = prev_mask = prev_y = None
-
+            
             # ----- Teacher clip prediction (KD용) -----
             teacher_disp_clip = None
+            teacher_kd_qkv    = None   # dict[layer] -> {"q":..., "k":..., "v":...}
+
             if kd_enabled and teacher is not None:
                 with torch.no_grad():
                     with autocast(enabled=torch.cuda.is_available()):
-                        teacher_depth_clip = teacher(x)                                   # [B,T,H,W] depth
-                        teacher_disp_clip  = 1.0 / teacher_depth_clip.clamp(min=1e-6) 
+                        # forward 시 Q/K/V까지 함께 반환하도록 나중에 구현
+                        teacher_depth_clip, teacher_kd = teacher(
+                            x, return_kd=True, kd_layers=kd_layers
+                        )   # depth: [B,T,H,W]
+
+                        teacher_disp_clip = 1.0 / teacher_depth_clip.clamp(min=1e-6)
+                        teacher_kd_qkv    = teacher_kd.get("qkv", None)
+                        # (필요하면 teacher_kd_attn = teacher_kd.get("attn", None) 도 나중에 추가 가능)
 
             frame_pbar = tqdm(range(T), desc=f"Batch {batch_idx+1} - Frames", leave=False, disable=T < 10)
             for t in frame_pbar:
@@ -402,7 +422,14 @@ def train(args):
 
                 with autocast(enabled=torch.cuda.is_available()):
                     # 1-frame streaming step (student 내부 cache_state 사용)
-                    pred_t_net, cache_state = m.stream_step_train(x_t, cache_state)
+                    if kd_enabled:
+                        pred_t_net, cache_state, student_kd_t = m.stream_step_train(
+                            x_t, cache_state, return_kd=True, kd_layers=kd_layers
+                        )
+                    else:
+                        pred_t_net, cache_state = m.stream_step_train(x_t, cache_state)
+                        student_kd_t = None
+
                     pred_t_raw = to_BHW_pred(pred_t_net).clamp(min=1e-6)  # [B,H,W]
 
                     # ----- Scale-Shift & Depth Losses -----
@@ -430,20 +457,47 @@ def train(args):
                     else:
                         tgm_loss = pred_t_raw.new_tensor(0.0)
 
-                    # ----- (NEW) KD loss: Teacher clip disparity vs Student stream disparity -----
-                    kd_loss_t = pred_t_raw.new_tensor(0.0)
-                    if kd_enabled and teacher_disp_clip is not None:
-                        teacher_disp_t = teacher_disp_clip[:, t]                       # [B,H,W]
-                        # 마스크 적용한 L1 KD (disparity space)
-                        kd_mask = mask_t.squeeze(2).squeeze(1)                         # [B,H,W]
+                    # ----- KD loss: output disparity + QKV -----
+                    kd_loss_out_t = pred_t_raw.new_tensor(0.0)
+                    kd_loss_qkv_t = pred_t_raw.new_tensor(0.0)
+
+                    # (1) output KD (disp space)
+                    if kd_enabled and teacher_disp_clip is not None and lambda_out > 0.0:
+                        teacher_disp_t = teacher_disp_clip[:, t]                  # [B,H,W]
+                        kd_mask = mask_t.squeeze(2).squeeze(1)                    # [B,H,W]
                         if kd_mask.any():
                             diff = (pred_t_raw - teacher_disp_t).abs() * kd_mask
-                            kd_loss_t = diff.sum() / kd_mask.sum().clamp(min=1.0)
-                        else:
-                            kd_loss_t = pred_t_raw.new_tensor(0.0)
+                            kd_loss_out_t = diff.sum() / kd_mask.sum().clamp(min=1.0)
+
+                    # (2) Q/K/V KD
+                    if kd_enabled and student_kd_t is not None and teacher_kd_qkv is not None and lambda_qkv > 0.0:
+                        try:
+                            for lid in kd_layers:
+                                if lid not in student_kd_t.get("qkv", {}) or lid not in teacher_kd_qkv:
+                                    continue
+
+                                # 학생: [B, heads, N, D] (현재 timestep)
+                                s_q = student_kd_t["qkv"][lid]["q"]   # [B,H,N,D]
+                                s_k = student_kd_t["qkv"][lid]["k"]
+                                s_v = student_kd_t["qkv"][lid]["v"]
+
+                                # 교사: [B, T, H, N, D] 라고 가정 → 현재 t만 slice
+                                t_q = teacher_kd_qkv[lid]["q"][:, t]  # [B,H,N,D]
+                                t_k = teacher_kd_qkv[lid]["k"][:, t]
+                                t_v = teacher_kd_qkv[lid]["v"][:, t]
+
+                                kd_loss_qkv_t = kd_loss_qkv_t + F.mse_loss(s_q, t_q) \
+                                                               + F.mse_loss(s_k, t_k) \
+                                                               + F.mse_loss(s_v, t_v)
+                        except Exception as e:
+                            # 디버깅용: shape 안 맞으면 여기에서 한 번만 경고 찍고 넘어가도 됨
+                            logger.debug(f"QKV KD skipped at frame {t} due to error: {e}")
+
+                    # (3) 최종 KD term
+                    kd_total_t = lambda_out * kd_loss_out_t + lambda_qkv * kd_loss_qkv_t
 
                     # 최종 loss: depth + KD
-                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_lambda * kd_loss_t if kd_enabled else 0.0)
+                    loss = ratio_ssi * ssi_loss_t + ratio_tgm * tgm_loss + (kd_total_t if kd_enabled else 0.0)
 
                 # 1) grad accumulation
                 scaled_loss = loss / update_frequency
@@ -465,15 +519,19 @@ def train(args):
                 # 통계
                 B_eff = pred_t_raw.shape[0]
                 epoch_frames += B_eff
-                epoch_ssi += ssi_loss_t.item() * B_eff
-                epoch_tgm += tgm_loss.item() * B_eff
-                if kd_enabled:
-                    epoch_kd_dis += kd_loss_t.item() * B_eff  # 이름은 kd_dis 그대로 재활용 (output KD)
+                epoch_ssi    += ssi_loss_t.item()    * B_eff
+                epoch_tgm    += tgm_loss.item()      * B_eff
 
+                if kd_enabled:
+                    epoch_kd_out += kd_loss_out_t.item()     * B_eff
+                    epoch_kd_qkv += kd_loss_qkv_t.item()     * B_eff
+                    epoch_kd_dis += kd_total_t.item()        * B_eff
+
+                avg_frames = max(1, epoch_frames)
                 frame_pbar.set_postfix({
-                    'wSSI': f'{epoch_ssi / max(1, epoch_frames) * ratio_ssi:.4f}',
-                    'wTGM': f'{epoch_tgm / max(1, epoch_frames) * ratio_tgm:.4f}',
-                    'wKD':  f'{(epoch_kd_dis / max(1, epoch_frames) * kd_lambda):.4e}' if kd_enabled else '0.0000',
+                    'wSSI': f'{epoch_ssi / avg_frames * ratio_ssi:.4f}',
+                    'wTGM': f'{epoch_tgm / avg_frames * ratio_tgm:.4f}',
+                    'wKD':  f'{epoch_kd_dis / avg_frames:.4e}' if kd_enabled else '0.0000',
                 })
             frame_pbar.close()
         batch_pbar.close()
@@ -522,13 +580,20 @@ def train(args):
         # KD 평균 (프레임당)
         mean_kd = (epoch_kd_dis / max(1, epoch_frames)) if kd_enabled else 0.0
 
+        # KD 평균 (프레임당, 이미 λ 포함된 값)
+        mean_kd_total = (epoch_kd_dis / max(1, epoch_frames)) if kd_enabled else 0.0
+        mean_kd_out   = (epoch_kd_out / max(1, epoch_frames)) if kd_enabled else 0.0
+        mean_kd_qkv   = (epoch_kd_qkv / max(1, epoch_frames)) if kd_enabled else 0.0
+
         # W&B 로깅
         if not args.test:
             wandb.log({
-                "train/loss": epoch_loss / max(1, len(kitti_train_loader)),
-                "train/ssi":  epoch_ssi  / max(1, epoch_frames),
-                "train/tgm":  epoch_tgm  / max(1, epoch_frames),
-                "train/kd":   mean_kd * kd_lambda if kd_enabled else 0.0,
+                "train/loss":    epoch_loss / max(1, len(kitti_train_loader)),
+                "train/ssi":     epoch_ssi  / max(1, epoch_frames),
+                "train/tgm":     epoch_tgm  / max(1, epoch_frames),
+                "train/kd_total": mean_kd_total if kd_enabled else 0.0,
+                "train/kd_out":   mean_kd_out   if kd_enabled else 0.0,
+                "train/kd_qkv":   mean_kd_qkv   if kd_enabled else 0.0,
 
                 "val_kitti/loss":   kitti_val_loss,
                 "val_kitti/absrel": kitti_val_absrel,
@@ -554,7 +619,7 @@ def train(args):
             torch.save(save_dict, best_model_path)
             logger.info(
                 f"🏆 Best model saved! Epoch {epoch}, "
-                f"KITTI val loss: {best_delta1:.4f} | "
+                f"Best ScanNet delta1: {best_delta1:.4f} | "
                 f"KITTI delta1: {kitti_val_delta1:.4f} | "
                 f"ScanNet delta1: {scannet_delta1:.4f}"
             )
