@@ -69,6 +69,29 @@ class VideoDepthAnything(nn.Module):
         assert self.gap == 41
         self.id = -1
 
+    # =====================================================
+    # QKV 분석용 엔드포인트 (teacher와 동일한 인터페이스)
+    # =====================================================
+    def enable_qkv_save(self, flag: bool):
+        """
+        DPTHeadTemporal → TemporalModule → TemporalAttention 까지
+        Q/K/V 저장 플래그를 내려보내는 래퍼.
+        분석 스크립트에서만 사용 (일반 학습·추론에는 영향 없음).
+        """
+        if hasattr(self.head, "enable_qkv_save"):
+            self.head.enable_qkv_save(flag)
+        else:
+            raise AttributeError("DPTHeadTemporal has no method 'enable_qkv_save'.")
+
+    def collect_qkv(self, layer_idx: int):
+        """
+        특정 temporal layer(layer_idx)의 Q/K/V를 가져오는 래퍼.
+        반환 형태는 teacher와 동일하게 [B, A, L, d].
+        """
+        if hasattr(self.head, "collect_qkv"):
+            return self.head.collect_qkv(layer_idx)
+        raise AttributeError("DPTHeadTemporal has no method 'collect_qkv'.")
+
     def forward(self, x):
         return self.forward_depth(self.forward_features(x), x.shape)[0]
 
@@ -279,3 +302,51 @@ class VideoDepthAnything(nn.Module):
 
         new_depth = depth_up[0, 0].cpu().numpy()               # [H,W]
         return new_depth
+    
+    # -----------------------------------------------------
+    # 🔍 Streaming + QKV 분석용 헬퍼 (train 경로)
+    #   - 분석 스크립트에서만 사용
+    #   - 기존 stream_step_train을 감싸서 Q/K/V를 함께 리턴
+    # -----------------------------------------------------
+    def stream_step_train_with_qkv(self, x_t, cache_state=None, layer_idx: int = None):
+        """
+        분석용:
+          1) Q/K/V 저장 플래그를 켜고
+          2) stream_step_train 한 스텝을 수행한 뒤
+          3) 지정 layer_idx의 Q/K/V를 회수한다.
+
+        return:
+          pred_t: [B,H,W]
+          cache_state: dict
+          (q,k,v): 각 [B,A,L,d] 또는 layer_idx=None이면 (None,None,None)
+        """
+        self.enable_qkv_save(True)
+        pred_t, cache_state = self.stream_step_train(x_t, cache_state)
+
+        q = k = v = None
+        if layer_idx is not None:
+            q, k, v = self.collect_qkv(layer_idx)
+
+        self.enable_qkv_save(False)
+        return pred_t, cache_state, (q, k, v)
+    
+    # -----------------------------------------------------
+    # 🔍 Streaming + QKV 분석용 헬퍼 (inference 경로)
+    #   - 비디오 한 프레임씩 넣으면서 Q/K/V 수집할 때 사용 가능
+    # -----------------------------------------------------
+    def infer_video_depth_one_with_qkv(self, frame, input_size=518,
+                                       device='cuda', fp32=False,
+                                       layer_idx: int = None):
+        """
+        infer_video_depth_one과 동일하지만,
+        지정된 temporal layer의 Q/K/V를 함께 반환 (분석용).
+        """
+        self.enable_qkv_save(True)
+        depth = self.infer_video_depth_one(frame, input_size, device, fp32)
+
+        q = k = v = None
+        if layer_idx is not None:
+            q, k, v = self.collect_qkv(layer_idx)
+
+        self.enable_qkv_save(False)
+        return depth, (q, k, v)

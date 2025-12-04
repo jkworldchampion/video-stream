@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+import numpy as np
+import random
+
 # =======================
 # DATA & MODEL IMPORTS
 # =======================
@@ -15,7 +18,7 @@ from video_depth_anything.video_depth import VideoDepthAnything as VideoDepthTea
 
 
 # =======================
-# QKV UTILITIES
+# UTILITIES
 # =======================
 
 def reshape_qkv_BTND(q: torch.Tensor, T_use: int):
@@ -24,7 +27,7 @@ def reshape_qkv_BTND(q: torch.Tensor, T_use: int):
     -> [B,A,T_use,N,d]
     """
     B, A, L, d = q.shape
-    assert L % T_use == 0, f"L({L}) % T_use({T_use}) != 0"
+    assert L % T_use == 0
     N = L // T_use
     return q.view(B, A, T_use, N, d)
 
@@ -41,50 +44,20 @@ def cosine_l2_same_frame(q1, q2, frame_idx: int):
     return cos, l2
 
 
-def last_query_attention(q, k, T_use: int):
+def build_sliding_windows(T_full: int, window_size: int, step: int):
     """
-    q,k : [B,A,L,d], L=T_use*N
-    return: [B,A,T_use] frame-wise attention weight
+    예: T_full=48, window_size=32, step=5
+    → [(0,32), (5,37), (10,42), ...]
     """
-    B, A, L, d = q.shape
-    assert L % T_use == 0, f"L({L}) % T_use({T_use}) != 0"
-    N = L // T_use
+    return [(s, s + window_size)
+            for s in range(0, T_full - window_size + 1, step)]
 
-    q_ = q.view(B, A, T_use, N, d)
-    k_ = k.view(B, A, T_use, N, d)
-
-    t = T_use - 1  # 마지막 frame (window local index)
-
-    q_last = q_[:, :, t]               # [B,A,N,d]
-    k_all  = k_.reshape(B, A, T_use * N, d)
-
-    scale = 1.0 / math.sqrt(d)
-
-    q_last_exp = q_last.unsqueeze(2)         # [B,A,N,1,d]
-    k_all_exp = k_all.unsqueeze(2)           # [B,A,1,TN,d]
-
-    sim = torch.matmul(q_last_exp, k_all_exp.transpose(-1, -2)) * scale
-    sim = sim.squeeze(3)  # [B,A,N,TN]
-
-    attn = F.softmax(sim, dim=-1)            # [B,A,N,TN]
-
-    # → frame 차원으로 다시 묶기
-    attn_frame = attn.view(B, A, N, T_use, N).sum(-1)  # [B,A,N,T_use]
-    attn_frame = attn_frame.mean(2)                    # [B,A,T_use]
-
-    return attn_frame
-
-
-# =======================
-# TEACHER FORWARD (PREFIX)
-# =======================
 
 def teacher_forward_prefix(teacher: VideoDepthTeacher, x_window: torch.Tensor, layer_idx: int):
     """
     x_window: [B,T_use,3,H,W]
     """
     with torch.no_grad():
-        # 🔹 VideoDepthAnything 쪽에 정의해둔 endpoint 사용
         teacher.enable_qkv_save(True)
         _ = teacher(x_window)
         q, k, v = teacher.collect_qkv(layer_idx)
@@ -93,118 +66,108 @@ def teacher_forward_prefix(teacher: VideoDepthTeacher, x_window: torch.Tensor, l
 
 
 # =======================
-# SLIDING WINDOW GENERATOR
+# MAIN EVAL (한 layer용)
 # =======================
 
-def build_sliding_windows(T_full: int, window_size: int, step: int):
+def analyze_teacher_sliding_stats_for_layer(
+    teacher: VideoDepthTeacher,
+    loader: DataLoader,
+    target_layer: int,
+    physical_frames: List[int],
+    window_size: int,
+    step: int,
+    num_samples: int,
+    device,
+    verbose_per_pair: bool = False,
+):
     """
-    예: T_full=48, window_size=32, step=5
-    반환: [(0,32), (5,37), (10,42), ...]
+    한 개 layer에 대해 여러 sample(T 영상)에서 sliding window shift에 대한
+    Q/K/V invariance 통계를 계산.
     """
-    windows = []
-    s = 0
-    while s + window_size <= T_full:
-        windows.append((s, s + window_size))
-        s += step
-    return windows
+    stats = {
+        "cos_q": [], "cos_k": [], "cos_v": [],
+        "l2_q": [], "l2_k": [], "l2_v": [],
+    }
 
+    for sample_idx, (x, _) in enumerate(loader):
+        if sample_idx >= num_samples:
+            break
 
-# =======================
-# MAIN ANALYZER
-# =======================
+        x = x.to(device)  # [1,T,3,H,W]
+        B, T, _, H, W = x.shape
 
-def analyze_teacher_sliding(teacher: VideoDepthTeacher,
-                            x: torch.Tensor,
-                            target_layer: int,
-                            physical_frames: List[int],
-                            window_size: int,
-                            step: int,
-                            device):
-
-    x = x.to(device)
-    B, T, _, H, W = x.shape
-
-    if window_size > T:
-        raise ValueError(f"window_size({window_size}) > T_full({T})")
-
-    print(f"[Info] Loaded sequence B={B}, T_full={T}, H={H}, W={W}")
-    print(f"[Info] window_size={window_size}, step={step}")
-
-    # 1) sliding windows
-    windows = build_sliding_windows(T_full=T, window_size=window_size, step=step)
-    print(f"[Info] Sliding windows: {windows}")
-
-    # 2) 각 window마다 teacher 돌며 Q/K/V 수집
-    q_list, k_list, v_list = [], [], []
-    for (s, e) in windows:
-        x_win = x[:, s:e]    # [B, window_size, 3, H, W]
-        q, k, v = teacher_forward_prefix(teacher, x_win, target_layer)
-        q_list.append(q)
-        k_list.append(k)
-        v_list.append(v)
-
-    # 3) [B,A,T_use,N,d]로 reshape
-    q_ctx = [reshape_qkv_BTND(q, window_size) for q in q_list]
-    k_ctx = [reshape_qkv_BTND(k, window_size) for k in k_list]
-    v_ctx = [reshape_qkv_BTND(v, window_size) for v in v_list]
-
-    # 4) 같은 physical frame t_phys에 대해 window 간 Q/K/V 비교
-    print("\n====== QKV context invariance (sliding) ======\n")
-
-    for t_phys in physical_frames:
-        print(f"--- Physical frame t={t_phys} ---")
-        if not (0 <= t_phys < T):
-            print(f"  [Warn] t_phys={t_phys} is outside [0,{T-1}], skip.")
+        if window_size > T:
             continue
 
-        # 각 window에서 local index 계산
-        per_window_indices = []
+        windows = build_sliding_windows(T, window_size, step)
+
+        # 1) 각 window에서 Q/K/V 수집
+        q_list, k_list, v_list = [], [], []
         for (s, e) in windows:
-            if s <= t_phys < e:
-                per_window_indices.append(t_phys - s)
-            else:
-                per_window_indices.append(None)
+            q, k, v = teacher_forward_prefix(teacher, x[:, s:e], target_layer)
+            q_list.append(q)
+            k_list.append(k)
+            v_list.append(v)
 
-        # 둘 다 포함하는 윈도우 pair만 대상으로 비교
-        valid_pairs = []
-        for i in range(len(windows)):
-            for j in range(i + 1, len(windows)):
-                if per_window_indices[i] is not None and per_window_indices[j] is not None:
-                    valid_pairs.append((i, j))
+        # 2) [B,A,T_use,N,d]로 reshape
+        q_ctx = [reshape_qkv_BTND(q, window_size) for q in q_list]
+        k_ctx = [reshape_qkv_BTND(k, window_size) for k in k_list]
+        v_ctx = [reshape_qkv_BTND(v, window_size) for v in v_list]
 
-        if not valid_pairs:
-            print("  [Info] No window pair contains this frame in common, skip.")
-            continue
+        # 3) 같은 physical frame에 대해 window pair 비교
+        for t_phys in physical_frames:
+            if not (0 <= t_phys < T):
+                continue
 
-        for (i, j) in valid_pairs:
-            idx_i = per_window_indices[i]
-            idx_j = per_window_indices[j]
+            per_window_indices = []
+            for (s, e) in windows:
+                if s <= t_phys < e:
+                    per_window_indices.append(t_phys - s)
+                else:
+                    per_window_indices.append(None)
 
-            cos_q, l2_q = cosine_l2_same_frame(q_ctx[i], q_ctx[j], frame_idx=idx_i)
-            cos_k, l2_k = cosine_l2_same_frame(k_ctx[i], k_ctx[j], frame_idx=idx_i)
-            cos_v, l2_v = cosine_l2_same_frame(v_ctx[i], v_ctx[j], frame_idx=idx_i)
+            pairs = []
+            for i in range(len(windows)):
+                for j in range(i + 1, len(windows)):
+                    if per_window_indices[i] is not None and per_window_indices[j] is not None:
+                        pairs.append((i, j))
 
-            print(f"  Window {windows[i]} vs {windows[j]} (local idx: {idx_i} vs {idx_j}):")
-            print(f"    Q: cos={cos_q:.4f}, L2={l2_q:.4f}")
-            print(f"    K: cos={cos_k:.4f}, L2={l2_k:.4f}")
-            print(f"    V: cos={cos_v:.4f}, L2={l2_v:.4f}")
+            for (i, j) in pairs:
+                idx_i = per_window_indices[i]
+                idx_j = per_window_indices[j]
 
-    # 5) 마지막 window에서 마지막 프레임 query의 frame-wise attention
-    print("\n====== Last-frame attention (last window) ======\n")
+                cos_q, l2_q = cosine_l2_same_frame(q_ctx[i], q_ctx[j], idx_i)
+                cos_k, l2_k = cosine_l2_same_frame(k_ctx[i], k_ctx[j], idx_i)
+                cos_v, l2_v = cosine_l2_same_frame(v_ctx[i], v_ctx[j], idx_i)
 
-    q_last = q_list[-1]  # [B,A,L,d]
-    k_last = k_list[-1]
+                stats["cos_q"].append(cos_q)
+                stats["cos_k"].append(cos_k)
+                stats["cos_v"].append(cos_v)
+                stats["l2_q"].append(l2_q)
+                stats["l2_k"].append(l2_k)
+                stats["l2_v"].append(l2_v)
 
-    att_frames = last_query_attention(q_last, k_last, window_size)  # [B,A,window_size]
-    att_mean = att_frames.mean(0).mean(0)  # [window_size]
+                if verbose_per_pair:
+                    print(
+                        f"[layer {target_layer}] sample={sample_idx}, t={t_phys}, "
+                        f"win{windows[i]} vs {windows[j]} → "
+                        f"Qcos={cos_q:.4f}, Kcos={cos_k:.4f}, Vcos={cos_v:.4f}"
+                    )
 
-    for i, w in enumerate(att_mean):
-        print(f"  Frame(local {i:02d}): att={w.item():.4f}")
+    # numpy 통계 계산
+    summary = {}
+    for key, arr_list in stats.items():
+        if len(arr_list) == 0:
+            summary[key] = {"mean": float("nan"), "std": float("nan"), "n": 0}
+        else:
+            arr = np.array(arr_list, dtype=np.float32)
+            summary[key] = {
+                "mean": float(arr.mean()),
+                "std": float(arr.std()),
+                "n": int(arr.shape[0]),
+            }
 
-    print("\n  Top-k frames:")
-    top_vals, top_idx = torch.topk(att_mean, k=min(5, window_size))
-    for v, idx in zip(top_vals, top_idx):
-        print(f"    local={idx.item():02d}, att={v.item():.4f}")
+    return summary
 
 
 # =======================
@@ -225,77 +188,63 @@ def build_kitti_loader(kitti_path: str, clip_len: int):
         split="train",
         clip_len=clip_len,
     )
-    return DataLoader(dataset, batch_size=1, shuffle=True)
+    # shuffle=False → 순서 고정
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    return loader
 
 
 # =======================
-# MAIN SCRIPT
+# ARGS & MAIN
 # =======================
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Analyze teacher Q/K/V context invariance with sliding windows on KITTI."
+        description="Analyze teacher Q/K/V context invariance (sliding windows) over multiple layers."
     )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default="/home/work/juhwan/monocular_depth/stream/video-stream/checkpoints/video_depth_anything_vits.pth",
-        help="teacher checkpoint path (.pth)",
-    )
-    parser.add_argument(
-        "--kitti-path",
-        type=str,
-        default="/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI",
-        help="root path to KITTI dataset",
-    )
-    parser.add_argument(
-        "--clip-len",
-        type=int,
-        default=48,
-        help="long sequence length to load from dataloader",
-    )
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=32,
-        help="sliding window size (prefix length)",
-    )
-    parser.add_argument(
-        "--step",
-        type=int,
-        default=5,
-        help="sliding step size between windows",
-    )
-    parser.add_argument(
-        "--layer",
-        type=int,
-        default=2,
-        help="target TemporalModule index (0~3 in DPTHeadTemporal.motion_modules)",
-    )
-    parser.add_argument(
-        "--phys-frames",
-        type=int,
-        nargs="+",
-        default=[10, 11, 12],
-        help="physical frame indices to analyze (on the full clip)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="device (cuda or cpu)",
-    )
+
+    parser.add_argument("--ckpt", type=str,
+                        default="/home/work/juhwan/monocular_depth/stream/video-stream/checkpoints/video_depth_anything_vits.pth")
+    parser.add_argument("--kitti-path", type=str,
+                        default="/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI")
+
+    parser.add_argument("--clip-len", type=int, default=48)
+    parser.add_argument("--window-size", type=int, default=32)
+    parser.add_argument("--step", type=int, default=5)
+
+    parser.add_argument("--phys-frames", type=int, nargs="+",
+                        default=[10, 11, 12])
+
+    parser.add_argument("--num-samples", type=int, default=20,
+                        help="number of clips to use from KITTI")
+    parser.add_argument("--device", type=str, default="cuda")
+
+    parser.add_argument("--seed", type=int, default=42,
+                        help="random seed for reproducibility")
+    parser.add_argument("--verbose-per-pair", action="store_true",
+                        help="print per sample/pair logs (default: off)")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # -----------------------
+    # Seed 설정 (재현성)
+    # -----------------------
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(args.device)
 
     print(f"[Info] Using ckpt: {args.ckpt}")
     print(f"[Info] Using KITTI path: {args.kitti_path}")
+    print(f"[Info] clip_len={args.clip_len}, window_size={args.window_size}, step={args.step}")
+    print(f"[Info] num_samples={args.num_samples}, seed={args.seed}")
 
-    # load teacher
+    # Teacher 모델 로드
     teacher = VideoDepthTeacher(
         encoder="vits",
         features=64,
@@ -311,19 +260,46 @@ def main():
     teacher.to(device)
     teacher.eval()
 
-    # load long sequence
-    loader = build_kitti_loader(args.kitti_path, clip_len=args.clip_len)
-    x, y = next(iter(loader))   # x: [1, clip_len, 3, H, W]
+    # layer 0~3 전체 루프
+    all_layer_summaries = {}
 
-    analyze_teacher_sliding(
-        teacher=teacher,
-        x=x,
-        target_layer=args.layer,
-        physical_frames=args.phys_frames,
-        window_size=args.window_size,
-        step=args.step,
-        device=device,
-    )
+    for layer_idx in range(4):
+        print(f"\n================ LAYER {layer_idx} ================")
+
+        # 매 layer마다 loader 새로 생성 (shuffle=False라 순서는 동일)
+        loader = build_kitti_loader(args.kitti_path, args.clip_len)
+
+        summary = analyze_teacher_sliding_stats_for_layer(
+            teacher=teacher,
+            loader=loader,
+            target_layer=layer_idx,
+            physical_frames=args.phys_frames,
+            window_size=args.window_size,
+            step=args.step,
+            num_samples=args.num_samples,
+            device=device,
+            verbose_per_pair=args.verbose_per_pair,
+        )
+
+        all_layer_summaries[layer_idx] = summary
+
+        # layer별 요약 출력
+        print(f"\n------ Layer {layer_idx} summary ------")
+        for key, val in summary.items():
+            print(f"{key:>5}: mean={val['mean']:.4f}, std={val['std']:.44f}, n={val['n']}")
+
+    # 마지막에 전체 layer 비교를 한 번에 보고 싶으면 여기서 정리 출력
+    print("\n\n====== Layer-wise Comparison (Teacher) ======\n")
+    for layer_idx in range(4):
+        summary = all_layer_summaries[layer_idx]
+        print(f"[Layer {layer_idx}]")
+        print(f"  cos_q: mean={summary['cos_q']['mean']:.4f}, std={summary['cos_q']['std']:.4f}")
+        print(f"  cos_k: mean={summary['cos_k']['mean']:.4f}, std={summary['cos_k']['std']:.4f}")
+        print(f"  cos_v: mean={summary['cos_v']['mean']:.4f}, std={summary['cos_v']['std']:.4f}")
+        print(f"  l2_q : mean={summary['l2_q']['mean']:.4f}, std={summary['l2_q']['std']:.4f}")
+        print(f"  l2_k : mean={summary['l2_k']['mean']:.4f}, std={summary['l2_k']['std']:.4f}")
+        print(f"  l2_v : mean={summary['l2_v']['mean']:.4f}, std={summary['l2_v']['std']:.4f}")
+        print("")
 
 
 if __name__ == "__main__":
