@@ -34,7 +34,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', message=".*preferred_linalg_library.*")
 
 # ================ 실험 설정 ================
-experiment = 0
+experiment = 5
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +94,7 @@ def train(args):
             entity=wandb_entity,
             project=wandb_project,
             config=hyper_params,
-            name=f"experiment_{experiment}_kd_output"
+            name=f"experiment_{experiment}_kd_output_ssi"
         )
 
     # ================== 데이터 ==================
@@ -259,6 +259,8 @@ def train(args):
     logger.info(f"  Update Frequency: {hyper_params.get('update_frequency', 6)}")
     logger.info(f"  SSI Loss Weight: {ratio_ssi}")
     logger.info(f"  TGM Loss Weight: {ratio_tgm}")
+    logger.info(f"  KD Enabled: {kd_enabled}")
+    logger.info(f"  KD Lambda: {kd_lambda}") if args.test else ""
     logger.info("")
     logger.info("--- Model Architecture (Student) ---")
     logger.info(f"  Encoder: {student.encoder}")
@@ -290,71 +292,72 @@ def train(args):
 
     student.eval()
 
-    # 1. KITTI Validation
-    logger.info("Running KITTI validation...")
-    kitti_val_metrics = validate_kitti_streaming(
-        model=student,
-        val_loader=kitti_val_loader,
-        device=device,
-        loss_ssi_fn=loss_ssi,
-        loss_tgm_fn=loss_tgm,
-        ratio_ssi=ratio_ssi,
-        ratio_tgm=ratio_tgm,
-        min_depth=1e-3,
-        max_depth=80.0,
-    )
-    kitti_val_loss   = kitti_val_metrics['loss']
-    kitti_val_absrel = kitti_val_metrics['absrel']
-    kitti_val_delta1 = kitti_val_metrics['delta1']
+    if False:
+        # 1. KITTI Validation
+        logger.info("Running KITTI validation...")
+        kitti_val_metrics = validate_kitti_streaming(
+            model=student,
+            val_loader=kitti_val_loader,
+            device=device,
+            loss_ssi_fn=loss_ssi,
+            loss_tgm_fn=loss_tgm,
+            ratio_ssi=ratio_ssi,
+            ratio_tgm=ratio_tgm,
+            min_depth=1e-3,
+            max_depth=80.0,
+        )
+        kitti_val_loss   = kitti_val_metrics['loss']
+        kitti_val_absrel = kitti_val_metrics['absrel']
+        kitti_val_delta1 = kitti_val_metrics['delta1']
 
-    logger.info(
-        f"[Init KITTI] loss={kitti_val_loss:.4f} | "
-        f"absrel={kitti_val_absrel:.4f} | delta1={kitti_val_delta1:.4f}"
-    )
+        logger.info(
+            f"[Init KITTI] loss={kitti_val_loss:.4f} | "
+            f"absrel={kitti_val_absrel:.4f} | delta1={kitti_val_delta1:.4f}"
+        )
 
-    # 2. ScanNet Validation
-    logger.info("Running ScanNet validation...")
-    init_infer_dir = os.path.join(args.val_infer_dir, "init")
-    os.makedirs(init_infer_dir, exist_ok=True)
+        # 2. ScanNet Validation
+        logger.info("Running ScanNet validation...")
+        init_infer_dir = os.path.join(args.val_infer_dir, "init")
+        os.makedirs(init_infer_dir, exist_ok=True)
 
-    scannet_metrics = validate_with_infer_eval_subset(
-        model=student,
-        json_file=args.val_json_file,
-        infer_path=init_infer_dir,
-        dataset=args.val_dataset_key,
-        dataset_eval_tag=args.val_dataset_tag,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        input_size=518,
-        scenes_to_eval=args.val_scenes,
-        scene_indices=scene_indices,
-        fp32=True,
-    )
-    avg_metrics    = scannet_metrics.get("avg", {})
-    scannet_absrel = float(avg_metrics.get("abs_relative_difference", float('nan')))
-    scannet_rmse   = float(avg_metrics.get("rmse_linear", float('nan')))
-    scannet_delta1 = float(avg_metrics.get("delta1_acc", float('nan')))
+        scannet_metrics = validate_with_infer_eval_subset(
+            model=student,
+            json_file=args.val_json_file,
+            infer_path=init_infer_dir,
+            dataset=args.val_dataset_key,
+            dataset_eval_tag=args.val_dataset_tag,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            input_size=518,
+            scenes_to_eval=args.val_scenes,
+            scene_indices=scene_indices,
+            fp32=True,
+        )
+        avg_metrics    = scannet_metrics.get("avg", {})
+        scannet_absrel = float(avg_metrics.get("abs_relative_difference", float('nan')))
+        scannet_rmse   = float(avg_metrics.get("rmse_linear", float('nan')))
+        scannet_delta1 = float(avg_metrics.get("delta1_acc", float('nan')))
 
-    logger.info(
-        f"[Init ScanNet] absrel={scannet_absrel:.4f} | "
-        f"rmse={scannet_rmse:.4f} | delta1={scannet_delta1:.4f}"
-    )
+        logger.info(
+            f"[Init ScanNet] absrel={scannet_absrel:.4f} | "
+            f"rmse={scannet_rmse:.4f} | delta1={scannet_delta1:.4f}"
+        )
 
-    if not args.test:
-        wandb.log({
-            "init/val_kitti_loss":   kitti_val_loss,
-            "init/val_kitti_absrel": kitti_val_absrel,
-            "init/val_kitti_delta1": kitti_val_delta1,
-            "init/val_real_absrel":  scannet_absrel,
-            "init/val_real_rmse":    scannet_rmse,
-            "init/val_real_delta1":  scannet_delta1,
-            "epoch": -1,
-        })
+        if not args.test:
+            wandb.log({
+                "init/val_kitti_loss":   kitti_val_loss,
+                "init/val_kitti_absrel": kitti_val_absrel,
+                "init/val_kitti_delta1": kitti_val_delta1,
+                "init/val_real_absrel":  scannet_absrel,
+                "init/val_real_rmse":    scannet_rmse,
+                "init/val_real_delta1":  scannet_delta1,
+                "epoch": -1,
+            })
 
-    logger.info("=" * 60)
-    logger.info("Initial validation completed! Starting training...")
-    logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("Initial validation completed! Starting training...")
+        logger.info("=" * 60)
 
-    # best_val_loss = kitti_val_loss  # 기준
+    # best_val_loss = val_real_delta1  # 기준
     best_delta1 = 0.0
 
     # --------------------- Training ---------------------
@@ -418,6 +421,7 @@ def train(args):
                     disp_normed_t = norm_ssi(y[:, t:t+1], mask_t).squeeze(2)
                     ssi_loss_t = loss_ssi(pred_t_aligned_disp.unsqueeze(1), disp_normed_t, mask_t.squeeze(2))
 
+                    # ----- TGM Loss -----
                     if t > 0:
                         prev_aligned_disp = (a_star.detach() * prev_pred_raw.unsqueeze(1) + b_star.detach()).squeeze(1)
                         prev_aligned_depth = 1.0 / prev_aligned_disp.clamp(min=1e-6)
@@ -434,10 +438,24 @@ def train(args):
                     kd_loss_t = pred_t_raw.new_tensor(0.0)
                     if kd_enabled and teacher_disp_clip is not None:
                         teacher_disp_t = teacher_disp_clip[:, t]                       # [B,H,W]
-                        # 마스크 적용한 L1 KD (disparity space)
+                        # kd_mask: [B,H,W]
                         kd_mask = mask_t.squeeze(2).squeeze(1)                         # [B,H,W]
                         if kd_mask.any():
-                            diff = (pred_t_raw - teacher_disp_t).abs() * kd_mask
+                            # 1) scale/shift 추정 (student -> teacher)
+                            #    batch_ls_scale_shift(pred, gt, mask)
+                            #    pred: [B,H,W], gt: [B,1,H,W], mask: [B,1,1,H,W] 이런 형태를 이미 지원한다고 가정
+                            with torch.no_grad():
+                                a_kd, b_kd = batch_ls_scale_shift(
+                                    pred_t_raw,                      # [B,H,W]
+                                    teacher_disp_t.unsqueeze(1),     # [B,1,H,W]
+                                    mask_t                           # [B,1,1,H,W]
+                                )
+
+                            # 2) student disparity를 teacher에 맞게 정렬
+                            pred_kd_aligned = (a_kd * pred_t_raw.unsqueeze(1) + b_kd).squeeze(1)  # [B,H,W]
+
+                            # 3-A) L1 KD
+                            diff = (pred_kd_aligned - teacher_disp_t).abs() * kd_mask
                             kd_loss_t = diff.sum() / kd_mask.sum().clamp(min=1.0)
                         else:
                             kd_loss_t = pred_t_raw.new_tensor(0.0)

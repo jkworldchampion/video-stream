@@ -50,6 +50,33 @@ class DPTHeadTemporal(DPTHead):
                            **motion_module_kwargs)
         ])
 
+    # ============================
+    # 🔹 QKV Hook 인터페이스 추가
+    # ============================
+    def enable_qkv_save(self, flag: bool):
+        """
+        모든 TemporalModule에 save_qkv 플래그 전달
+        (실제 QKV 저장은 motion_module 내부 attention에서 수행)
+        """
+        for m in self.motion_modules:
+            if hasattr(m, "enable_qkv_save"):
+                m.enable_qkv_save(flag)
+
+    def collect_qkv(self, layer_idx: int):
+        """
+        layer_idx 번째 TemporalModule이 저장한 (q,k,v)를 반환
+        """
+        assert 0 <= layer_idx < len(self.motion_modules), \
+            f"invalid layer_idx {layer_idx}, must be in [0,{len(self.motion_modules)-1}]"
+
+        m = self.motion_modules[layer_idx]
+        if not hasattr(m, "get_qkv"):
+            raise RuntimeError(
+                f"TemporalModule at idx={layer_idx} has no get_qkv() – "
+                f"motion_module.py에 구현이 필요합니다."
+            )
+        return m.get_qkv()   # (q, k, v), each [B, A, L, d]
+
     def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, cached_hidden_state_list=None):
         out = []
         for i, x in enumerate(out_features):

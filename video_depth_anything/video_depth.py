@@ -55,6 +55,12 @@ class VideoDepthAnything(nn.Module):
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
 
+    def enable_qkv_save(self, flag: bool):
+        self.head.enable_qkv_save(flag)
+
+    def collect_qkv(self, layer_idx: int):
+        return self.head.collect_qkv(layer_idx)
+
     def forward(self, x, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean"):
         """
         기본: [B,T,H,W] depth 반환
