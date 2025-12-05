@@ -11,6 +11,7 @@ from .attention import CrossAttention, FeedForward, apply_rotary_emb, precompute
 
 from einops import rearrange, repeat
 import math
+import weakref
 
 try:
     import xformers
@@ -56,6 +57,30 @@ class TemporalModule(nn.Module):
 
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
+
+        # QKV hook 상태
+        self.save_qkv = False
+        self.qkv_buffer = None
+
+        # 🔹 여기에서 attention 모듈들에게 weakref 전달
+        # for block in self.temporal_transformer.transformer_blocks:
+        #     for attn in block.attention_blocks:
+        #         attn.parent_temporal_module = weakref.proxy(self)
+        for block in self.temporal_transformer.transformer_blocks:
+            for attn in block.attention_blocks:
+                attn.__dict__["parent_temporal_module"] = weakref.proxy(self)
+
+    def enable_qkv_save(self, flag: bool):
+        self.save_qkv = flag
+        if flag:
+            self.qkv_buffer = None
+
+    def set_qkv(self, q, k, v):
+        if self.qkv_buffer is None:
+            self.qkv_buffer = (q, k, v)
+
+    def get_qkv(self):
+        return self.qkv_buffer
 
     def forward(self, input_tensor, encoder_hidden_states, attention_mask=None, cached_hidden_state_list=None):
         hidden_states = input_tensor
@@ -239,6 +264,9 @@ class TemporalAttention(CrossAttention):
         else:
             raise NotImplementedError
 
+        # 🔹 TemporalModule에서 세팅해주는 parent
+        # self.parent_temporal_module = None
+
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, cached_hidden_states=None):
         # TODO: support cache for these
         assert encoder_hidden_states is None
@@ -263,6 +291,7 @@ class TemporalAttention(CrossAttention):
         if self.group_norm is not None:
             hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
+        # hidden_states: [(B*d), L, C]
         query = self.to_q(hidden_states[:, d_in:, ...])
         dim = query.shape[-1]
 
@@ -278,26 +307,40 @@ class TemporalAttention(CrossAttention):
             freqs_cis = self.freqs_cis[:seq_len].to(query.device)
             query, key = apply_rotary_emb(query, key, freqs_cis)
 
+        # 🔹 여기서 Q/K/V 저장 (head 분리하여 [B_eff, heads, L, d_head] 형태)
+        if (
+            self.parent_temporal_module is not None
+            and getattr(self.parent_temporal_module, "save_qkv", False)
+            and getattr(self.parent_temporal_module, "qkv_buffer", None) is None
+        ):
+            B_eff_q, L_q, C_q = query.shape
+            B_eff_k, L_k, C_k = key.shape
+            heads = self.heads
+            d_head = C_q // heads
+
+            q_h = query.view(B_eff_q, L_q, heads, d_head).permute(0, 2, 1, 3).contiguous()  # [B_eff, H, L_q, d_head]
+            k_h = key.view(B_eff_k, L_k, heads, d_head).permute(0, 2, 1, 3).contiguous()     # [B_eff, H, L_k, d_head]
+            v_h = value.view(B_eff_k, L_k, heads, d_head).permute(0, 2, 1, 3).contiguous()   # [B_eff, H, L_k, d_head]
+
+            self.parent_temporal_module.set_qkv(q_h, k_h, v_h)
+
         if attention_mask is not None:
             if attention_mask.shape[-1] != query.shape[1]:
                 target_length = query.shape[1]
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
-
         use_memory_efficient = XFORMERS_AVAILABLE and self._use_memory_efficient_attention_xformers
         if use_memory_efficient and (dim // self.heads) % 8 != 0:
-            # print('Warning: the dim {} cannot be divided by 8. Fall into normal attention'.format(dim // self.heads))
             use_memory_efficient = False
 
-        # attention, what we cannot get enough of
+        # 이후 기존 attention 계산 로직은 그대로 유지
         if use_memory_efficient:
             query = self.reshape_heads_to_4d(query)
             key = self.reshape_heads_to_4d(key)
             value = self.reshape_heads_to_4d(value)
 
             hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
-            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
             query = self.reshape_heads_to_batch_dim(query)
@@ -308,12 +351,8 @@ class TemporalAttention(CrossAttention):
                 hidden_states = self._attention(query, key, value, attention_mask)
             else:
                 raise NotImplementedError
-                # hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
-        # linear proj
         hidden_states = self.to_out[0](hidden_states)
-
-        # dropout
         hidden_states = self.to_out[1](hidden_states)
 
         hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)

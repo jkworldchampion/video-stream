@@ -1,0 +1,53 @@
+hyper_parameter:
+  learning_rate: 1.0e-4
+  clip_len: 32
+  ratio_ssi: 1.0
+  ratio_tgm: 10.0
+  epochs: 75
+  batch_size: 4
+  update_frequency: 6
+
+model:
+  encoder: "vits"
+  features: 64
+  out_channels: [48, 96, 192, 384]
+  num_frames: 32
+  resize_size: 518
+
+optimizer:
+  type: "AdamW"
+  weight_decay: 1.0e-4
+
+scheduler:
+  type: "CosineAnnealingLR"
+  eta_min: 1.0e-6
+
+loss:
+  tgm:
+    diff_depth_th: 0.05
+  ssi:
+    type: "basic"
+
+kd_aux:
+  enabled: true         # baseline에서는 OFF
+  lambda_kd: 0.0001         # 나중에 output KD 켤 때 사용할 예정 값
+
+data:
+  kitti_path: "/home/work/juhwan/monocular_depth/Video-Depth-Anything/datasets/KITTI"
+  data_name: "kitti"
+  split: "train"
+  num_workers: 4
+  pin_memory: true
+
+validation:
+  json_file: "/home/work/juhwan/monocular_depth/stream/Video-Depth-Anything/datasets/scannet/scannet_video_500.json"
+  infer_dir: "benchmark/output/scannet_stream_valmini"
+  dataset_key: "scannet"
+  dataset_tag: "scannet_500"
+  scenes: 2
+  scene_indices: [0, 1]
+  fp32: true
+
+wandb:
+  project: "new_base"
+  entity: "depth-finder"

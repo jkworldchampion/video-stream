@@ -55,14 +55,38 @@ class VideoDepthAnything(nn.Module):
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
 
-    def forward(self, x):
+    def enable_qkv_save(self, flag: bool):
+        self.head.enable_qkv_save(flag)
+
+    def collect_qkv(self, layer_idx: int):
+        return self.head.collect_qkv(layer_idx)
+
+    def forward(self, x, *, return_intermediates: bool=False, return_qkv: bool=False, feature_pool: str="mean"):
+        """
+        기본: [B,T,H,W] depth 반환
+        return_intermediates=True: {"pred": [B,T,H,W], "intermediates": dict} 반환
+        """
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
         features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        depth = self.head(features, patch_h, patch_w, T)[0]
+        if return_intermediates or return_qkv:
+            depth_raw = self.head(
+                features, patch_h, patch_w, T,
+                return_intermediates=True,
+                return_qkv=return_qkv,
+                feature_pool=feature_pool,
+            )
+            depth, _cache, intermediates = depth_raw
+        else:
+            depth, _cache = self.head(features, patch_h, patch_w, T)
+
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
-        return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]
+        depth_bt = depth.squeeze(1).unflatten(0, (B, T))  # [B,T,H,W]
+
+        if return_intermediates or return_qkv:
+            return {"pred": depth_bt, "intermediates": intermediates}
+        return depth_bt
 
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
         frame_height, frame_width = frames[0].shape[:2]

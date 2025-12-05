@@ -1,153 +1,312 @@
 <div align="center">
-<h1>Video Depth Anything</h1>
-  
-[**Sili Chen**](https://github.com/SiliChen321) · [**Hengkai Guo**](https://guohengkai.github.io/)<sup>&dagger;</sup> · [**Shengnan Zhu**](https://github.com/Shengnan-Zhu)  · [**Feihu Zhang**](https://github.com/zhizunhu)
-<br>
-[**Zilong Huang**](http://speedinghzl.github.io/)   ·  [**Jiashi Feng**](https://scholar.google.com.sg/citations?user=Q8iay0gAAAAJ&hl=en)   ·  [**Bingyi Kang**](https://bingykang.github.io/)<sup>&dagger;</sup> 
-<br>
-ByteDance
-<br>
-&dagger;Corresponding author
 
-<a href="https://arxiv.org/abs/2501.12375"><img src='https://img.shields.io/badge/arXiv-Video Depth Anything-red' alt='Paper PDF'></a>
-<a href='https://videodepthanything.github.io'><img src='https://img.shields.io/badge/Project_Page-Video Depth Anything-green' alt='Project Page'></a>
-<a href='https://huggingface.co/spaces/depth-anything/Video-Depth-Anything'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
-</div>
+# 🎬 StreamDepth: Real-Time Streaming Video Depth Estimation
+
+**Non-Streaming Teacher에서 Streaming Student로의 Knowledge Distillation을 통한<br>실시간 스트리밍 비디오 깊이 추정**
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+
+[🚀 Quick Start](#-quick-start) • [📖 Method](#-method) • [🔬 Results](#-results) • [📊 Benchmark](#-benchmark)
 
 </div>
 
-This work presents **Video Depth Anything** based on [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2), which can be applied to arbitrarily long videos without compromising quality, consistency, or generalization ability. Compared with other diffusion-based models, it enjoys faster inference speed, fewer parameters, and higher consistent depth accuracy.
+---
 
-![teaser](assets/teaser_video_v2.png)
+## 🎯 Overview
 
-## News
-- **2025-07-03:** 🚀🚀🚀 Release an experimental version of training-free **streaming video depth estimation**.
-- **2025-07-03:** Release our implementation of [training loss](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/loss).
-- **2025-04-25:** 🌟🌟🌟 Release [metric depth model](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/metric_depth) based on Video-Depth-Anything-Large.
-- **2025-04-05:** Our paper has been accepted for a **highlight** presentation at [CVPR 2025](https://cvpr.thecvf.com/) (13.5% of the accepted papers).
-- **2025-03-11:** Add full dataset inference and evaluation [scripts](https://github.com/DepthAnything/Video-Depth-Anything/tree/main/benchmark).
-- **2025-02-08:** Enable autocast inference. Support grayscale video, NPZ and EXR output formats.
-- **2025-01-21:** Paper, project page, code, models, and demo are all released.
+**StreamDepth**는 비디오 깊이 추정(Video Depth Estimation)을 **실시간 스트리밍** 환경에서 수행할 수 있도록 설계된 프레임워크입니다.  
 
+기존의 Video Depth Estimation 모델들은 전체 비디오 클립(batch)을 한 번에 처리해야 하므로, **실시간 애플리케이션**(자율주행, AR/VR, 로봇 비전 등)에 적용하기 어렵습니다. 본 프로젝트는 **Knowledge Distillation** 기법을 활용하여, Non-streaming Teacher 모델의 성능을 유지하면서도 **프레임 단위 실시간 추론**이 가능한 Streaming Student 모델을 학습합니다.
 
-## Release Notes
-- **2025-02-08:** 🚀🚀🚀 Inference speed and memory usage improvement
-  <table>
-    <thead>
-      <tr>
-        <th rowspan="2" style="text-align: center;">Model</th>
-        <th colspan="2">Latency (ms)</th>
-        <th colspan="2">GPU VRAM (GB)</th>
-      </tr>
-      <tr>
-        <th>FP32</th>
-        <th>FP16</th>
-        <th>FP32</th>
-        <th>FP16</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Video-Depth-Anything-V2-Small</td>
-        <td>9.1</td>
-        <td><strong>7.5</strong></td>
-        <td>7.3</td>
-        <td><strong>6.8</strong></td>
-      </tr>
-      <tr>
-        <td>Video-Depth-Anything-V2-Large</td>
-        <td>67</td>
-        <td><strong>14</strong></td>
-        <td>26.7</td>
-        <td><strong>23.6</strong></td>
-    </tbody>
-  </table>
+<div align="center">
+<img src="assets/architecture_overview.png" alt="Architecture Overview" width="800"/>
+<br>
+<em>StreamDepth 아키텍처: Teacher(Clip-based) → Student(Frame-by-frame Streaming)</em>
+</div>
 
-  The Latency and GPU VRAM results are obtained on a single A100 GPU with input of shape 1 x 32 x 518 × 518.
+### ✨ Key Features
 
-## Pre-trained Models
-We provide **two models** of varying scales for robust and consistent video depth estimation:
+- **🔴 Real-time Streaming**: 프레임 단위 순차적 추론으로 실시간 처리 가능
+- **📚 Knowledge Distillation**: Non-streaming Teacher의 지식을 Streaming Student로 효과적으로 전이
+- **🎯 Temporal Consistency**: Causal Attention과 Hidden State Caching으로 시간적 일관성 유지
+- **⚡ Efficient Inference**: 슬라이딩 윈도우 캐시 기반의 효율적인 메모리 관리
 
-| Model | Params | Checkpoint |
-|:-|-:|:-:|
-| Video-Depth-Anything-V2-Small | 28.4M | [Download](https://huggingface.co/depth-anything/Video-Depth-Anything-Small/resolve/main/video_depth_anything_vits.pth?download=true) |
-| Video-Depth-Anything-V2-Large | 381.8M | [Download](https://huggingface.co/depth-anything/Video-Depth-Anything-Large/resolve/main/video_depth_anything_vitl.pth?download=true) |
-| Video-Depth-Anything-V2-Large-Metric | 381.8M | [Download](https://huggingface.co/depth-anything/Metric-Video-Depth-Anything-Large/resolve/main/metric_video_depth_anything_vitl.pth) |
+---
 
+## 🏗️ Architecture
 
-## Usage
+### Non-Streaming vs Streaming
 
-### Preparation
+| 구분 | Non-Streaming (Teacher) | Streaming (Student) |
+|:---:|:---:|:---:|
+| **입력** | 전체 비디오 클립 [B, T, C, H, W] | 단일 프레임 [B, 1, C, H, W] |
+| **Attention** | Bidirectional (양방향) | Causal (단방향) |
+| **추론 방식** | Batch 처리 | Frame-by-frame |
+| **실시간 적용** | ❌ 불가능 | ✅ 가능 |
+| **메모리** | T에 비례하여 증가 | 고정 (캐시 윈도우) |
+
+### Model Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      StreamDepth Architecture                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Input Frame    ┌──────────────────┐                           │
+│   [B,1,3,H,W] ──▶│   DINOv2 Encoder │──▶ Spatial Features       │
+│                  │   (ViT-S/L)      │    [B,1,C,h,w]            │
+│                  └──────────────────┘                           │
+│                           │                                     │
+│                           ▼                                     │
+│                  ┌──────────────────┐                           │
+│                  │  DPT Temporal    │                           │
+│   Cached States ─│  Head (Causal)   │─▶ Depth Map [B,1,H,W]     │
+│   [T-1 frames]   │  + Motion Module │                           │
+│                  └──────────────────┘                           │
+│                           │                                     │
+│                           ▼                                     │
+│                    Hidden State Cache                           │
+│                    (Sliding Window)                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📖 Method
+
+### Knowledge Distillation Framework
+
+StreamDepth는 **3가지 핵심 손실 함수**를 통해 Teacher에서 Student로 지식을 전달합니다:
+
+#### Output-level KD Loss
+
+Teacher와 Student의 **최종 출력(depth map)**을 직접 비교합니다:
+
+$$L_{KD} = \frac{1}{N}\sum_{i} |d_{student}^{(i)} - d_{teacher}^{(i)}| \cdot \mathbb{1}_{valid}$$
+
+#### Feature Similarity Loss (DistilHuBERT Style)
+
+중간 레이어의 특징 표현을 정합하여 Teacher의 표현력을 전달합니다:
+
+$$L_{DIS} = \frac{1}{D} \|h_t - z_t\|_1 - \log\sigma(\cos(h_t, z_t))$$
+
+#### Attention Relation KL Loss (MiniLM-v2 Style)
+
+Self-Attention의 Q/K/V 관계를 보존하여 시간적 의존성을 학습합니다:
+
+$$L_{KLD} = L_{KLD}^Q + L_{KLD}^K + L_{KLD}^V$$
+
+### Training Strategy
+
+```python
+# Pseudo-code for training loop
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        # Teacher: Clip-based inference (frozen)
+        with torch.no_grad():
+            teacher_depth = teacher(clip)
+        
+        # Student: Frame-by-frame streaming
+        cache = None
+        for t in range(T):
+            student_depth, cache = student.stream_step(frame[t], cache)
+            
+            # Compute losses
+            loss_depth = depth_loss(student_depth, gt_depth[t])
+            loss_kd = kd_loss(student_depth, teacher_depth[t])
+            
+            loss = loss_depth + λ_kd * loss_kd
+            loss.backward()
+```
+
+---
+
+## 🔬 Results
+
+### Quantitative Results on ScanNet
+
+| Model | Mode | Abs Rel ↓ | RMSE ↓ | δ₁ ↑ |
+|:------|:----:|:---------:|:------:|:----:|
+| Video-Depth-Anything | Non-streaming | 0.0XXX | 0.XXX | 0.806 |
+| **StreamDepth (Ours)** | Streaming | 0.0XXX | 0.XXX | 0.837 |
+
+### Qualitative Comparison Graph (later)
+
+<!-- <div align="center">
+<table>
+<tr>
+<td><img src="assets/qual_input.gif" width="200"/><br><em>Input Video</em></td>
+<td><img src="assets/qual_teacher.gif" width="200"/><br><em>Teacher (Non-streaming)</em></td>
+<td><img src="assets/qual_student.gif" width="200"/><br><em>Student (Streaming)</em></td>
+</tr>
+</table>
+</div> -->
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 
 ```bash
-git clone https://github.com/DepthAnything/Video-Depth-Anything
-cd Video-Depth-Anything
+# Clone repository
+git clone https://github.com/your-repo/video-stream.git
+cd video-stream
+
+# Create conda environment
+conda create -n streamdepth python=3.10
+conda activate streamdepth
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-Download the checkpoints listed [here](#pre-trained-models) and put them under the `checkpoints` directory.
+### Download Pretrained Weights
+
 ```bash
 bash get_weights.sh
 ```
 
-### Inference a video
+### Inference (Streaming Mode)
+
 ```bash
-python3 run.py --input_video ./assets/example_videos/davis_rollercoaster.mp4 --output_dir ./outputs --encoder vitl
+# Real-time streaming inference on video
+python run_streaming.py \
+    --input_video assets/example_videos/sample.mp4 \
+    --encoder vits \
+    --output_dir outputs_streaming
 ```
 
-Options:
-- `--input_video`: path of input video
-- `--output_dir`: path to save the output results
-- `--input_size` (optional): By default, we use input size `518` for model inference.
-- `--max_res` (optional): By default, we use maximum resolution `1280` for model inference.
-- `--encoder` (optional): `vits` for Video-Depth-Anything-V2-Small, `vitl` for Video-Depth-Anything-V2-Large.
-- `--max_len` (optional): maximum length of the input video, `-1` means no limit
-- `--target_fps` (optional): target fps of the input video, `-1` means the original fps
-- `--fp32` (optional): Use `fp32` precision for inference. By default, we use `fp16`.
-- `--grayscale` (optional): Save the grayscale depth map, without applying color palette.
-- `--save_npz` (optional): Save the depth map in `npz` format.
-- `--save_exr` (optional): Save the depth map in `exr` format.
+### Training
 
-### Inference a video using streaming mode (Experimental features)
-We implement an experimental streaming mode **without training**. In details, we save the hidden states of temporal attentions for each frames in the caches, and only send a single frame into our video depth model during inference by reusing these past hidden states in temporal attentions. We hack our pipeline to align the original inference setting in the offline mode. Due to the inevitable gap between training and testing, we observe a **performance drop** between the streaming model and the offline model (e.g. the `d1` of ScanNet drops from `0.926` to `0.836`). Finetuning the model in the streaming mode will greatly improve the performance. We leave it for future work.
-
-To run the streaming model:
 ```bash
-python3 run_streaming.py --input_video ./assets/example_videos/davis_rollercoaster.mp4 --output_dir ./outputs_streaming --encoder vitl
+# Train with Knowledge Distillation
+python train.py \
+    --pretrained_ckpt checkpoints/video_depth_anything_vits.pth \
+    --epochs 75 \
+    --val_dataset_key scannet
 ```
-Options:
-- `--input_video`: path of input video
-- `--output_dir`: path to save the output results
-- `--input_size` (optional): By default, we use input size `518` for model inference.
-- `--max_res` (optional): By default, we use maximum resolution `1280` for model inference.
-- `--encoder` (optional): `vits` for Video-Depth-Anything-V2-Small, `vitl` for Video-Depth-Anything-V2-Large.
-- `--max_len` (optional): maximum length of the input video, `-1` means no limit
-- `--target_fps` (optional): target fps of the input video, `-1` means the original fps
-- `--fp32` (optional): Use `fp32` precision for inference. By default, we use `fp16`.
-- `--grayscale` (optional): Save the grayscale depth map, without applying color palette.
 
-## Training Loss
-Our training loss is in `loss/` directory. Please see the `loss/test_loss.py` for usage.
+---
 
-## Fine-tuning to a metric-depth video model
-Please refer to [Metric Depth](./metric_depth/README.md).
+## 📊 Benchmark
 
-## Benchmark
-Please refer to [Benchmark](./benchmark/README.md).
+### Supported Datasets
 
-## Citation
+- **KITTI**: Outdoor driving scenes
+- **ScanNet**: Indoor scenes
+- **Sintel**: Synthetic sequences
+- **Bonn**: RGB-D dynamic scenes
+- **NYUv2**: Indoor depth benchmark
 
-If you find this project useful, please consider citing:
+### Running Evaluation
+
+```bash
+# Run inference
+python benchmark/infer/infer.py \
+    --infer_path benchmark/output/scannet_stream \
+    --json_file datasets/scannet/scannet_video_500.json \
+    --datasets scannet
+
+# Evaluate
+bash benchmark/eval/eval_500.sh benchmark/output/scannet_stream benchmark/dataset_extract/dataset
+```
+
+---
+
+## 📁 Project Structure
+
+```
+video-stream/
+├── 📄 train.py                    # Main training script
+├── 📄 run_streaming.py            # Real-time streaming inference
+├── 📄 run_eval_comparison.py      # Teacher vs Student evaluation
+├── 📄 config_jh.yaml              # Training configuration
+│
+├── 📂 video_depth_anything/       # Model implementations
+│   ├── video_depth.py             # Teacher model (Non-streaming)
+│   ├── video_depth_stream.py      # Student model (Streaming)
+│   ├── dpt_temporal.py            # DPT Head with Temporal module
+│   ├── dinov2.py                  # DINOv2 backbone
+│   └── motion_module/             # Temporal attention modules
+│
+├── 📂 utils/
+│   ├── loss_MiDas.py              # Depth loss functions
+│   ├── loss_kd_aux.py             # KD auxiliary losses
+│   └── train_helper.py            # Training utilities
+│
+├── 📂 benchmark/                  # Evaluation pipeline
+│   ├── infer/                     # Inference scripts
+│   ├── eval/                      # Evaluation scripts
+│   └── dataset_extract/           # Dataset preparation
+│
+├── 📂 checkpoints/                # Model weights
+├── 📂 data/                       # Data loading utilities
+└── 📂 outputs/                    # Training outputs
+```
+
+---
+
+## ⚙️ Configuration
+
+주요 학습 설정 (`config_jh.yaml`):
+
+```yaml
+hyper_parameter:
+  learning_rate: 1.0e-4
+  batch_size: 4
+  clip_len: 32              # Frames per training clip
+  epochs: 75
+  ratio_ssi: 1.0            # Scale-Shift Invariant loss weight
+  ratio_tgm: 10.0           # Temporal Gradient Matching loss weight
+
+kd_aux:
+  enabled: true             # Enable Knowledge Distillation
+  lambda_kd: 0.0001         # KD loss weight
+
+model:
+  encoder: "vits"           # ViT-S (vits) or ViT-L (vitl)
+  features: 64
+  num_frames: 32
+```
+
+---
+
+## 📚 Citation
 
 ```bibtex
-@article{video_depth_anything,
-  title={Video Depth Anything: Consistent Depth Estimation for Super-Long Videos},
-  author={Chen, Sili and Guo, Hengkai and Zhu, Shengnan and Zhang, Feihu and Huang, Zilong and Feng, Jiashi and Kang, Bingyi}
-  journal={arXiv:2501.12375},
+@article{streamdepth2025,
+  title={StreamDepth: Real-Time Streaming Video Depth Estimation via Knowledge Distillation},
+  author={Your Name},
+  journal={arXiv preprint},
   year={2025}
 }
 ```
 
+---
 
-## LICENSE
-Video-Depth-Anything-Small model is under the Apache-2.0 license. Video-Depth-Anything-Large model is under the CC-BY-NC-4.0 license. For business cooperation, please send an email to Hengkai Guo at guohengkaighk@gmail.com.
+## 🙏 Acknowledgements
+
+본 프로젝트는 다음 연구들을 기반으로 합니다:
+
+- [Video-Depth-Anything](https://github.com/xxx) - Base video depth model
+- [DINOv2](https://github.com/facebookresearch/dinov2) - Vision encoder
+- [DistilHuBERT](https://arxiv.org/abs/2110.01900) - Feature distillation
+- [MiniLM](https://arxiv.org/abs/2002.10957) - Attention relation distillation
+
+---
+
+## 📜 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+---
+
+<div align="center">
+
+**Made with ❤️ for Real-time Video Depth Estimation**
+
+</div>
