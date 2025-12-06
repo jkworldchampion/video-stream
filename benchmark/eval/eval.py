@@ -142,6 +142,7 @@ def main():
     parser.add_argument('--wandb_run_name', type=str, default='', help='wandb run name')
     parser.add_argument('--wandb_group', type=str, default='', help='wandb group')
     parser.add_argument('--wandb_mode', type=str, default='online', choices=['online','offline','disabled'], help='wandb mode')
+    parser.add_argument('--scene_limit', type=int, default=-1, help='number of scenes to eval (for debugging), -1 means all scenes')
     
     args = parser.parse_args()
 
@@ -256,7 +257,7 @@ def main():
         with open(args.json_file, 'r') as fs:
             path_json = json.load(fs)
         
-        json_data = path_json[dataset]
+        json_data = path_json[dataset][:args.scene_limit] if args.scene_limit > 0 else path_json[dataset]
         scale_stds = shift_stds = stable_result_fulls = stable_result_wins = 0
         depth_result_fulls = np.zeros(5)
         depth_result_wins = np.zeros(5)

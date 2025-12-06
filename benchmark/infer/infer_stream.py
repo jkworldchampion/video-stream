@@ -34,12 +34,8 @@ if __name__ == '__main__':
     parser.add_argument('--input_size', type=int, default=518)
     parser.add_argument('--encoder', type=str, default='vits', choices=['vits', 'vitl'])
     parser.add_argument('--pe', type=str, default='ape', choices=['ape', 'rope', 'none'])
-    parser.add_argument(
-        '--checkpoint',
-        type=str,
-        default='./outputs/experiment_2/best_model.pth',
-        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)'
-    )
+    parser.add_argument('--checkpoint', type=str, default='./outputs/experiment_2/best_model.pth',
+        help='Path to model checkpoint (e.g., ./outputs/experiment_2/best_model.pth)')
     args = parser.parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'

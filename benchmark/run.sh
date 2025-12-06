@@ -41,7 +41,8 @@ for EXP in "${EXPERIMENTS[@]}"; do
     --infer_path "${INFER_PATH}" \
     --json_file  "${JSON_FILE}" \
     --datasets scannet \
-    --checkpoint "${CHECKPOINT_PATH}"
+    --checkpoint "${CHECKPOINT_PATH}" \
+    --scene_limit 1
 
   echo
   echo "▶ Offline 평가 (DepthCrafter) → results.txt에 기록"
